@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "name": "AVR",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/avr/avr/include"
+            ],
+            "defines": [
+                "__GNUC__=7",
+                "__GNUC_MINOR__=3",
+                "__ATtiny804__",
+                "__AVR_ATtiny804__",
+                "F_CPU=3333333",
+                "VERSION_MAJOR=0",
+                "VERSION_MINOR=1"
+            ],
+            "compilerPath": "${workspaceFolder}/avr/bin/avr-gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "configurationProvider": "ms-vscode.makefile-tools"
+        }
+    ],
+    "version": 4
+}                                                                           

@@ -1,0 +1,5 @@
+CompileFlags: 
+  Add:
+    - "-I/opt/avr-gcc/avr/include/"
+    - "-DF_CPU=3333333"
+    - "-D__AVR_ATtiny804__"

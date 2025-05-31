@@ -1,7 +1,7 @@
 # TinyModbus
 This is a simple little ATTINY program intended to act as a MODBUS device, processing inputs for up to 8 relays.
 
-The PCB design is in the `pcb` folder.  It is set up to allow 8 PTF08A relay housings side by side.  The PCB automatically slots beneath the housings.
+The PCB design is in the `pcb` folder.  It is set up to allow 8 [PTF08A](https://www.aliexpress.com/w/wholesale-PTF08A.html?spm=a2g0o.home.search.0) housings with [Omrom LY2](https://www.omron.com.au/products/family/949/lineup.html) relays side by side.  The PCB automatically slots beneath the housings.
 
 ## Building
 This thing just needs a version of avr-gcc with support for my CPU (attiny806) and pymcuprog.  I installed pymcuprog using pip.  I tried using the version of avr-gcc that comes from homebrew (for macs) but it didn't have the CPU support built in.  So instead, the makefile has a command `download_gcc` that will download the version used by Arduino, and host it locally.

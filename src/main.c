@@ -8,8 +8,15 @@
 #include <util/atomic.h>
 #include <util/delay.h>
 
+#define MODBUS_GET_COILS_CMD 0x01
 #define MODBUS_SET_SINGLE_COIL_CMD 0x05
 #define MODBUS_SET_COILS_CMD 0x0F
+
+typedef enum {
+    MODBUS_ERR_ILLEGAL_FUNCTION = 0x01,
+    MODBUS_ERR_ILLEGAL_ADDRESS,
+    MODBUS_ERR_ILLEGAL_VALUE,
+} modbus_err_t;
 
 #define MODBUS_BAUD 9600
 #define USART0_BAUD_RATE(BAUD_RATE) ((float)(F_CPU * 64 / (16 * (float)BAUD_RATE)) + 0.5)
@@ -107,7 +114,7 @@ static inline void send(uint8_t byte) {
     USART0.CTRLA = USART_CTRLA_TRANSMITTING;
 }
 
-static inline void reset_inbuf() {
+static inline void resetModbusBuf() {
     modbusptr = modbusbuf;
     modbus_sz = 0;
     modbuscrc = 0xFFFF;
@@ -162,11 +169,34 @@ static inline bool inputIsValidModbusCommand() {
         switch (cmd) {
             case MODBUS_SET_COILS_CMD:
                 return modbus_sz == 9 + modbusbuf[6];
+            case MODBUS_GET_COILS_CMD:
             case MODBUS_SET_SINGLE_COIL_CMD:
                 return modbus_sz == 8;
         }
     }
     return false;
+}
+
+static void setErrorResponse(modbus_err_t err) {
+    modbusbuf[1] |= 0x80;  // Set the high bit to indicate an error.
+    modbusbuf[2] = err;
+    appendCrc(modbusbuf, 3);
+    modbus_sz = 5;
+}
+
+static void processGetCoilsCommand() {
+    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
+    uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
+
+    if (count > 0 && addr + count <= 8) {
+        modbusbuf[2] = 1;  // there can only be one bytes as we are a 1 byte coil holder
+        modbusbuf[3] = coilValues >> addr;
+        appendCrc(modbusbuf, 4);
+        modbus_sz = 6;
+    } else {
+        // We can't query downstream sources, so this should return an illegal address error.
+        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+    }
 }
 
 static void processSetCoilsCommand() {
@@ -270,6 +300,10 @@ static void processModbusCommand() {
     downstreamptr = downstreambuf;
 
     switch (modbusbuf[1]) {
+        case MODBUS_GET_COILS_CMD:
+            processGetCoilsCommand();
+            break;
+
         case MODBUS_SET_COILS_CMD:
             processSetCoilsCommand();
             break;
@@ -348,7 +382,7 @@ int main(void) {
                 }
             }
             // Reset the input buffer to allow for a new command.
-            reset_inbuf();
+            resetModbusBuf();
             sei();
         }
     }
@@ -359,7 +393,7 @@ ISR(TCB0_INT_vect) {
     TCB0.CTRLA = 0;               // Turn off the timer.
     TCB0.INTFLAGS = TCB_CAPT_bm;  // Clear the interrupt flag.
     TCB0.CNT = 0;                 // Set the timer back to 0 so that it starts there when we next turn the timer on
-    reset_inbuf();
+    resetModbusBuf();
 }
 
 // USART output shift register is empty.  If we have further bytes in the output buffer, buffer the next one, otherwise return

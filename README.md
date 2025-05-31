@@ -3,6 +3,7 @@ This is a simple little ATTINY program intended to act as a MODBUS device, proce
 
 The PCB design is in the `pcb` folder.  It is set up to allow 8 [PTF08A](https://www.aliexpress.com/w/wholesale-PTF08A.html?spm=a2g0o.home.search.0) housings with [Omrom LY2](https://www.omron.com.au/products/family/949/lineup.html) relays side by side.  The PCB automatically slots beneath the housings.
 
+![PCB](pcb/TinyModbus.png)
 
 ## Device addressing
 Each device can have its own Modbus Device Address programmed using byte 0 of the USERROW EEPROM value.  Whatever is written will have 2 added to it.  This means that the default value of 0xFF will translate to 1.  If you write 0 then it will have a deviceId of 2, and so on and so forth.

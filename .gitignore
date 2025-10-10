@@ -1,5 +1,6 @@
 build/
 avr/
 .venv/
+
 .DS_Store
 ~*.lck

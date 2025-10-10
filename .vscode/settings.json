@@ -1,1 +1,0 @@
-{ "clangd.fallbackFlags": ["-I${workspaceFolder}/avr/avr/include"] }

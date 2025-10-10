@@ -1,12 +1,13 @@
-DEVICE     = attiny806
-CLOCK      = 3333333
-PORT	   = /dev/tty.usbserial-B0010TZE
-FILENAME   = main
+DEVICE     	= attiny806
+CLOCK      	= 3333333
+PORT	   	= /dev/tty.usbserial-B0010TZE
+FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)
-COMPILE    = avr-gcc -Wall -Os -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE)
+COMPILE    	= avr-gcc -Wall -Os -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE)
 AVR_GCC_DIR = avr
-SOURCES    = $(wildcard src/*.c)
-OBJECTS    = $(subst src/,build/,$(subst .c,.o,$(SOURCES)))
+CSOURCES    = $(wildcard src/*.c )
+ASMSOURCES  = $(wildcard src/*.S )
+OBJECTS    	= $(subst src/,build/,$(subst .c,.o,$(CSOURCES))) # $(subst src/,build/,$(subst .S,.o,$(ASMSOURCES)))
 export PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)
 
 all: clean build erase flash
@@ -17,6 +18,10 @@ download_gcc:
    
 build/%.o: src/%.c
 	$(COMPILE) -c $< -o $@
+
+build/%.o: src/%.S
+	$(COMPILE) -c $< -o $@
+
 
 prepare:
 	mkdir -p build

@@ -1,0 +1,133 @@
+/* 
+  DALI master, useable as a multi-switch controller.  Programmed (via UPDI, or UART?) to respond to button presses
+  by sending out DALI commands to dim 
+*/
+
+#ifndef __DALI_H__
+#define __DALI_H__
+
+#include <inttypes.h>
+#include <stdbool.h>
+
+typedef enum { 
+    DALI_OK = 0, 
+    DALI_ERR_COLLISION_DETECTED,
+    DALI_ERR_INVALID_STATE,
+    DALI_ERR_NO_START_BIT,
+    DALI_ERR_NOT_FOR_ME,
+    DALI_ERR_CORRUPT_READ,
+    DALI_ERR_QUEUEFULL,
+} dali_result_t;
+
+
+typedef enum {
+    RESPONSE,
+    NO_RESPONSE,
+    COLLISION,
+} dali_command_result_t;
+
+
+// Only correct for clock of 3.33Mhz
+#define DALI_BAUD                   (1200)
+#define DALI_BIT_USECS              (1000000.0/DALI_BAUD)
+#define DALI_HALF_BIT_USECS         (DALI_BIT_USECS/2.0)
+#define DALI_MAX_DEVICES            (64)
+
+
+// The DALI configuration - PB3 for transmit - PB2 for receive.
+#define DALI_PORT PORTB
+#define DALI_TX_bm PIN0_bm
+#define DALI_RX_bm PIN2_bm
+#define DALI_RX_PINCTRL PIN2CTRL
+
+typedef enum {
+  DALI_RESPONSE_OK = 0,
+  DALI_RESPONSE_NAK = 404,
+  DALI_RESPONSE_COLLISION = 409,
+  DALI_RESPONSE_MALFORMED = 500,
+} dali_response_type_t;
+
+
+typedef struct {
+    uint8_t level;
+    uint8_t status;
+} dali_pwr_bank_t;
+
+typedef struct {
+    uint8_t min;
+    uint8_t max;
+} dali_minmax_bank_t;
+
+typedef struct {
+    uint8_t rate;
+    uint8_t time;
+} dali_fade_bank_t;
+
+typedef struct {
+    uint8_t powerOnLevel;
+    uint8_t systemFailureLevel;
+} dali_initialvalues_bank_t;
+
+
+
+
+typedef struct {
+    uint16_t power[DALI_MAX_DEVICES];
+    // dali_minmax_bank_t minmax[DALI_MAX_DEVICES];
+    // dali_fade_bank_t fade[DALI_MAX_DEVICES];
+    // dali_initialvalues_bank_t initialValues[DALI_MAX_DEVICES];
+    // uint16_t groups[DALI_MAX_DEVICES];
+} dali_all_holding_registers_t;
+
+typedef void (*dali_response_callback_t)(dali_response_type_t type, uint16_t cmd, uint8_t response);
+
+
+typedef struct dali_command_t {
+    uint16_t cmd;
+    dali_response_callback_t responseHandler;
+} dali_command_t;
+
+
+
+extern uint16_t dali_input_regs[DALI_MAX_DEVICES];
+#define DALI_MAX_INPUT_REGISTER (sizeof(dali_input_regs) / sizeof(uint16_t))
+
+extern dali_all_holding_registers_t dali_holding_regs;
+#define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
+
+
+
+
+extern void dali_init();
+uint8_t dali_is_bus_shorted();
+
+dali_result_t dali_queue_command(uint16_t data, dali_response_callback_t responseCallback);
+
+
+// State management - each of these functions lives in its own source file. 
+void dali_idle_state_enter();
+extern void dali_transmitting_state_enter(dali_command_t *cmd);
+void dali_wait_for_idle_state_enter();
+void dali_receiving_state_enter();
+void dali_waiting_for_response_state_enter();
+
+void dali_call_on_rising_once(void (*callback)());
+void dali_call_on_low_once(void (*callback)());
+
+// Receiving state.
+void dali_state_receiving_prepare();
+void dali_state_receiving_enter();
+
+
+void dali_wait_for_response_state_enter();
+bool dali_idle();
+void send_command_response(dali_response_type_t err, uint8_t res);
+void dali_state_init();
+
+
+// Commmands
+extern void dali_start_scan(uint8_t addr);
+
+
+
+#endif

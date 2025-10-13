@@ -5,7 +5,6 @@
 #include <stdbool.h>
 
 extern void rs485_init(uint8_t deviceId);
-extern void rs485_poll();
-extern bool rs485_is_transmitting();
+extern bool rs485_process_command();
 
 #endif

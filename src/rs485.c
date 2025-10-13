@@ -5,14 +5,21 @@
 #include <avr/wdt.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <util/atomic.h>
 #include <util/delay.h>
-#include "relays.h"
-#include "soft_serial.h"
+#include "timers.h"
+#include "dali.h"
 
-#define MODBUS_GET_COILS_CMD 0x01
-#define MODBUS_SET_SINGLE_COIL_CMD 0x05
-#define MODBUS_SET_COILS_CMD 0x0F
+#define MODBUS_READ_COILS_CMD 0x01
+#define MODBUS_READ_DISCRETE_INPUTS_CMD 0x02
+#define MODBUS_READ_HOLDING_REGISTERS_CMD 0x03
+#define MODBUS_READ_INPUT_REGISTERS_CMD 0x04
+#define MODBUS_WRITE_SINGLE_COIL_CMD 0x05
+#define MODBUS_WRITE_SINGLE_REGISTER_CMD 0x06
+#define MODBUS_WRITE_COILS_CMD 0x0F
+#define MODBUS_WRITE_REGISTERS_CMD 0x10
 
 typedef enum {
     MODBUS_ERR_ILLEGAL_FUNCTION = 0x01,
@@ -22,35 +29,21 @@ typedef enum {
 
 #define MODBUS_BAUD 9600
 #define USART0_BAUD_RATE(BAUD_RATE) ((float)(F_CPU * 64 / (16 * (float)BAUD_RATE)) + 0.5)
-#define USEC_TO_TICKS(x) ((unsigned)(((float)F_CPU * (x) / (float)1000000) + 0.5))
 
-#define MAX_PKT_SZ 200
+#define RS485_PORT PORTA
+#define RS485_TX_bm PIN1_bm
+#define RS485_RX_bm PIN2_bm
+#define RS485_DE_bm PIN4_bm
 
-#define TXFLAG_UART (1 << 0)
-#define TXFLAG_SOFT (1 << 1)
-
-// When we're idle we're only interested in reading a new byte in.
-#define USART_CTRLA_OUTPUT_BUFFER_EMPTY (USART_RXCIF_bm | USART_TXCIF_bm | USART_RS485_EXT_gc)
-// When we're Active, we are also interested in Transmission completion and keeping the buffer fed.
-#define USART_CTRLA_TRANSMITTING (USART_CTRLA_OUTPUT_BUFFER_EMPTY | USART_DREIF_bm)
+#define MAX_PKT_SZ 64*2+8
 
 static uint8_t deviceId = 1;
-
-
 
 static uint16_t modbuscrc = 0xFFFF;
 static uint8_t modbusbuf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 256 that MODBUS allows for)
 static uint8_t *modbusptr = modbusbuf;
 static uint8_t modbus_sz = 0;
 
-static uint8_t outbuf[10];  // We never output very much back over MODBUS (maximum 8 bytes)
-static uint8_t *outhead = outbuf;
-static uint8_t *outtail = outbuf;
-
-static uint8_t downstreambuf[MAX_PKT_SZ];
-static uint8_t *downstreamptr = downstreambuf;
-
-static volatile uint8_t transmissionFlags = 0;
 
 
 static const uint16_t crc_table[256] = {
@@ -85,19 +78,6 @@ static void appendCrc(uint8_t *pkt, uint8_t len) {
     *pkt++ = crc >> 8;
 }
 
-static inline void send(uint8_t byte) {
-    transmissionFlags |= TXFLAG_UART;
-    *outtail++ = byte;
-    // Enable the output buffer ready ISR.  If we were previously idle, this will fire immediately.
-    USART0.CTRLA = USART_CTRLA_TRANSMITTING;
-}
-
-static inline void resetModbusBuf() {
-    modbusptr = modbusbuf;
-    modbus_sz = 0;
-    modbuscrc = 0xFFFF;
-}
-
 
 
 static inline bool inputIsValidModbusCommand() {
@@ -115,10 +95,12 @@ static inline bool inputIsValidModbusCommand() {
     uint8_t cmd = modbusbuf[1];
     if ((cmdDeviceId == deviceId || cmdDeviceId == 0) && modbuscrc == 0) {
         switch (cmd) {
-            case MODBUS_SET_COILS_CMD:
+            case MODBUS_WRITE_COILS_CMD:
                 return modbus_sz == 9 + modbusbuf[6];
-            case MODBUS_GET_COILS_CMD:
-            case MODBUS_SET_SINGLE_COIL_CMD:
+            case MODBUS_READ_COILS_CMD:
+            case MODBUS_WRITE_SINGLE_COIL_CMD:
+            case MODBUS_READ_INPUT_REGISTERS_CMD:
+            case MODBUS_READ_HOLDING_REGISTERS_CMD:
                 return modbus_sz == 8;
         }
     }
@@ -135,17 +117,47 @@ static void setErrorResponse(modbus_err_t err) {
 static void processGetCoilsCommand() {
     uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
     uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
+    uint8_t *dptr = modbusbuf + 2;
+    uint16_t *sptr = dali_holding_regs.power + addr;
 
-    if (count > 0 && addr + count <= 8) {
-        modbusbuf[2] = 1;  // there can only be one bytes as we are a 1 byte coil holder
-        modbusbuf[3] = getCoils(addr);
-        appendCrc(modbusbuf, 4);
-        modbus_sz = 6;
+    if (count > 0 && addr + count <= DALI_MAX_DEVICES) {
+        *dptr = count/8 + (count % 8 ? 1 : 0);
+        for (int i = 0; i < count; i++) {
+            if (i % 8 == 0) {
+                dptr++;
+            }
+            *dptr = *dptr << 1 | (*sptr++ ? 1 : 0);
+        }
+        appendCrc(modbusbuf, modbusbuf[2] + 3);
+        modbus_sz = modbusbuf[2] + 5;
     } else {
         // We can't query downstream sources, so this should return an illegal address error.
         setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
 }
+
+
+static void sendModbusRegs(uint16_t *sptr, uint16_t max) {
+    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
+    uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
+        
+    if (count > 0 && count < 128 && addr + count <= max) {
+        modbusbuf[2] = 2 * count;
+        sptr += addr;
+        uint16_t *end = sptr + count;
+        uint8_t *dptr = modbusbuf + 3;
+
+        while (sptr < end) {
+            *dptr++ = *sptr >> 8;
+            *dptr++ = *sptr++ & 0xFF;
+        }
+        appendCrc(modbusbuf, modbusbuf[2] + 3);
+        modbus_sz = modbusbuf[2] + 5;
+    } else {
+        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+    }
+}
+
 
 static void processSetCoilsCommand() {
     uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
@@ -159,65 +171,15 @@ static void processSetCoilsCommand() {
         if (bitsForThisUnit > count) {
             bitsForThisUnit = count;
         }
-
-        uint8_t val = modbusbuf[7];
         // Set coil values.
-        for (uint8_t i = 0; i < bitsForThisUnit; i++) {
-            setCoil(addr + i, val & 0x01 ? 0xFF : 0x00);
-            val >>= 1;
-        }
-        latchOutputs();
+        // for (uint8_t i = 0; i < bitsForThisUnit; i++) {
+        //     setCoil(addr + i, val & 0x01 ? 0xFF : 0x00);
+        //     val >>= 1;
+        // }
+        // latchOutputs();
 
-        // All remaining values get shunted downstream, shifted by bitsForThisUnit bits,
-        // and any remaining bits from the next byte.
-        count -= bitsForThisUnit;
-        if (count > 0) {
-            addr -= bitsForThisUnit;
-            numBytes = count / 8;
-            if (bitsForThisUnit < 8) {
-                numBytes++;
-            }
-
-            *downstreamptr++ = modbusbuf[0];          // Device ID
-            *downstreamptr++ = MODBUS_SET_COILS_CMD;  // CMD
-            *downstreamptr++ = addr << 8;
-            *downstreamptr++ = addr;
-            *downstreamptr++ = count << 8;
-            *downstreamptr++ = count;
-            *downstreamptr++ = numBytes;
-            // Then copy in the bytes from the upstream.
-            if (bitsForThisUnit == 8) {
-                // Degenerate use case that aligns on byte boundaries.
-                coilData++;  // Skip the first byte, as we consumed it all
-                while (numBytes--) {
-                    *downstreamptr++ = *coilData++;
-                }
-            } else {
-                // We need part from the current byte, and part from the next byte
-                while (numBytes--) {
-                    // If its the last byte, we don't have a next byte, so use 0.
-                    uint8_t next = numBytes == 0 ? 0 : coilData[1];
-                    *downstreamptr++ = (*coilData >> bitsForThisUnit) | (next << (8 - bitsForThisUnit));
-                    coilData++;
-                }
-            }
-        }
     } else {
-        // All of the bytes are for downstream. Copy them through but with a lower address.
-        addr -= 8;
-        // We need to pass all but the first 8 coils on to the next controller
-        *downstreamptr++ = modbusbuf[0];  // Device ID
-        *downstreamptr++ = MODBUS_SET_COILS_CMD;
-        *downstreamptr++ = addr << 8;
-        *downstreamptr++ = addr;
-        *downstreamptr++ = count << 8;
-        *downstreamptr++ = count;
-        *downstreamptr++ = numBytes;
-
-        // Then copy in the bytes from the upstream.
-        for (int i = 0; i < numBytes; i++) {
-            *downstreamptr++ = *coilData++;
-        }
+        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
     // The respnose is simply the input bytes, but only up to the address (6 bytes).
     // We need to change the CRC.
@@ -229,144 +191,134 @@ static void processSetSingleCoilCommand() {
     uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
     uint8_t val = modbusbuf[4];
 
-    if (addr < 8) {
-        setCoil(addr, val);
-        latchOutputs();
-    } else {
-        // Its for a downstream unit. Pass the command on.
-        addr -= 8;
-        *downstreamptr++ = deviceId;  // Device ID
-        *downstreamptr++ = MODBUS_SET_SINGLE_COIL_CMD;
-        *downstreamptr++ = addr << 8;
-        *downstreamptr++ = addr;
-        *downstreamptr++ = val;  // The value
-        *downstreamptr++ = 0;
+    if (addr < DALI_MAX_DEVICES) {
+        // setCoil(addr, val);
+        // latchOutputs();
     }
 }
 
-static void processModbusCommand() {
-    downstreamptr = downstreambuf;
-
-    switch (modbusbuf[1]) {
-        case MODBUS_GET_COILS_CMD:
-            processGetCoilsCommand();
-            break;
-
-        case MODBUS_SET_COILS_CMD:
-            processSetCoilsCommand();
-            break;
-
-        case MODBUS_SET_SINGLE_COIL_CMD:
-            processSetSingleCoilCommand();
-            break;
-    }
-
-    // Buffer the downstream command, if there is one.
-    uint8_t sz = downstreamptr - downstreambuf;
-    if (sz) {
-        appendCrc(downstreambuf, sz);
-        softserial_tx(downstreambuf, sz + 2);
-    }
-}
 
 
 extern void rs485_init(uint8_t rs485_device_id) {
     deviceId = rs485_device_id;
 
-    // Set up USART to operate at 9600
-    PORTB.OUTSET = PIN2_bm;            // PB2 defaults high, because its UART out.
-    PORTB.DIRSET = PIN2_bm | PIN0_bm;  // PB0 (XDIR) and PB2 (TXD) are outputs
-    PORTB.DIRCLR = PIN3_bm;            // PB3 (RXD) is an input
+    // Set up USART to operate at 9600, running on alternate pins.
+    PORTMUX.CTRLB = PORTMUX_USART0_ALTERNATE_gc;
+    RS485_PORT.PIN7CTRL = PORT_PULLUPEN_bm;
+    RS485_PORT.PIN1CTRL = PORT_PULLUPEN_bm;
+    RS485_PORT.OUTSET = RS485_TX_bm;            // PB2 defaults high, because its UART out.
+    RS485_PORT.OUTCLR = RS485_DE_bm;            // PB2 defaults high, because its UART out.
+    RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;  // PB0 (XDIR) and PB2 (TXD) are outputs
+    RS485_PORT.DIRCLR = RS485_RX_bm;            // PB3 (RXD) is an input
 
     USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD);  // Set Baud rate to 9600
-    USART0.CTRLA = USART_CTRLA_OUTPUT_BUFFER_EMPTY;
-    USART0.CTRLB = USART_RXEN_bm | USART_TXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
-
-
-    // Set up TCB0 to handle timeout duties for us.
-    // The standard says that if there is a gap of 1.5 characters or more between two the end of one byte and the start of
-    // another, it is considered invalid. We receive notification at the end of each character, so we use 2.5 characters as our
-    // timeout.
-    TCB0.CCMP = USEC_TO_TICKS(25000000.0 / MODBUS_BAUD) / 2;
-    TCB0.INTCTRL = TCB_CAPT_bm;  // Enable overflow interrupt.
+    // USART0.CTRLA = USART_RS485_EXT_gc;
+    USART0.CTRLB = USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
 
 }
 
-extern void rs485_poll() {
-    // Process the input buffer, if it is valid
-    if (modbus_sz == 1) {
-        // We just read our first character. Turn on the read timeout timer.
-        TCB0.CTRLA = TCB_RUNSTDBY_bm | TCB_CLKSEL_CLKDIV2_gc | TCB_CNTMODE_INT_gc | TCB_ENABLE_bm;
+
+/**
+ * Reads a single character in from the UART, with a rough timeout.
+ */
+static int readch() {
+    // Both timers are already in use by DALI, so we have to poll the CPU clock for timeout.
+    // If we assume that each check is 9 cycles (to make the maths easy), It'll do one cycle in 3 microseconds .
+    // So, to get 1.5 ms, we would wait for 500 cycles.
+    // If DALI is doing stuff, it will extend the timeout, but the timer need only be rough.
+    int countDown = USEC_TO_TICKS(1500)/9;
+    while (!(USART0.STATUS & USART_RXCIF_bm)) {
+        if (--countDown == 0) {
+            return -1;
+        }
     }
-    // Check to see if we have received a valid MODBUS packet
-    if (inputIsValidModbusCommand()) {
-        cli();  // Turn off interrupts while we process the packet.
-        processModbusCommand();
+    uint8_t val = USART0.RXDATAL; // this will clear the CIF flag. 
+    return val;
+}
+
+
+static inline void send(uint8_t *buf, size_t sz) {
+    USART0.CTRLB = USART_TXEN_bm;
+    // Enabling and disabling the UART seems to turn the pin back to an input.  Make sure they're all outputs.
+    RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm; 
+    USART0.STATUS = USART_TXCIF_bm;
+    RS485_PORT.OUTSET = RS485_DE_bm;
+    _delay_us(100);
+
+
+
+    while (sz--) {
+        // wait for TX buffer to be empty.
+        while (!(USART0.STATUS & USART_DREIF_bm)) {
+        }
+        USART0.TXDATAL = *buf++;
+    }
+    // Wait all output to be flushed
+    while (!(USART0.STATUS & USART_TXCIF_bm)) {
+    }
+    USART0.STATUS = USART_TXCIF_bm;
+
+    // Switch the RS485 transciever back into receive mode.
+    RS485_PORT.OUTCLR = RS485_DE_bm;
+
+    USART0.CTRLB = USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
+
+}
+
+
+
+extern bool rs485_process_command() {
+    modbusptr = modbusbuf;
+    modbuscrc = 0xFFFF;
+    modbus_sz = 0;
+    int ch;
+
+    // Reset the Start of Frame flag, if it was set
+    USART0.STATUS = USART_RXSIF_bm;
+
+    do {
+        ch = readch();
+
+        if (ch == -1 || modbus_sz == MAX_PKT_SZ) {
+            return false;
+        }
+
+        *modbusptr++ = ch;
+        modbus_sz++;
+        uint8_t xor = ch ^ modbuscrc;
+        modbuscrc >>= 8;
+        modbuscrc ^= crc_table[xor];
+    } while (!inputIsValidModbusCommand());
+
+    uint8_t cmd_addr = modbusbuf[0];
+
+    if (cmd_addr == deviceId || cmd_addr == 0) {
+        switch (modbusbuf[1]) {
+            case MODBUS_READ_COILS_CMD:
+
+                processGetCoilsCommand();
+                break;
+            case MODBUS_READ_HOLDING_REGISTERS_CMD:
+                sendModbusRegs((uint16_t *) &dali_holding_regs, DALI_MAX_HOLDING_REGISTER);
+                break;
+            case MODBUS_READ_INPUT_REGISTERS_CMD:
+                sendModbusRegs(dali_input_regs, DALI_MAX_INPUT_REGISTER);
+                break;
+            case MODBUS_WRITE_COILS_CMD:
+                processSetCoilsCommand();
+                break;
+            case MODBUS_WRITE_SINGLE_COIL_CMD:
+                processSetSingleCoilCommand();
+                break;
+            default:
+                setErrorResponse(MODBUS_ERR_ILLEGAL_FUNCTION);
+                break;
+        }
 
         // Respond to the caller, unless it was a broadcast
-        if (modbusbuf[0]) {
-            for (uint8_t i = 0; i < modbus_sz; i++) {
-                send(modbusbuf[i]);
-            }
+        if (cmd_addr) {
+            send(modbusbuf, modbus_sz);
         }
-        // Reset the input buffer to allow for a new command.
-        resetModbusBuf();
-        sei();
     }
-
-}
-
-extern bool rs485_is_transmitting() {
-    return transmissionFlags != 0;
-}
-
-
-// USART output shift register is empty.  If we have further bytes in the output buffer, buffer the next one, otherwise return
-// to idle. This ISR is turned on whenever a character is added to the output buffer.
-ISR(USART0_DRE_vect) {
-    if (outhead < outtail) {
-        USART0.TXDATAL = *outhead++;
-    } else {
-        // Disable the Data Ready Interrupt until there is more data to transmit.
-        USART0.CTRLA = USART_CTRLA_OUTPUT_BUFFER_EMPTY;
-        // Start from the start of the buffer again
-        outhead = outtail = outbuf;
-    }
-}
-
-// There's no more data to be shifted out, so we return to the idle state.
-ISR(USART0_TXC_vect) {
-    // Turn off the Transmission flag.
-    transmissionFlags &= ~TXFLAG_UART;
-    // Clear the flag. The Datasheet says  this happens automatically, but this appears to be untrue
-    USART0.STATUS = USART_TXCIF_bm;
-}
-
-// There is a new character to read from the input buffer.
-ISR(USART0_RXC_vect) {
-    if (USART0.STATUS & USART_RXCIF_bm) {
-        // Read the byte directly into the output buffer.
-        uint8_t val = USART0.RXDATAL;
-        if (modbus_sz < MAX_PKT_SZ) {
-            *modbusptr++ = val;  // This will clear the Interrupt flag;
-            modbus_sz++;
-            uint8_t xor = val ^ modbuscrc;
-            modbuscrc >>= 8;
-            modbuscrc ^= crc_table[xor];
-        }
-        TCB0.CNT = 0;  // Reset the read timeout timer.
-    }
-    if (USART0.STATUS & USART_RXSIF_bm) {
-        // Clear the flag
-        USART0.STATUS = USART_RXSIF_bm;
-    }
-}
-
-
-ISR(TCB0_INT_vect) {
-    // We haven't received a character in a while.  Reset the input buffer
-    TCB0.CTRLA = 0;               // Turn off the timer.
-    TCB0.INTFLAGS = TCB_CAPT_bm;  // Clear the interrupt flag.
-    TCB0.CNT = 0;                 // Set the timer back to 0 so that it starts there when we next turn the timer on
-    resetModbusBuf();
+    return true;
 }

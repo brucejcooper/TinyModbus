@@ -8,6 +8,7 @@ AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )
 ASMSOURCES  = $(wildcard src/*.S )
 OBJECTS    	= $(subst src/,build/,$(subst .c,.o,$(CSOURCES))) # $(subst src/,build/,$(subst .S,.o,$(ASMSOURCES)))
+# OBJECTS = build/main.o build/timers.o
 export PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)
 
 all: clean build erase flash

@@ -3,7 +3,7 @@ CLOCK      	= 3333333
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)
-COMPILE    	= avr-gcc -Wall -Os -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE)
+COMPILE    	= avr-gcc -Wall -Os -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=1
 AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )
 ASMSOURCES  = $(wildcard src/*.S )

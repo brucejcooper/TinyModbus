@@ -11,13 +11,6 @@
 #include "timers.h"
 
 
-
-void pulse_led() {
-    PORTB.OUTTGL = PIN3_bm;  // clear the LED.
-    PORTB.OUTTGL = PIN3_bm;  // clear the LED.
-
-}
-
 int main(void) {
     // Device ID is stored in the first byte of the USERRROW EEPROM.  It is offset by 2, so that when set to the
     // default value (0xFF), it comes out as Device no 1.  If you want device 2, write 0x00

@@ -4,3 +4,5 @@ CompileFlags:
     - "-DF_CPU=3333333"
     - "-D__AVR_ATtiny806__"
     - "-DSM1"
+    - "-DFW_VER_MAJOR=1"
+    - "-DFW_VER_MINOR=0"

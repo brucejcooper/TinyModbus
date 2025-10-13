@@ -1,7 +1,6 @@
 #include "dali.h"
 
 dali_all_holding_registers_t dali_holding_regs;
-uint16_t dali_input_regs[DALI_MAX_DEVICES];
 
 
 

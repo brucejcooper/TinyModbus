@@ -32,7 +32,7 @@ void dali_init() {
     // We use 
     TCB0.CTRLB = TCB_CNTMODE_FRQ_gc;  // Put it in Capture Frequency Measurement mode.
     // Set up event systemt to route DALI RX change events to channel 0.
-    EVSYS.ASYNCCH1 = EVSYS_ASYNCCH1_PORTB_PIN2_gc;  // Make BP2 send asyncch1 event.
+    EVSYS.ASYNCCH1 = EVSYS_ASYNCCH1_PORTB_PIN1_gc;  // Make BP2 send asyncch1 event.
     EVSYS.ASYNCUSER0 = EVSYS_ASYNCUSER0_ASYNCCH1_gc;  // Set TCB0 to use ASYNCHCH1
 
 

@@ -22,7 +22,6 @@ void start_timeout();
 void cancel_timeout();
 void reset_timeout();
 void restart_timeout();
-void pulse_led();
 void update_timeout_callback(void (*callback)());
 
 #endif

@@ -130,7 +130,6 @@ ISR(TCB0_INT_vect) {
     // TCB0's CNT has been reset automatically, but TCA0's hasn't
     // We do this first so that it closely matches TCB0s as it can
     reset_timeout();
-    pulse_led();
     uint16_t pulseLengthInTicks = TCB0.CCMP;  // This will clear the interrupt flag.
     uint8_t evctrl = TCB0.EVCTRL;
     // Due to capacitance / collector behaviour, positive pulses are recorded shorter than they actually are.

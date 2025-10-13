@@ -10,7 +10,7 @@
 #include "timers.h"
 
 // TODO What is the correct value here?
-#define NORESPONSE_TIMEOUT USEC_TO_TICKS(10500)
+#define NORESPONSE_TIMEOUT USEC_TO_TICKS(22*DALI_HALF_BIT_USECS)
 
 static inline void cleanup() {
     cancel_timeout();
@@ -38,7 +38,6 @@ static void startReceivingResponse() {
 
 
 extern void dali_wait_for_response_state_enter() {
-    // log_info("wfr");
     // For this, we will be reading the line, so we enable the rising line interrupt, and make it interrupt on any change.
     dali_state_receiving_prepare();
     dali_call_on_rising_once(startReceivingResponse);

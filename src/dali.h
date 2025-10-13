@@ -37,8 +37,8 @@ typedef enum {
 // The DALI configuration - PB3 for transmit - PB2 for receive.
 #define DALI_PORT PORTB
 #define DALI_TX_bm PIN0_bm
-#define DALI_RX_bm PIN2_bm
-#define DALI_RX_PINCTRL PIN2CTRL
+#define DALI_RX_bm PIN1_bm
+#define DALI_RX_PINCTRL PIN1CTRL
 
 typedef enum {
   DALI_RESPONSE_OK = 0,
@@ -89,8 +89,8 @@ typedef struct dali_command_t {
 
 
 
-extern uint16_t dali_input_regs[DALI_MAX_DEVICES];
-#define DALI_MAX_INPUT_REGISTER (sizeof(dali_input_regs) / sizeof(uint16_t))
+// extern uint16_t dali_input_regs[DALI_MAX_DEVICES];
+// #define DALI_MAX_INPUT_REGISTER (sizeof(dali_input_regs) / sizeof(uint16_t))
 
 extern dali_all_holding_registers_t dali_holding_regs;
 #define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
@@ -127,7 +127,10 @@ void dali_state_init();
 
 // Commmands
 extern void dali_start_scan(uint8_t addr);
-
+extern void dali_goto_last_active(uint8_t addr);
+extern void dali_off(uint8_t addr);
+extern void dali_toggle(uint8_t addr);
+extern void dali_set_level(uint8_t addr, uint8_t level);
 
 
 #endif

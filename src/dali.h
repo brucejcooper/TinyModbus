@@ -31,6 +31,7 @@ typedef enum {
 #define DALI_BIT_USECS              (1000000.0/DALI_BAUD)
 #define DALI_HALF_BIT_USECS         (DALI_BIT_USECS/2.0)
 #define DALI_MAX_DEVICES            (64)
+#define DALI_DECODE_ADDR(cmd)       (((cmd) >> 9) & 0x3F)
 
 
 // The DALI configuration - PB3 for transmit - PB2 for receive.

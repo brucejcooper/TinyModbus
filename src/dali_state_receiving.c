@@ -80,6 +80,7 @@ void timerOverflow() {
 
     if ((state == STATE_START_0 || state == STATE_MIDDLE_1) && numBits == 8) {
         // We have come to a valid end of sequence.  Process what we have read.
+        // In addition to sending the response, we automatically mirror the output of some DALI commands to our holding registers
         send_command_response(DALI_RESPONSE_OK, shiftreg);
     } else {
         // Some timing error or collision occurred.

@@ -24,10 +24,23 @@ bool dali_idle() { return idle; }
 
 void send_command_response(dali_response_type_t err, uint8_t res) {
     cli();
+    uint8_t addr;
     if (q_size > 0) {
         // We don't set the callback when we are repeating ourselves, because we need to send the command again (once we re-enter the idle state)
-        if (commandQ[0].repeat == 0 || --commandQ[0].repeat == 0) {
-            commandQ[0].responseHandler(err, commandQ[0].cmd, res);
+        if (commandQ->repeat == 0 || --commandQ->repeat == 0) {
+            // In addition to calling the callback, we automatically mirror the output of some DALI commands to our holding registers.  
+            // This makes it easier to process when also calling Custom Dali commands. 
+            if (err == DALI_RESPONSE_OK) {
+                switch (commandQ->cmd & 0x81FF) {
+                    case 0x1a0:
+                        addr = DALI_DECODE_ADDR(commandQ->cmd);
+                        dali_holding_regs.power[addr] = res;
+                        break;
+                }
+            }
+
+
+            commandQ->responseHandler(err, commandQ->cmd, res);
             q_size--;
             if (q_size > 0) {
                 memcpy(commandQ, commandQ + 1, q_size * sizeof(dali_command_t));

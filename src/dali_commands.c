@@ -6,14 +6,14 @@
 #define DALI_CMD_OFF 0x100
 
 #define ENCODE_CMD(cmd, addr) ((cmd) | ((addr) << 9))
-#define DECODE_ADDR(cmd) (((cmd) >> 9) & 0x3F)
 
 static void scan_result_received(dali_response_type_t err, uint16_t cmd, uint8_t response) {
-    uint8_t addr = DECODE_ADDR(cmd);
+    uint8_t addr = DALI_DECODE_ADDR(cmd);
     if (addr < 64) {
         switch (err) {
             case DALI_RESPONSE_OK:
-                dali_holding_regs.power[addr] = response;
+                // The power register is automatically updated.
+                // dali_holding_regs.power[addr] = response;
                 break;
             default:
                 dali_holding_regs.power[addr] = err;
@@ -36,10 +36,8 @@ static void fade_status_received(dali_response_type_t err, uint16_t cmd, uint8_t
 }
 
 static void fade_level_received(dali_response_type_t err, uint16_t cmd, uint8_t currentLevel) {
-    uint8_t addr = DECODE_ADDR(cmd);
-    if (err == DALI_RESPONSE_OK) {
-        dali_holding_regs.power[addr] = currentLevel;
-    }
+    uint8_t addr = DALI_DECODE_ADDR(cmd);
+    // The side-effect processor will have already stored the value in the holding register
     // We continue to fetch the level until the fade status bit is no longer set.
     dali_queue_command(ENCODE_CMD(DALI_CMD_QUERY_STATUS, addr), fade_status_received, 1);
 }
@@ -47,11 +45,11 @@ static void fade_level_received(dali_response_type_t err, uint16_t cmd, uint8_t 
 static void track_fade(dali_response_type_t err, uint16_t cmd, uint8_t _ignored) {
     // We expect it to have NAKed.  Ignore the response.
     // Fetch current level.
-    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_LEVEL, DECODE_ADDR(cmd)), fade_level_received, 1);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_LEVEL, DALI_DECODE_ADDR(cmd)), fade_level_received, 1);
 }
 
 static void toggle_based_on_level(dali_response_type_t err, uint16_t cmd, uint8_t currentLevel) {
-    uint8_t addr = DECODE_ADDR(cmd);
+    uint8_t addr = DALI_DECODE_ADDR(cmd);
     if (err == DALI_RESPONSE_OK) {
         if (currentLevel) {
             dali_off(addr);

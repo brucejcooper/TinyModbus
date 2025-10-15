@@ -21,11 +21,20 @@
 #define MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD 0x06
 #define MODBUS_WRITE_COILS_CMD 0x0F
 #define MODBUS_WRITE_REGISTERS_CMD 0x10
+#define MODBUS_CUSTOM_EXEC_DALI_CMD 0x44
+#define MODBUS_CUSTOM_START_PROCESS_CMD 0x45
 
 typedef enum {
     MODBUS_ERR_ILLEGAL_FUNCTION = 0x01,
-    MODBUS_ERR_ILLEGAL_ADDRESS,
-    MODBUS_ERR_ILLEGAL_VALUE,
+    MODBUS_ERR_ILLEGAL_ADDRESS = 0x02,
+    MODBUS_ERR_ILLEGAL_VALUE = 0x03,
+    MODBUS_ERR_SLAVE_DEVICE_FAILURE = 0x04,
+    MODBUS_ERR_ACKNOWLEDGE = 0x05,
+    MODBUS_ERR_SLAVE_DEVICE_BUSY = 0x06,
+    MODBUS_ERR_NEGATIVE_ACKNOWLEDGE = 0x07,
+    MODBUS_ERR_MEMORY_PARITY_ERROR = 0x08,
+    MODBUS_ERR_GATEWAY_PATH_UNAVAILABLE = 0x09,
+    MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND = 0x0a,
 } modbus_err_t;
 
 #define MODBUS_BAUD 9600
@@ -44,7 +53,6 @@ static uint16_t modbuscrc = 0xFFFF;
 static uint8_t modbusbuf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 256 that MODBUS allows for)
 static uint8_t *modbusptr = modbusbuf;
 static uint8_t modbus_sz = 0;
-
 
 /**
  * Stores an indentifier string for this device.  Clients can fetch 32 registers worth of Input registers at address 0 to get the string.
@@ -69,6 +77,7 @@ static const uint16_t crc_table[256] = {
 
 static void appendCrc(uint8_t *pkt, uint8_t len) {
     uint16_t crc = 0xFFFF;
+    modbus_sz = len + 2;
     while (len--) {
         uint8_t xor = (*pkt++) ^ crc;
         crc >>= 8;
@@ -86,21 +95,38 @@ static inline bool inputIsValidModbusCommand() {
     // d) the length is valid for the command.  The smallest possible modbus packet size is 8 bytes,
     //    but some a variable length
 
-    if (modbus_sz < 8) {
+    if (modbus_sz < 5) {
         return false;
     }
     uint8_t cmdDeviceId = modbusbuf[0];
     uint8_t cmd = modbusbuf[1];
+    uint8_t expectedSz = 255;
+
     if ((cmdDeviceId == deviceId || cmdDeviceId == 0) && modbuscrc == 0) {
         switch (cmd) {
             case MODBUS_WRITE_COILS_CMD:
-                return modbus_sz == 9 + modbusbuf[6];
+                expectedSz = 9 + modbusbuf[6];
+                break;
             case MODBUS_READ_COILS_CMD:
             case MODBUS_WRITE_SINGLE_COIL_CMD:
             case MODBUS_READ_INPUT_REGISTERS_CMD:
             case MODBUS_READ_HOLDING_REGISTERS_CMD:
             case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
-                return modbus_sz == 8;
+                expectedSz = 8;
+                break;
+
+            case MODBUS_CUSTOM_EXEC_DALI_CMD:
+                expectedSz = 7;
+                break;
+        }
+
+        if (modbus_sz == expectedSz) {
+            if (modbuscrc == 0) {
+                return true;
+            } else {
+                // Indicate a CRC mismatch
+                return false;
+            }
         }
     }
     return false;
@@ -110,7 +136,6 @@ static void setErrorResponse(modbus_err_t err) {
     modbusbuf[1] |= 0x80;  // Set the high bit to indicate an error.
     modbusbuf[2] = err;
     appendCrc(modbusbuf, 3);
-    modbus_sz = 5;
 }
 
 static void processGetCoilsCommand() {
@@ -128,7 +153,6 @@ static void processGetCoilsCommand() {
             *dptr = *dptr << 1 | (*sptr++ ? 1 : 0);
         }
         appendCrc(modbusbuf, modbusbuf[2] + 3);
-        modbus_sz = modbusbuf[2] + 5;
     } else {
         // We can't query downstream sources, so this should return an illegal address error.
         setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
@@ -150,13 +174,10 @@ static void sendModbusRegs(uint16_t *sptr, uint16_t max) {
             *dptr++ = *sptr++ & 0xFF;
         }
         appendCrc(modbusbuf, modbusbuf[2] + 3);
-        modbus_sz = modbusbuf[2] + 5;
     } else {
         setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
 }
-
-
 
 /**
  * Sends device info, as a String, with each register holding two bytes
@@ -165,14 +186,52 @@ static void sendInfo() {
     uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
     uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
 
-    
-    if (count > 0 && addr + count <= (sizeof(verStr)/2)) {
-        modbusbuf[2] = count*2;
-        memcpy(modbusbuf+3, verStr+addr*2, count*2);
+    if (count > 0 && addr + count <= (sizeof(verStr) / 2)) {
+        modbusbuf[2] = count * 2;
+        memcpy(modbusbuf + 3, verStr + addr * 2, count * 2);
         appendCrc(modbusbuf, modbusbuf[2] + 3);
-        modbus_sz = modbusbuf[2] + 5;
     } else {
         setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+    }
+}
+
+static volatile bool custom_command_complete;
+static void dali_cmd_callback(dali_response_type_t type, uint16_t cmd, uint8_t response) {
+    switch (type) {
+        case DALI_RESPONSE_OK:
+            modbusbuf[2] = response;
+            appendCrc(modbusbuf, 3);
+            break;
+        case DALI_RESPONSE_NAK:
+            setErrorResponse(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
+            break;
+        case DALI_RESPONSE_MALFORMED:
+            setErrorResponse(MODBUS_ERR_SLAVE_DEVICE_FAILURE);
+            break;
+        case DALI_RESPONSE_COLLISION:
+            setErrorResponse(MODBUS_ERR_MEMORY_PARITY_ERROR);
+            break;
+        default:
+            setErrorResponse(MODBUS_ERR_ILLEGAL_FUNCTION);
+            break;
+    }
+    custom_command_complete = true;
+}
+
+static void processCustomDaliCommand() {
+    uint16_t cmd = modbusbuf[2] << 8 | modbusbuf[3];
+    uint8_t repeat = modbusbuf[4];
+    custom_command_complete = false;
+    if (repeat > 2) {
+        setErrorResponse(MODBUS_ERR_ILLEGAL_VALUE);
+        return;
+    }
+    dali_queue_command(cmd, dali_cmd_callback, repeat);
+    // dali_cmd_callback() will perform the response, but we need to wait for it.
+    // TODO add WDT
+
+    while (!custom_command_complete) {
+        ;
     }
 }
 
@@ -223,7 +282,6 @@ static void processSetCoilsCommand() {
     // The respnose is simply the input bytes, but only up to the address (6 bytes).
     // We need to change the CRC.
     appendCrc(modbusbuf, 6);
-    modbus_sz = 8;
 }
 
 static void processSetSingleCoilCommand() {
@@ -246,7 +304,8 @@ static void processSetSingleCoilCommand() {
 extern void rs485_init(uint8_t rs485_device_id) {
     deviceId = rs485_device_id;
     memset(verStr, 0, sizeof(verStr));
-    snprintf(verStr, sizeof(verStr), "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", FW_VER_MAJOR, FW_VER_MINOR, SIGROW_SERNUM0, SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3, SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7, SIGROW_SERNUM8, SIGROW_SERNUM9);
+    snprintf(verStr, sizeof(verStr), "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", FW_VER_MAJOR, FW_VER_MINOR, SIGROW_SERNUM0,
+             SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3, SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7, SIGROW_SERNUM8, SIGROW_SERNUM9);
 
     // Set up USART to operate at 9600, running on alternate pins.
     PORTMUX.CTRLB = PORTMUX_USART0_ALTERNATE_gc;
@@ -321,11 +380,13 @@ extern bool rs485_process_command() {
             return false;
         }
 
-        *modbusptr++ = ch;
-        modbus_sz++;
-        uint8_t xor = ch ^ modbuscrc;
-        modbuscrc >>= 8;
-        modbuscrc ^= crc_table[xor];
+        if (modbus_sz < MAX_PKT_SZ) {
+            *modbusptr++ = ch;
+            modbus_sz++;
+            uint8_t xor = ch ^ modbuscrc;
+            modbuscrc >>= 8;
+            modbuscrc ^= crc_table[xor];
+        }
     } while (!inputIsValidModbusCommand());
 
     uint8_t cmd_addr = modbusbuf[0];
@@ -333,7 +394,6 @@ extern bool rs485_process_command() {
     if (cmd_addr == deviceId || cmd_addr == 0) {
         switch (modbusbuf[1]) {
             case MODBUS_READ_COILS_CMD:
-
                 processGetCoilsCommand();
                 break;
             case MODBUS_READ_HOLDING_REGISTERS_CMD:
@@ -352,6 +412,11 @@ extern bool rs485_process_command() {
             case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
                 processSetSingleHoldingRegisterCommand();
                 break;
+
+            case MODBUS_CUSTOM_EXEC_DALI_CMD:
+                processCustomDaliCommand();
+                break;
+
             default:
                 setErrorResponse(MODBUS_ERR_ILLEGAL_FUNCTION);
                 break;

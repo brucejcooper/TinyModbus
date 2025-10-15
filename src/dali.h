@@ -27,7 +27,6 @@ typedef enum {
 } dali_command_result_t;
 
 
-// Only correct for clock of 3.33Mhz
 #define DALI_BAUD                   (1200)
 #define DALI_BIT_USECS              (1000000.0/DALI_BAUD)
 #define DALI_HALF_BIT_USECS         (DALI_BIT_USECS/2.0)
@@ -85,6 +84,7 @@ typedef void (*dali_response_callback_t)(dali_response_type_t type, uint16_t cmd
 typedef struct dali_command_t {
     uint16_t cmd;
     dali_response_callback_t responseHandler;
+    uint8_t repeat;
 } dali_command_t;
 
 
@@ -101,8 +101,7 @@ extern dali_all_holding_registers_t dali_holding_regs;
 extern void dali_init();
 uint8_t dali_is_bus_shorted();
 
-dali_result_t dali_queue_command(uint16_t data, dali_response_callback_t responseCallback);
-
+dali_result_t dali_queue_command(uint16_t data, dali_response_callback_t responseCallback, uint8_t repeat);
 
 // State management - each of these functions lives in its own source file. 
 void dali_idle_state_enter();

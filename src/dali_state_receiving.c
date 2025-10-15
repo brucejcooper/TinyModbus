@@ -77,6 +77,7 @@ void timerOverflow() {
     // In either case, we will be leaving this state.  Shut down the timers.
     cleanup();
 
+
     if ((state == STATE_START_0 || state == STATE_MIDDLE_1) && numBits == 8) {
         // We have come to a valid end of sequence.  Process what we have read.
         send_command_response(DALI_RESPONSE_OK, shiftreg);

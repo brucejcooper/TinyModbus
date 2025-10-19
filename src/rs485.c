@@ -316,9 +316,11 @@ extern void rs485_init(uint8_t rs485_device_id) {
     RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;  // PB0 (XDIR) and PB2 (TXD) are outputs
     RS485_PORT.DIRCLR = RS485_RX_bm;                // PB3 (RXD) is an input
 
-    USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD);  // Set Baud rate to 9600
-    // USART0.CTRLA = USART_RS485_EXT_gc;
-    USART0.CTRLB = USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
+    USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD) ;  // Set Baud rate to 9600
+    // N81 Async Sserial
+    USART0.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc |  USART_CHSIZE_8BIT_gc | USART_SBMODE_1BIT_gc;
+    USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm;
+    USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
 }
 
 /**
@@ -340,13 +342,13 @@ static int readch() {
 }
 
 static inline void send(uint8_t *buf, size_t sz) {
-    USART0.CTRLB = USART_TXEN_bm;
+    // Turn off receive, and turn on Transmit.
+    // USART0.CTRLB = USART_TXEN_bm | USART_SFDEN_bm;
     // Enabling and disabling the UART seems to turn the pin back to an input.  Make sure they're all outputs.
-    RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;
-    USART0.STATUS = USART_TXCIF_bm;
-    RS485_PORT.OUTSET = RS485_DE_bm;
-    _delay_us(100);
-
+    // RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;
+    
+    USART0.STATUS = USART_TXCIF_bm; // Clear any existing Receive Complete flags... errr why?
+    RS485_PORT.OUTSET = RS485_DE_bm; // turn DE on 
     while (sz--) {
         // wait for TX buffer to be empty.
         while (!(USART0.STATUS & USART_DREIF_bm)) {
@@ -359,9 +361,10 @@ static inline void send(uint8_t *buf, size_t sz) {
     USART0.STATUS = USART_TXCIF_bm;
 
     // Switch the RS485 transciever back into receive mode.
-    RS485_PORT.OUTCLR = RS485_DE_bm;
+    RS485_PORT.OUTCLR = RS485_DE_bm; 
 
-    USART0.CTRLB = USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
+    // Go back to receive mode.
+    // USART0.CTRLB = USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
 }
 
 extern bool rs485_process_command() {
@@ -371,7 +374,6 @@ extern bool rs485_process_command() {
     int ch;
 
     // Reset the Start of Frame flag, if it was set
-    USART0.STATUS = USART_RXSIF_bm;
 
     do {
         ch = readch();
@@ -428,4 +430,14 @@ extern bool rs485_process_command() {
         }
     }
     return true;
+}
+
+
+
+ISR(USART0_RXC_vect) {
+    if (USART0.STATUS & USART_RXSIF_bm) {
+        USART0.STATUS = USART_RXSIF_bm;
+    }
+
+    // TODO may as well also implement a receive data ISR.
 }

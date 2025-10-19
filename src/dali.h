@@ -120,7 +120,7 @@ void dali_state_receiving_enter();
 
 
 void dali_wait_for_response_state_enter();
-bool dali_idle();
+bool dali_is_idle();
 void send_command_response(dali_response_type_t err, uint8_t res);
 void dali_state_init();
 

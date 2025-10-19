@@ -20,7 +20,7 @@ static void cleanup() {
     idle = false;
 }
 
-bool dali_idle() { return idle; }
+bool dali_is_idle() { return idle; }
 
 void send_command_response(dali_response_type_t err, uint8_t res) {
     cli();

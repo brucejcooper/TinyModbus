@@ -8,7 +8,6 @@
 #include <util/delay.h>
 
 #include "dali.h"
-#include "timers.h"
 
 // Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
 
@@ -24,29 +23,20 @@ void dali_init() {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     DALI_PORT.DIRSET = DALI_TX_bm;
 
-
-    // Receiving set up - we use the Analog Comparator, to get it to trigger at 
+    // Receiving set up 
     DALI_PORT.OUTCLR = DALI_RX_bm;
     DALI_PORT.DIRCLR = DALI_RX_bm;
 
-    // We use 
+    // We use TCB0 to process inputs, using events
     TCB0.CTRLB = TCB_CNTMODE_FRQ_gc;  // Put it in Capture Frequency Measurement mode.
     // Set up event systemt to route DALI RX change events to channel 0.
     EVSYS.ASYNCCH1 = EVSYS_ASYNCCH1_PORTB_PIN1_gc;  // Make BP2 send asyncch1 event.
     EVSYS.ASYNCUSER0 = EVSYS_ASYNCUSER0_ASYNCCH1_gc;  // Set TCB0 to use ASYNCHCH1
 
-
     dali_state_init();
-
-
-
-
 
     // We start in the reset state (which we should exit in short order).
     dali_wait_for_idle_state_enter();
-
-    // Make the TCA.CMP1 interrupt the highest priority, so that it goes off ASAP after the timer goes off.
-
 }
 
 /**

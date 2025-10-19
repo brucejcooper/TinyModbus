@@ -57,7 +57,7 @@ export class ModbusSwitchFixture extends LitElement {
                 display: flex;
                 gap: 5px;
                 min-width: 35px;
-                /* align-items: center; */
+                align-items: center;
                 flex-direction: column;
                 padding: 8px;
             }
@@ -117,13 +117,14 @@ export class ModbusSwitchFixture extends LitElement {
 
     @consume({ context: modbusContext })
     @property({ attribute: false })
-    public modbus?: ModbusConnection;
+    public modbus!: ModbusConnection;
+
+    @property({ type: Number })
+    deviceId: number = 0;
+
 
     @property({ type: Number })
     fixture: number = 0;
-
-    @property({ reflect: false })
-    buttons: number = 0;
 
     @property({ reflect: false })
     label: string = "";
@@ -134,17 +135,44 @@ export class ModbusSwitchFixture extends LitElement {
     @state()
     dropTargetButton: number = -1;
 
-    requestBindings = async () => {
-        if (this.modbus) {
-            this.bindings = (await this.modbus.getHoldingRegisters(1, this.fixture * 7, 7)).map(decodeBinding);
+    private pollHandlerFilter: { deviceId: number; addressRange: [number,number] } | undefined;
+
+
+    disconnectedCallback(): void {
+        super.disconnectedCallback();
+        this.removeEventHandler();
+    }
+
+    polledValuesChanged = () => {
+        this.requestUpdate();
+    }
+
+    private removeEventHandler() {
+        if (this.pollHandlerFilter) {
+            this.modbus.removePollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
         }
-    };
+    }
+
+
+
+    private refreshEventHandler() {
+        this.removeEventHandler();
+        this.pollHandlerFilter = { deviceId: this.deviceId, addressRange: [this.fixture*7, this.fixture*7+5 ] };
+        this.modbus.addPollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
+    }
+
+
+    protected willUpdate(changed: PropertyValues): void {
+        super.willUpdate(changed);
+
+        if (changed.has("deviceId") || changed.has("type") || changed.has("fixture")) {
+            this.refreshEventHandler();
+        }
+    }
 
     connectedCallback(): void {
         super.connectedCallback();
         this.label = localStorage.getItem(`modbus.fixture${this.fixture}`) ?? `Fix${this.fixture}`;
-        // The main app requests the status for All fixtures.  We simply pick out the bits we want.
-        setTimeout(this.requestBindings, 200);
     }
 
     labelChanged = (evt: Event) => {
@@ -157,13 +185,9 @@ export class ModbusSwitchFixture extends LitElement {
         this.dispatchEvent(new CustomEvent<SwitchFixtureID>("switch-selected", { detail: { button: Number(target.dataset.index), fixture: this.fixture }, bubbles: true }));
     };
 
-    protected willUpdate(_changedProperties: PropertyValues): void {
-        super.willUpdate(_changedProperties);
-    }
-
 
     private async changeBindingAtIndex(index: number, value: ButtonBinding) {
-        await this.modbus?.setHoldingRegister(1, this.fixture * 7 + this.dropTargetButton, encodeBinding(value));
+        await this.modbus?.setHoldingRegister(this.deviceId, this.fixture * 7 + this.dropTargetButton, encodeBinding(value));
         const newBindings = [...this.bindings];
         newBindings[index] = value;
         this.bindings = newBindings;
@@ -171,7 +195,7 @@ export class ModbusSwitchFixture extends LitElement {
 
     clearBinding = (evt: Event) => {
         const index = parseInt((evt.target as HTMLButtonElement).dataset.index!);
-        this.modbus?.setHoldingRegister(1, this.fixture * 7 + index, 0xc000);
+        this.modbus?.setHoldingRegister(this.deviceId, this.fixture * 7 + index, 0xc000);
         this.changeBindingAtIndex(index, null);
     };
 
@@ -204,19 +228,22 @@ export class ModbusSwitchFixture extends LitElement {
     };
 
     render() {
+        const inputs = this.modbus.polledValues.get(this.deviceId)?.inputs ?? [];
+
         return html`
             <div class="wrapper">
                 <input class="underlined" type="text" value=${this.label} @change=${this.labelChanged} />
                 <div class="switchFixture">
                     ${map(range(5), (btnidx) => {
-                        const binding = this.bindings[btnidx];
+                        const address = this.fixture*7 + btnidx;
+                        const binding = this.bindings[address];
                         return html`<div
                             class=${classMap({ stateandbinding: true, dropTarget: btnidx == this.dropTargetButton })}
                             @drop=${this.drop}
                             @dragover=${this.dragover}
                             @dragleave=${this.dragleave}
                         >
-                            <button data-index=${btnidx} @click=${this.buttonClicked} class=${classMap({ switch: true, switch_on: (this.buttons & (1 << btnidx)) !== 0 })}></button>
+                            <button data-index=${btnidx} @click=${this.buttonClicked} class=${classMap({ switch: true, switch_on: inputs[address] > 0 })}></button>
                             ${when(binding, () => html`
                                 <span class="binding"> ${binding && `${binding[0] === "modbus" ? "relay" : binding[0]} ${binding[1]}`} </span>
                                 <button data-index=${btnidx} class="delbinding" @click=${this.clearBinding}>&#x2717;</button>

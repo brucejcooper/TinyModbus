@@ -38,13 +38,6 @@ function calcCrc(arr: Uint8Array) {
     new DataView(arr.buffer, arr.length - 2).setUint16(0, crc, true);
 }
 
-function convertUint8_to_hexStr(uint8: Uint8Array) {
-    let res = "";
-    for (let i = 0; i < uint8.length; i++) {
-        res += uint8[i].toString(16).padStart(2, "0");
-    }
-    return res;
-}
 
 interface Command<X> {
     cmdBytes: Uint8Array;
@@ -71,7 +64,7 @@ export enum ModbusCommand {
 function toU16Array(bytes: Uint8Array): number[] {
     const arr = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const res: number[] = [];
-    for (let i = 0; i < bytes.byteLength/2; i+= 2) {
+    for (let i = 0; i < bytes.byteLength / 2; i += 2) {
         res.push(arr.getUint16(i, false));
     }
     return res;
@@ -96,12 +89,12 @@ export class ModbusError extends Error {
     }
 }
 
-function executeWithTimeout<X>(p: Promise<X>, timeout: number): Promise<X> {
-    return Promise.race<X>([p, new Promise((_, reject) => {
-        setTimeout(reject, timeout, new Error("timeout"));
-    })])
+class TimeoutError extends Error {
+    constructor(msg: string) {
+        super(msg);
+        Object.setPrototypeOf(this, TimeoutError.prototype);
+    }
 }
-
 
 
 class ModbusResponseChunker {
@@ -119,7 +112,7 @@ class ModbusResponseChunker {
 
     readTimeout = () => {
         if (this.reject) {
-            this.reject(new Error(`Read timeout after reading ${this.readLen} response bytes`));
+            this.reject(new TimeoutError(`Read timeout after reading ${this.readLen} response bytes`));
             this.readLen = 0;
             this.resolve = undefined;
             this.reject = undefined;
@@ -186,16 +179,74 @@ class ModbusResponseChunker {
     }
 
 
-    read = (): Promise<Uint8Array<ArrayBuffer>> => {
+    read = (timeout = 1000): Promise<Uint8Array<ArrayBuffer>> => {
         if (this.resolve) {
             throw new Error("Only one concurrent read call allowed");
         }
         return new Promise<Uint8Array<ArrayBuffer>>((resolve, reject) => {
             this.resolve = resolve;
             this.reject = reject;
-            this.resetTimer = setTimeout(this.readTimeout, 1000);
+            this.resetTimer = setTimeout(this.readTimeout, timeout);
         });
     }
+}
+
+export type PollType = "inputs" | "coils" | "holding";
+
+interface DevicePoll {
+    deviceId: number;
+    type: PollType;
+    startAddress: number;
+    count: number;
+}
+
+
+function createGetHoldingRegistersCommand(device: number, start_address: number, num_registers: number) {
+    const arr = new Uint8Array(8);
+    const dv = new DataView(arr.buffer);
+    dv.setUint8(0, device);
+    dv.setUint8(1, ModbusCommand.READ_HOLDING_REGISTERS);
+    dv.setUint16(2, start_address);
+    dv.setUint16(4, num_registers);
+    return arr;
+}
+
+function createGetCoilsCommand(device: number, start_address: number, num_coils: number) {
+
+    const arr = new Uint8Array(8);
+    const dv = new DataView(arr.buffer);
+    dv.setUint8(0, device);
+    dv.setUint8(1, ModbusCommand.READ_COILS);
+    dv.setUint16(2, start_address);
+    dv.setUint16(4, num_coils);
+    return arr;
+
+}
+
+function createGetDiscreteInputsCommand(device: number, start_address: number, num_coils: number) {
+    const arr = new Uint8Array(8);
+    const dv = new DataView(arr.buffer);
+    dv.setUint8(0, device);
+    dv.setUint8(1, ModbusCommand.READ_DISCRETE_INPUTS);
+    dv.setUint16(2, start_address);
+    dv.setUint16(4, num_coils);
+    return arr;
+}
+
+export interface ModbusDeviceValues {
+    coils: number[];
+    holding: number[];
+    inputs: number[];
+    failures: number;
+}
+
+type ListenerCallback = (value: number, type: PollType, deviceId: number, address: number) => void;
+
+interface Listener {
+    type?: PollType,
+    deviceId?: number,
+    addressRange?: [number, number],
+    callback: ListenerCallback;
 }
 
 
@@ -209,19 +260,74 @@ export class ModbusConnection {
         "open": [],
     };
 
+
+    // We split each of the address spaces up into smaller chunks to make it more responsive. 
+    polls: DevicePoll[] = [
+        // the Switches
+        { type: "inputs", deviceId: 2, startAddress: 0, count: 32 },
+        { type: "inputs", deviceId: 2, startAddress: 32, count: 32 },
+        { type: "inputs", deviceId: 2, startAddress: 64, count: 32 },
+        { type: "inputs", deviceId: 2, startAddress: 96, count: 32 },
+        { type: "inputs", deviceId: 2, startAddress: 128, count: 32 },
+        { type: "inputs", deviceId: 2, startAddress: 160, count: 8 },
+        // Relays
+        { type: "coils", deviceId: 1, startAddress: 0, count: 32 },
+        // DALI 1
+        { type: "holding", deviceId: 3, startAddress: 0, count: 16 },
+        { type: "holding", deviceId: 3, startAddress: 16, count: 16 },
+        { type: "holding", deviceId: 3, startAddress: 32, count: 16 },
+        { type: "holding", deviceId: 3, startAddress: 48, count: 16 },
+    ];
+    nextPoll = 0;
+    commandLoopRunning = false;
+
+
+    polledValues: Map<number, ModbusDeviceValues> = new Map<number, ModbusDeviceValues>();
     awaitingPacket: ((pkt: Uint8Array<ArrayBuffer>) => void) | null = null;
     responseReader?: ModbusResponseChunker;
+
+    listeners: Listener[] = [];
+
+    constructor() {
+        for (let p of this.polls) {
+            this.polledValues.set(p.deviceId, { coils: [], inputs: [], holding: [], failures: 0 });
+        }
+    }
 
     private addCommand<X>(cmd: Uint8Array): Promise<X> {
         if (!this.port) {
             throw new Error("Not open");
         }
         return new Promise<X>((resolve, reject) => {
-            if (this.pendingCommands.push({ cmdBytes: cmd, resolve, reject, }) == 1) {
-                this.processCommands();
-            }
+            this.pendingCommands.push({ cmdBytes: cmd, resolve, reject, });
         });
     }
+
+    addPollChangeHandler(handler: ListenerCallback, filter?: Omit<Listener, "callback">) {
+        const l = { ...filter, callback: handler };
+        console.log("Adding listener", l);
+        this.listeners.push(l);
+    }
+
+    removePollChangeHandler(handler: ListenerCallback, filter: Omit<Listener, "callback"> = {}) {
+        const idx = this.listeners.findIndex(l => l.callback === handler && l.type == filter.type && l.deviceId == filter.deviceId && (l.addressRange == undefined && filter.addressRange === undefined) || (l.addressRange && filter.addressRange && l.addressRange[0] == filter.addressRange[0] && l.addressRange[1] == filter.addressRange[1]))
+        if (idx !== -1) {
+            this.listeners.slice(idx, 1);
+        }
+    }
+
+    dispatchValueChange = (type: PollType, deviceId: number, address: number, value: number) => {
+        for (let l of this.listeners) {
+
+            if ((l.type === undefined || l.type === type) &&
+                (l.deviceId === undefined || l.deviceId === deviceId) && 
+                (l.addressRange === undefined || (address >= l.addressRange[0] && address <= l.addressRange[0] + l.addressRange[1]))
+            ) {
+                l.callback(value, type, deviceId, address);
+            }
+        }
+    }
+
 
     addEventHandler(evt: ModbusConnectionEventType, handler: EventHandler) {
         this.eventHandlers[evt].push(handler);
@@ -239,34 +345,22 @@ export class ModbusConnection {
         }
     }
 
-    setCoil(device: number, address: number, value: boolean) {
+    setCoil(device: number, address: number, value: boolean | "toggle") {
         const arr = new Uint8Array(8);
         const dv = new DataView(arr.buffer);
         dv.setUint8(0, device);
         dv.setUint8(1, ModbusCommand.WRITE_SINGLE_COIL);
         dv.setUint16(2, address);
-        dv.setUint16(4, value ? 0xff00 : 0x0000);
+        dv.setUint16(4, value === "toggle" ? 0x5500 : value ? 0xff00 : 0x0000);
         return this.addCommand<null>(arr);
     }
 
     getCoils(device: number, start_address: number, num_coils: number) {
-        const arr = new Uint8Array(8);
-        const dv = new DataView(arr.buffer);
-        dv.setUint8(0, device);
-        dv.setUint8(1, ModbusCommand.READ_COILS);
-        dv.setUint16(2, start_address);
-        dv.setUint16(4, num_coils);
-        return this.addCommand<bigint>(arr);
+        return this.addCommand<bigint>(createGetCoilsCommand(device, start_address, num_coils));
     }
 
     getDiscreteInputs(device: number, start_address: number, num_coils: number) {
-        const arr = new Uint8Array(8);
-        const dv = new DataView(arr.buffer);
-        dv.setUint8(0, device);
-        dv.setUint8(1, ModbusCommand.READ_DISCRETE_INPUTS);
-        dv.setUint16(2, start_address);
-        dv.setUint16(4, num_coils);
-        return this.addCommand<bigint>(arr);
+        return this.addCommand<bigint>(createGetDiscreteInputsCommand(device, start_address, num_coils));
     }
 
     setHoldingRegister(device: number, address: number, value: number) {
@@ -300,15 +394,9 @@ export class ModbusConnection {
         return res;
     }
 
-    getHoldingRegisters(device: number, start_address: number, num_registers: number) {
-        const arr = new Uint8Array(8);
-        const dv = new DataView(arr.buffer);
-        dv.setUint8(0, device);
-        dv.setUint8(1, ModbusCommand.READ_HOLDING_REGISTERS);
-        dv.setUint16(2, start_address);
-        dv.setUint16(4, num_registers);
 
-        return this.addCommand<number[]>(arr);
+    getHoldingRegisters(device: number, start_address: number, num_registers: number) {
+        return this.addCommand<number[]>(createGetHoldingRegistersCommand(device, start_address, num_registers));
     }
 
     open = async (port: SerialPort) => {
@@ -317,86 +405,142 @@ export class ModbusConnection {
         await this.port.open({ baudRate: 9600 });
         // An independent process to receive responses. 
         this.responseReader = new ModbusResponseChunker(this.port.readable!.getReader());
+        this.commandLoopRunning = true;
+        this.commandLoop();
         this.dispatch("open");
     }
 
-
-
-
-    private async processCommands() {
-        while (this.pendingCommands.length > 0) {
-            const { cmdBytes, resolve, reject } = this.pendingCommands[0];
-            const writer = this.port?.writable?.getWriter();
-            if (!writer || !this.responseReader) {
-                throw new Error("No reader");
-            }
+    private async commandLoop() {
+        while (this.commandLoopRunning) {
             try {
-                calcCrc(cmdBytes);
-                // console.log("Transmitting", convertUint8_to_hexStr(command, command.length));
-                writer.write(cmdBytes);
-                const response = await this.responseReader.read();
-
-                // The response will be a valid MODBUS response.
-                let cmd = response[1];
-                let len;
-
-                if (cmd & 0x80) {
-                    const errorCode = response[2];
-                    // ox01 as gateway device failed to respond - i.e. a NAK
-                    if (errorCode == 0x0a) {
-                        resolve(null);
-                    } else {
-                        reject(new ModbusError(modbus_error_codes[errorCode] ?? `Unknown error ${errorCode}`, errorCode));
+                if (this.pendingCommands.length > 0) {
+                    const { cmdBytes, resolve, reject } = this.pendingCommands[0];
+                    try {
+                        resolve(await this.executeCommand(cmdBytes));
+                    } catch (ex) {
+                        reject(ex);
+                    } finally {
+                        // Remove the pending command from the queue.
+                        this.pendingCommands.shift();
                     }
-                }
-                switch (cmd) {
-                    case ModbusCommand.READ_COILS:
-                    case ModbusCommand.READ_DISCRETE_INPUTS:
-                    case ModbusCommand.READ_HOLDING_REGISTERS:
-                    case ModbusCommand.READ_INPUT_REGISTERS:
-                        // Length delimited result.
-                        len = response[2];
-                        const responseBytes = response.slice(3, 3 + len);
-
-                        if (cmd <= ModbusCommand.READ_DISCRETE_INPUTS) {
-                            // Bitfield response, represented as a bigint.
-                            resolve(toBigInt(response));
-                        } else {
-                            // U16 array response
-                            resolve(toU16Array(responseBytes));
+                } else {
+                    const poll = this.polls[this.nextPoll];
+                    const deviceData = this.polledValues.get(poll.deviceId);
+                    if (!deviceData) {
+                        throw new Error(`No Device Data for device ${poll.deviceId}`);
+                    }
+                    try {
+                        switch (poll.type) {
+                            // case "coils":
+                            //     await 
+                            case "coils":
+                            case "inputs":
+                                const bitMap = (await this.executeCommand(poll.type === "inputs" ? createGetDiscreteInputsCommand(poll.deviceId, poll.startAddress, poll.count) : createGetCoilsCommand(poll.deviceId, poll.startAddress, poll.count), 100)) as bigint;
+                                // console.log("Coils", poll.startAddress, "..", poll.startAddress + poll.count, "=", coils);
+                                for (let i = 0; i < poll.count; i++) {
+                                    const addr = i + poll.startAddress;
+                                    const coilVal = bitMap & BigInt(1 && i) ? 1 : 0;
+                                    if (deviceData.coils[addr] !== coilVal) {
+                                        deviceData.coils[addr] = coilVal;
+                                        this.dispatchValueChange(poll.type, poll.deviceId, addr, coilVal);
+                                    }
+                                }
+                                break;
+                            case "holding":
+                                const regs = (await this.executeCommand(createGetHoldingRegistersCommand(poll.deviceId, poll.startAddress, poll.count), 100)) as number[];
+                                for (let i = 0; i < poll.count; i++) {
+                                    const addr = i + poll.startAddress;
+                                    if (deviceData.holding[addr] !== regs[i]) {
+                                        deviceData.holding[addr] = regs[i];
+                                        this.dispatchValueChange(poll.type, poll.deviceId, addr, regs[i]);
+                                    }
+                                }
+                                break;
                         }
-                        break;
-
-                    case ModbusCommand.WRITE_SINGLE_COIL:
-                    case ModbusCommand.WRITE_SINGLE_REGISTER:
-                        resolve(null);
-                        break;
-
-                    case ModbusCommand.MODBUS_CMD_CUSTOM_EXEC_DALI:
-                        resolve(response[2]);
-                        break;
-
-                    case ModbusCommand.MODBUS_CMD_CUSTOM_START_PROCESS:
-                        resolve(null);
-                        break;
-
-                    default:
-                        reject(new Error("Unknown command"));
-                        break;
+                    } catch (ex) {
+                        if (ex instanceof TimeoutError) {
+                            if (++deviceData.failures >= 5) {
+                                // zero out the data.
+                            }
+                        } else {
+                            throw ex;
+                        }
+                    }
+                    this.nextPoll = (this.nextPoll + 1) % this.polls.length;
                 }
-
-                // Mandatory timing gap between packets.
-                await new Promise((resolve) => setTimeout(resolve, 2));
             } catch (ex) {
-                reject(ex);
-                // console.error(ex);
-            } finally {
-                // Remove the pending command from the queue.
-                this.pendingCommands.shift();
-                writer.releaseLock();
+                console.log("Error in command loop", ex);
+                this.commandLoopRunning = false;
             }
+            await new Promise((resolve) => setTimeout(resolve, 2));
+
+        }
+        console.log("Command loop teminated")
+    }
+
+
+    private async executeCommand(cmdBytes: Uint8Array<ArrayBufferLike>, timeout = 1000) {
+        const writer = this.port?.writable?.getWriter();
+        if (!writer || !this.responseReader) {
+            throw new Error("No reader");
+        }
+        try {
+            calcCrc(cmdBytes);
+            // console.log("Transmitting", convertUint8_to_hexStr(command, command.length));
+            writer.write(cmdBytes);
+            const response = await this.responseReader.read(timeout);
+
+            // The response will be a valid MODBUS response.
+            let cmd = response[1];
+            let len;
+
+            if (cmd & 0x80) {
+                const errorCode = response[2];
+                // ox01 as gateway device failed to respond - i.e. a NAK
+                if (errorCode == 0x0a) {
+                    return null;
+                } else {
+                    throw new ModbusError(modbus_error_codes[errorCode] ?? `Unknown error ${errorCode}`, errorCode);
+                }
+            }
+            switch (cmd) {
+                case ModbusCommand.READ_COILS:
+                case ModbusCommand.READ_DISCRETE_INPUTS:
+                case ModbusCommand.READ_HOLDING_REGISTERS:
+                case ModbusCommand.READ_INPUT_REGISTERS:
+                    // Length delimited result.
+                    len = response[2];
+                    const responseBytes = response.slice(3, 3 + len);
+
+                    if (cmd <= ModbusCommand.READ_DISCRETE_INPUTS) {
+                        // Bitfield response, represented as a bigint.
+                        return toBigInt(response);
+                    } else {
+                        // U16 array response
+                        return toU16Array(responseBytes);
+                    }
+
+                case ModbusCommand.WRITE_SINGLE_COIL:
+                case ModbusCommand.WRITE_SINGLE_REGISTER:
+                    return null;
+
+                case ModbusCommand.MODBUS_CMD_CUSTOM_EXEC_DALI:
+                    return response[2];
+
+                case ModbusCommand.MODBUS_CMD_CUSTOM_START_PROCESS:
+                    return null;
+
+                default:
+                    return new Error("Unknown command");
+            }
+
+            // Mandatory timing gap between packets.
+        } finally {
+            writer.releaseLock();
         }
     }
+
+
 
     async close() {
         console.log("closing serial port");

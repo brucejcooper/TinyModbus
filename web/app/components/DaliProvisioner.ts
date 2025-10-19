@@ -5,6 +5,7 @@ export interface DaliProvisionStatus {
 }
 
 export interface ProvisionDaliOpts {
+    deviceId: number;
     initAll?: boolean;
     dryRun?: boolean;
     signal?: AbortSignal;
@@ -47,11 +48,11 @@ export class DaliProvisioner {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
 
-    private async anyDaliDevicesLessThanOrEqualTo(val: number) {
-        await this.modbus.executeCustomDaliCommand(1, 0xb100 | ((val >> 16) & 0xff));
-        await this.modbus.executeCustomDaliCommand(1, 0xb300 | ((val >> 8) & 0xff));
-        await this.modbus.executeCustomDaliCommand(1, 0xb500 | (val & 0xff));
-        const searchResult = await this.modbus.executeCustomDaliCommand(1, 0xa900);
+    private async anyDaliDevicesLessThanOrEqualTo(deviceId: number, val: number) {
+        await this.modbus.executeCustomDaliCommand(deviceId, 0xb100 | ((val >> 16) & 0xff));
+        await this.modbus.executeCustomDaliCommand(deviceId, 0xb300 | ((val >> 8) & 0xff));
+        await this.modbus.executeCustomDaliCommand(deviceId, 0xb500 | (val & 0xff));
+        const searchResult = await this.modbus.executeCustomDaliCommand(deviceId, 0xa900);
         return searchResult !== null;
     }
 
@@ -61,12 +62,12 @@ export class DaliProvisioner {
      * @param high Highest possible ID that can be present. May as well always be 0xFFFFFF
      * @returns
      */
-    private async findLowestRandomAddress(low = 0, high = 0xffffff): Promise<number | undefined> {
+    private async findLowestRandomAddress(deviceId: number, low = 0, high = 0xffffff): Promise<number | undefined> {
         if (this.signal?.aborted) {
             return undefined;
         }
         // As a sanity check, make sure there's at least one device in initialisation mode, otherwise we'll be looking for ages.
-        const lessThanHigh = await this.anyDaliDevicesLessThanOrEqualTo(high);
+        const lessThanHigh = await this.anyDaliDevicesLessThanOrEqualTo(deviceId, high);
         if (!lessThanHigh) {
             return undefined;
         }
@@ -77,7 +78,7 @@ export class DaliProvisioner {
             }
             const testPoint = Math.floor((low + high) / 2);
 
-            const lessThanMiddle = await this.anyDaliDevicesLessThanOrEqualTo(testPoint);
+            const lessThanMiddle = await this.anyDaliDevicesLessThanOrEqualTo(deviceId, testPoint);
             console.log("Search", low, testPoint, high, lessThanMiddle);
             if (lessThanMiddle) {
                 if (low == testPoint) {
@@ -93,7 +94,7 @@ export class DaliProvisioner {
         return undefined;
     }
 
-    async provision({ initAll, onUpdate, dryRun }: ProvisionDaliOpts) {
+    async provision({ deviceId, initAll, onUpdate, dryRun }: ProvisionDaliOpts) {
         try {
             if (initAll) {
                 if (dryRun) {
@@ -101,9 +102,9 @@ export class DaliProvisioner {
                 } else {
                     console.log("Clearing all existing Short IDs");
                     // Set DTR0 to 255
-                    await this.modbus.executeCustomDaliCommand(1, 0xa3ff);
+                    await this.modbus.executeCustomDaliCommand(deviceId, 0xa3ff);
                     // Broadcast clear Short address
-                    await this.modbus.executeCustomDaliCommand(1, 0xff80, true);
+                    await this.modbus.executeCustomDaliCommand(deviceId, 0xff80, true);
                 }
             }
 
@@ -117,7 +118,7 @@ export class DaliProvisioner {
             console.log("checking for available device IDs");
             for (let i = 0; i < 64 && !this.signal.aborted; i++) {
                 // Query Control Gear Present for each address.
-                const present = await this.modbus.executeCustomDaliCommand(1, 0x0191 | (i << 9), true);
+                const present = await this.modbus.executeCustomDaliCommand(deviceId, 0x0191 | (i << 9), true);
                 if (present == null) {
                     console.log("Address", i, "available");
                     availableAddresses.push(i);
@@ -132,20 +133,20 @@ export class DaliProvisioner {
 
             console.log("Putting devices in provisioning mode");
             // Terminate any existing provisioning processes.
-            await this.modbus.executeCustomDaliCommand(1, 0xa100);
+            await this.modbus.executeCustomDaliCommand(deviceId, 0xa100);
 
             if (this.signal.aborted) {
                 return;
             }
 
             // Initialise - if initialising All then broadcast (0x00), otherwise all without short addresses (0xFF)
-            await this.modbus.executeCustomDaliCommand(1, initAll ? 0xa500 : 0xa5ff, true);
+            await this.modbus.executeCustomDaliCommand(deviceId, initAll ? 0xa500 : 0xa5ff, true);
             if (this.signal.aborted) {
                 return;
             }
 
             // Randomise
-            await this.modbus.executeCustomDaliCommand(1, 0xa700, true);
+            await this.modbus.executeCustomDaliCommand(deviceId, 0xa700, true);
             if (this.signal.aborted) {
                 return;
             }
@@ -157,7 +158,7 @@ export class DaliProvisioner {
             let lowestRandomDeviceIdFound: number | undefined = -1;
             do {
                 console.log("Looking for a device by its random address");
-                lowestRandomDeviceIdFound = await this.findLowestRandomAddress(lowestRandomDeviceIdFound + 1);
+                lowestRandomDeviceIdFound = await this.findLowestRandomAddress(deviceId, lowestRandomDeviceIdFound + 1);
                 if (lowestRandomDeviceIdFound !== undefined) {
                     console.log("Found device at random address", lowestRandomDeviceIdFound.toString(16).padStart(6, "0"));
 
@@ -171,17 +172,17 @@ export class DaliProvisioner {
                         console.log("assigning address ", deviceAddress);
 
                         // Program Short Address
-                        await this.modbus.executeCustomDaliCommand(1, 0xb701 | (deviceAddress << 1), true);
+                        await this.modbus.executeCustomDaliCommand(deviceId, 0xb701 | (deviceAddress << 1), true);
 
                         // Verify Short Address
-                        const verify = await this.modbus.executeCustomDaliCommand(1, 0xb901 | (deviceAddress << 1), true);
+                        const verify = await this.modbus.executeCustomDaliCommand(deviceId, 0xb901 | (deviceAddress << 1), true);
                         if (verify !== 0xff) {
                             throw new Error("Device did not verify its write");
                         }
                     }
 
                     // Withdraw the device we just provisioned.
-                    await this.modbus.executeCustomDaliCommand(1, 0xab00);
+                    await this.modbus.executeCustomDaliCommand(deviceId, 0xab00);
                 } else {
                     console.log("No device found");
                 }
@@ -191,7 +192,7 @@ export class DaliProvisioner {
             console.log("Provisioning Done");
         } finally {
             // Terminate
-            await this.modbus.executeCustomDaliCommand(1, 0xa100);
+            await this.modbus.executeCustomDaliCommand(deviceId, 0xa100);
             this._completed = true;
             this.eventHandlers.forEach((eh) => {
                 try {

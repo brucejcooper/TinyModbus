@@ -6,8 +6,10 @@ import { provide } from "@lit/context";
 import { modbusContext } from "./ModbusConnectionContext";
 import { SwitchFixtureID } from "./ModbusSwitchFixture";
 import { DaliProvisioner } from "./DaliProvisioner";
-import "./ModbusDaliGateway"
+import "./ModbusDevice"
 import "./DaliLightEditor"
+import "./ModbusCoilEditor"
+import "./ModbusInputBindingsEditor"
 
 
 @customElement("modbus-app")
@@ -86,31 +88,6 @@ export class ModbusApplication extends LitElement {
         }
     }
 
-    provisionStatusUpdated = () => { };
-
-    provisionDaliReassign = () => {
-        this.provisionDali(true);
-    };
-
-    provisionDaliUnassigned = () => {
-        this.provisionDali(false);
-    };
-
-    private provisionDali = async (initAll: boolean) => {
-        if (!this.modbus) {
-            return;
-        }
-        if (this.daliProvisioner) {
-            this.daliProvisioner.abort();
-        }
-
-        this.daliProvisioner = new DaliProvisioner(this.modbus);
-        this.daliProvisioner.addEventListener("completed", () => {
-            this.daliProvisioner = undefined;
-        });
-
-        await this.daliProvisioner.provision({ initAll, onUpdate: this.provisionStatusUpdated });
-    };
 
     stopProvision = async () => {
         this.daliProvisioner?.abort();
@@ -137,11 +114,22 @@ export class ModbusApplication extends LitElement {
 
         let deviceEditor: TemplateResult<1>|null|undefined = null;
 
-        if (this.selectedDevice?.startsWith("dali:")) {
-            const [deviceId,  address] = this.selectedDevice.substring(5).split('/').map(s => parseInt(s));
-            console.log("Dali device", deviceId, "address", address, "for ", this.selectedDevice.substring(5).split('/').map(s => parseInt(s)))
-            deviceEditor = html`<dali-light-editor .deviceId=${deviceId} .address=${address}></dali-light-editor>`;
-        } else {
+        if (this.selectedDevice) {
+            const split = this.selectedDevice.split(/[:\/]/);
+            const type = split[0];
+            const deviceId = parseInt(split[1]);
+            const address = parseInt(split[2]);
+            switch (type) {
+                case 'dali':
+                    deviceEditor = html`<dali-light-editor .deviceId=${deviceId} .address=${address}></dali-light-editor>`;
+                    break;
+                case 'coils':
+                    deviceEditor = html`<modbus-coil-editor .deviceId=${deviceId} .address=${address}></modbus-coil-editor>`;
+                case "inputs":
+                    deviceEditor = html`<modbus-input-bindings-editor .deviceId=${deviceId} .address=${address}></modbus-input-bindings-editor>`;
+            }
+        }
+        if (!deviceEditor) {
             deviceEditor = html`<div class="alert alert-primary" role="alert">
   Select a device to edit its properties here
 </div>`;
@@ -185,17 +173,17 @@ export class ModbusApplication extends LitElement {
                     </div> 
                 </nav>
 
-                <div class="d-flex flex-column flex-grow-1 p-3 text-bg-tertiary" @modbus-device-selected=${this.setSelectedDevice}>  
-                    <modbus-dali-gateway deviceId="3" .selectedDevice=${this.selectedDevice}></modbus-dali-gateway>
+                <div class="d-flex flex-column flex-grow-1 p-3 text-bg-tertiary" style="gap: 1em; overflow-y: auto; max-height: 100vh" @modbus-device-selected=${this.setSelectedDevice}>  
+                    <modbus-device deviceId="2" type="inputs" .numAddresses=${168} .selectedDevice=${this.selectedDevice}></modbus-device>
+                    <modbus-device deviceId="1" type="coils" .numAddresses=${32} .selectedDevice=${this.selectedDevice}></modbus-device>
+                    <modbus-device deviceId="3" type="dali" .numAddresses=${64} .selectedDevice=${this.selectedDevice}></modbus-device>
                 </div>            
 
                 <div class="" style=" width: 0.5rem; height: 100vh; flex-shrink: 0; background-color: #0000001a; border: solid rgba(0,0,0,.15); border-width: 1px 0; box-shadow: inset 0 .5em 1.5em #0000001a,inset 0 .125em .5em #00000026;"></div>
 
-                <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="width: 330px;"> 
+                <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="min-width: 330px;"> 
                     ${deviceEditor}
                 </div>            
-
-
             </main>
         `;
     }

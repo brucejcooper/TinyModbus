@@ -432,10 +432,9 @@ extern bool rs485_process_command() {
     return true;
 }
 
-
-
 ISR(USART0_RXC_vect) {
     if (USART0.STATUS & USART_RXSIF_bm) {
+        // Nothing to do here, just clear the interrupt flag.
         USART0.STATUS = USART_RXSIF_bm;
     }
 

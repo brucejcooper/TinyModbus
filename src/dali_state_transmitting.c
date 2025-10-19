@@ -58,7 +58,7 @@ extern void dali_transmitting_state_enter(dali_command_t *cmd) {
     bitsLeft = 17; // One extra for the stop bit. 
     on_timeout(USEC_TO_TICKS(DALI_HALF_BIT_USECS), halfBitToggle);
     TCA0.SINGLE.CNT = 38;  // Give it a bit of head start for the first bit, as there is latency in ISR latency and set up to consider.
-    DALI_PORT.OUTSET = DALI_TX_bm;
+    DALI_PORT.OUTSET = DALI_TX_bm; // Short dali line (start of start)
     TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm; // Start TCA0 for timeout.
 }
 

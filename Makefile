@@ -1,4 +1,4 @@
-DEVICE     	= attiny806
+DEVICE     	= attiny1604
 CLOCK      	= 3333333
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main

@@ -13,15 +13,29 @@
 // 19.86 ms is the highest value that this will support.
 #define USEC_TO_TICKS(u) ((uint16_t)(((float)u) * (F_CPU / 1000000.0) + 0.5))
 
-typedef void (*pulsewidth_handler_t)(uint16_t pulse_width);
 
-void timeout_init();
-void update_timeout(uint16_t to);
-void on_timeout(uint16_t timeout, void (*callback)());
-void start_timeout();
-void cancel_timeout();
-void reset_timeout();
-void restart_timeout();
-void update_timeout_callback(void (*callback)());
+
+typedef void (*timer_callback_t)();
+
+#define TIMER_DALI 0
+#define TIMER_RS485 1
+#define TIMER_MAX 2
+
+typedef struct {
+    uint8_t next;
+    bool active;
+    timer_callback_t callback;
+} timer_t;
+
+
+extern timer_t daliTimer;
+extern timer_t rs485Timer;
+extern volatile uint8_t timerCurrentTick;
+
+extern void timer_init();
+// extern void timer_set_cb(uint8_t idx, timer_callback_t cb);
+// extern void timer_exec_in(uint8_t idx, uint8_t ticks);
+// extern void timer_stop(uint8_t idx);
+#define timer_extend(timer, ticks) { timer.next += (ticks); timer.active = true;}
 
 #endif

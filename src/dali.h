@@ -8,6 +8,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <avr/io.h>
 
 typedef enum { 
     DALI_OK = 0, 
@@ -69,10 +70,16 @@ typedef struct {
 } dali_initialvalues_bank_t;
 
 
-
+typedef union {
+    uint16_t shortVal;
+    struct {
+        uint8_t high;
+        uint8_t low;
+    };
+} modbus_register_t;
 
 typedef struct {
-    uint16_t power[DALI_MAX_DEVICES];
+    modbus_register_t power[DALI_MAX_DEVICES];
     // dali_minmax_bank_t minmax[DALI_MAX_DEVICES];
     // dali_fade_bank_t fade[DALI_MAX_DEVICES];
     // dali_initialvalues_bank_t initialValues[DALI_MAX_DEVICES];
@@ -96,8 +103,7 @@ typedef struct dali_command_t {
 extern dali_all_holding_registers_t dali_holding_regs;
 #define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
 
-
-
+extern void pulse_led();
 
 extern void dali_init();
 uint8_t dali_is_bus_shorted();
@@ -113,6 +119,8 @@ void dali_waiting_for_response_state_enter();
 
 void dali_call_on_rising_once(void (*callback)());
 void dali_call_on_low_once(void (*callback)());
+void dali_cancel_edge_detect();
+
 
 // Receiving state.
 void dali_state_receiving_prepare();
@@ -120,7 +128,7 @@ void dali_state_receiving_enter();
 
 
 void dali_wait_for_response_state_enter();
-bool dali_is_idle();
+extern volatile bool dali_idle;
 void send_command_response(dali_response_type_t err, uint8_t res);
 void dali_state_init();
 

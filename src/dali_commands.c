@@ -10,13 +10,9 @@
 static void scan_result_received(dali_response_type_t err, uint16_t cmd, uint8_t response) {
     uint8_t addr = DALI_DECODE_ADDR(cmd);
     if (addr < 64) {
-        switch (err) {
-            case DALI_RESPONSE_OK:
-                // The power register is automatically updated.
-                // dali_holding_regs.power[addr] = response;
-                break;
-            default:
-                dali_holding_regs.power[addr] = err;
+        // The power register is automatically updated, but if there was an error, set the holding register to that value.
+        if (err) {
+            dali_holding_regs.power[addr].shortVal = err;
         }
         if (addr < 63) {
             dali_start_scan(addr + 1);
@@ -59,7 +55,9 @@ static void toggle_based_on_level(dali_response_type_t err, uint16_t cmd, uint8_
     }
 }
 
-void dali_start_scan(uint8_t addr) { dali_queue_command(ENCODE_CMD(DALI_CMD_GET_LEVEL, addr), scan_result_received, 1); }
+void dali_start_scan(uint8_t addr) { 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_LEVEL, addr), scan_result_received, 1); 
+}
 
 void dali_set_level(uint8_t addr, uint8_t level) { dali_queue_command(ENCODE_CMD(level, addr), track_fade, 1); }
 

@@ -49,10 +49,13 @@ typedef enum {
 
 static uint8_t deviceId = 1;
 
-static uint16_t modbuscrc = 0xFFFF;
-static uint8_t modbusbuf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 256 that MODBUS allows for)
-static uint8_t *modbusptr = modbusbuf;
-static uint8_t modbus_sz = 0;
+static volatile uint16_t crc = 0xFFFF;
+static uint8_t buf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 256 that MODBUS allows for)
+static volatile uint8_t *ptr = buf;
+static volatile uint8_t sz = 0;
+volatile bool modbus_idle = false;
+
+volatile uint8_t readCountDown;
 
 /**
  * Stores an indentifier string for this device.  Clients can fetch 32 registers worth of Input registers at address 0 to get the string.
@@ -75,9 +78,10 @@ static const uint16_t crc_table[256] = {
     0x4B00, 0x8BC1, 0x8A81, 0x4A40, 0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41, 0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680,
     0x8641, 0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040};
 
-static void appendCrc(uint8_t *pkt, uint8_t len) {
+
+static inline void appendCrc(uint8_t *pkt, uint8_t len) {
     uint16_t crc = 0xFFFF;
-    modbus_sz = len + 2;
+    sz = len + 2;
     while (len--) {
         uint8_t xor = (*pkt++) ^ crc;
         crc >>= 8;
@@ -95,17 +99,17 @@ static inline bool inputIsValidModbusCommand() {
     // d) the length is valid for the command.  The smallest possible modbus packet size is 8 bytes,
     //    but some a variable length
 
-    if (modbus_sz < 5) {
+    if (crc != 0 || sz < 5) {
         return false;
     }
-    uint8_t cmdDeviceId = modbusbuf[0];
-    uint8_t cmd = modbusbuf[1];
+    uint8_t cmdDeviceId = buf[0];
+    uint8_t cmd = buf[1];
     uint8_t expectedSz = 255;
 
-    if ((cmdDeviceId == deviceId || cmdDeviceId == 0) && modbuscrc == 0) {
+    if (cmdDeviceId == deviceId || cmdDeviceId == 0) {
         switch (cmd) {
             case MODBUS_WRITE_COILS_CMD:
-                expectedSz = 9 + modbusbuf[6];
+                expectedSz = 9 + buf[6];
                 break;
             case MODBUS_READ_COILS_CMD:
             case MODBUS_WRITE_SINGLE_COIL_CMD:
@@ -119,30 +123,32 @@ static inline bool inputIsValidModbusCommand() {
                 expectedSz = 7;
                 break;
         }
-
-        if (modbus_sz == expectedSz) {
-            if (modbuscrc == 0) {
-                return true;
-            } else {
-                // Indicate a CRC mismatch
-                return false;
-            }
-        }
+        return sz == expectedSz;
     }
     return false;
 }
 
-static void setErrorResponse(modbus_err_t err) {
-    modbusbuf[1] |= 0x80;  // Set the high bit to indicate an error.
-    modbusbuf[2] = err;
-    appendCrc(modbusbuf, 3);
+static void sendResponse(uint8_t *buf, uint8_t sz) {
+    appendCrc(buf, sz);
+    ptr = buf;
+
+    // We are interested in Data ready and transmisson complete.
+    USART0.STATUS = USART_TXCIF_bm;  // Clear any existing transmission complete flag set.
+    USART0.CTRLA = USART_RS485_EXT_gc | USART_DREIE_bm | USART_TXCIE_bm;
+}
+
+static void sendError(modbus_err_t err) {
+    buf[0] = deviceId;
+    buf[1] |= 0x80;  // Set the high bit to indicate an error.
+    buf[2] = err;
+    sendResponse(buf, 3);
 }
 
 static void processGetCoilsCommand() {
-    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
-    uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
-    uint8_t *dptr = modbusbuf + 2;
-    uint16_t *sptr = dali_holding_regs.power + addr;
+    uint16_t addr = buf[2] << 8 | buf[3];
+    uint16_t count = buf[4] << 8 | buf[5];
+    uint8_t *dptr = buf + 2;
+    uint16_t *sptr = (uint16_t *)dali_holding_regs.power + addr;
 
     if (count > 0 && addr + count <= DALI_MAX_DEVICES) {
         *dptr = count / 8 + (count % 8 ? 1 : 0);
@@ -152,30 +158,30 @@ static void processGetCoilsCommand() {
             }
             *dptr = *dptr << 1 | (*sptr++ ? 1 : 0);
         }
-        appendCrc(modbusbuf, modbusbuf[2] + 3);
+        sendResponse(buf, buf[2] + 3);
     } else {
         // We can't query downstream sources, so this should return an illegal address error.
-        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
 }
 
 static void sendModbusRegs(uint16_t *sptr, uint16_t max) {
-    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
-    uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
+    uint16_t addr = buf[2] << 8 | buf[3];
+    uint16_t count = buf[4] << 8 | buf[5];
 
     if (count > 0 && count < 128 && addr + count <= max) {
-        modbusbuf[2] = 2 * count;
+        buf[2] = 2 * count;
         sptr += addr;
         uint16_t *end = sptr + count;
-        uint8_t *dptr = modbusbuf + 3;
+        uint8_t *dptr = buf + 3;
 
         while (sptr < end) {
             *dptr++ = *sptr >> 8;
             *dptr++ = *sptr++ & 0xFF;
         }
-        appendCrc(modbusbuf, modbusbuf[2] + 3);
+        sendResponse(buf, buf[2] + 3);
     } else {
-        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
 }
 
@@ -183,61 +189,54 @@ static void sendModbusRegs(uint16_t *sptr, uint16_t max) {
  * Sends device info, as a String, with each register holding two bytes
  */
 static void sendInfo() {
-    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
-    uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
+    uint16_t addr = buf[2] << 8 | buf[3];
+    uint16_t count = buf[4] << 8 | buf[5];
 
     if (count > 0 && addr + count <= (sizeof(verStr) / 2)) {
-        modbusbuf[2] = count * 2;
-        memcpy(modbusbuf + 3, verStr + addr * 2, count * 2);
-        appendCrc(modbusbuf, modbusbuf[2] + 3);
+        buf[2] = count * 2;
+        memcpy(buf + 3, verStr + addr * 2, count * 2);
+
+        sendResponse(buf, buf[2] + 3);
     } else {
-        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
 }
 
-static volatile bool custom_command_complete;
 static void dali_cmd_callback(dali_response_type_t type, uint16_t cmd, uint8_t response) {
     switch (type) {
         case DALI_RESPONSE_OK:
-            modbusbuf[2] = response;
-            appendCrc(modbusbuf, 3);
+            buf[2] = response;
+            sendResponse(buf, 3);
             break;
         case DALI_RESPONSE_NAK:
-            setErrorResponse(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
+            sendError(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
             break;
         case DALI_RESPONSE_MALFORMED:
-            setErrorResponse(MODBUS_ERR_SLAVE_DEVICE_FAILURE);
+            sendError(MODBUS_ERR_SLAVE_DEVICE_FAILURE);
             break;
         case DALI_RESPONSE_COLLISION:
-            setErrorResponse(MODBUS_ERR_MEMORY_PARITY_ERROR);
+            sendError(MODBUS_ERR_MEMORY_PARITY_ERROR);
             break;
         default:
-            setErrorResponse(MODBUS_ERR_ILLEGAL_FUNCTION);
+            sendError(MODBUS_ERR_ILLEGAL_FUNCTION);
             break;
     }
-    custom_command_complete = true;
 }
 
 static void processCustomDaliCommand() {
-    uint16_t cmd = modbusbuf[2] << 8 | modbusbuf[3];
-    uint8_t repeat = modbusbuf[4];
-    custom_command_complete = false;
+    uint16_t cmd = buf[2] << 8 | buf[3];
+    uint8_t repeat = buf[4];
     if (repeat > 2) {
-        setErrorResponse(MODBUS_ERR_ILLEGAL_VALUE);
+        sendError(MODBUS_ERR_ILLEGAL_VALUE);
         return;
     }
     dali_queue_command(cmd, dali_cmd_callback, repeat);
-    // dali_cmd_callback() will perform the response, but we need to wait for it.
-    // TODO add WDT
-
-    while (!custom_command_complete) {
-        ;
-    }
+    // dali_cmd_callback() will perform the response
 }
 
 static void processSetSingleHoldingRegisterCommand() {
-    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
-    uint16_t val = modbusbuf[4] << 8 | modbusbuf[5];
+    uint16_t addr = buf[2] << 8 | buf[3];
+    uint16_t val = buf[4] << 8 | buf[5];
 
     uint8_t bank = addr / 64;
     uint8_t bankAddr = addr % 64;
@@ -247,22 +246,23 @@ static void processSetSingleHoldingRegisterCommand() {
             // Its power level;
             if (val <= 254) {
                 dali_set_level(bankAddr, val);
+                sendResponse(buf, sz - 2);
             } else {
-                setErrorResponse(MODBUS_ERR_ILLEGAL_VALUE);
+                sendError(MODBUS_ERR_ILLEGAL_VALUE);
             }
             break;
         default:
-            setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+            sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
             break;
     }
 }
 
 static void processSetCoilsCommand() {
-    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
-    uint16_t count = modbusbuf[4] << 8 | modbusbuf[5];
-    uint8_t numBytes = modbusbuf[6];
+    uint16_t addr = buf[2] << 8 | buf[3];
+    uint16_t count = buf[4] << 8 | buf[5];
+    uint8_t numBytes = buf[6];
 
-    uint8_t *coilData = modbusbuf + 7;
+    uint8_t *coilData = buf + 7;
     if (addr < 8) {
         // At least some of the coil values are for this unit
         uint8_t bitsForThisUnit = 8 - addr;
@@ -276,17 +276,15 @@ static void processSetCoilsCommand() {
         // }
         // latchOutputs();
 
+        sendResponse(buf, 6);
     } else {
-        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
-    // The respnose is simply the input bytes, but only up to the address (6 bytes).
-    // We need to change the CRC.
-    appendCrc(modbusbuf, 6);
 }
 
 static void processSetSingleCoilCommand() {
-    uint16_t addr = modbusbuf[2] << 8 | modbusbuf[3];
-    uint8_t val = modbusbuf[4];
+    uint16_t addr = buf[2] << 8 | buf[3];
+    uint8_t val = buf[4];
 
     if (addr < DALI_MAX_DEVICES) {
         if (val == 0x55) {
@@ -296,12 +294,30 @@ static void processSetSingleCoilCommand() {
         } else {
             dali_off(addr);
         }
+        // Simply mirror the request back to the caller
+        sendResponse(buf, sz - 2);
     } else {
-        setErrorResponse(MODBUS_ERR_ILLEGAL_ADDRESS);
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
 }
 
+static void modbus_reset_buffer() {
+    ptr = buf;
+    crc = 0xFFFF;
+    sz = 0;
+}
+
+static void readTimeout() {
+    cli();
+    modbus_reset_buffer();
+    rs485Timer.active = false;
+    modbus_idle = true;
+    sei();
+}
+
 extern void rs485_init(uint8_t rs485_device_id) {
+    modbus_reset_buffer();
+
     deviceId = rs485_device_id;
     memset(verStr, 0, sizeof(verStr));
     snprintf(verStr, sizeof(verStr), "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", FW_VER_MAJOR, FW_VER_MINOR, SIGROW_SERNUM0,
@@ -316,127 +332,96 @@ extern void rs485_init(uint8_t rs485_device_id) {
     RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;  // PB0 (XDIR) and PB2 (TXD) are outputs
     RS485_PORT.DIRCLR = RS485_RX_bm;                // PB3 (RXD) is an input
 
-    USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD) ;  // Set Baud rate to 9600
+    USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD);  // Set Baud rate to 9600
     // N81 Async Sserial
-    USART0.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc |  USART_CHSIZE_8BIT_gc | USART_SBMODE_1BIT_gc;
-    USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm;
-    USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
+    USART0.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc | USART_CHSIZE_8BIT_gc | USART_SBMODE_1BIT_gc;
+    USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;  // ISR for Start of Frmae or reception of data.
+    USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_SFDEN_bm;        // enable reception, transmission, and wake from sleep
+
+    rs485Timer.callback = readTimeout;
+
 }
 
 /**
- * Reads a single character in from the UART, with a rough timeout.
+ * Transmits data via RS485, until we run out
  */
-static int readch() {
-    // Both timers are already in use by DALI, so we have to poll the CPU clock for timeout.
-    // If we assume that each check is 9 cycles (to make the maths easy), It'll do one cycle in 3 microseconds .
-    // So, to get 1.5 ms, we would wait for 500 cycles.
-    // If DALI is doing stuff, it will extend the timeout, but the timer need only be rough.
-    int countDown = USEC_TO_TICKS(1500) / 9;
-    while (!(USART0.STATUS & USART_RXCIF_bm)) {
-        if (--countDown == 0) {
-            return -1;
-        }
+ISR(USART0_DRE_vect) {
+    if (sz) {
+        USART0.TXDATAL = *ptr++;
+        sz--;
+    } else {
+        // Disable DRE ISR
+        USART0.CTRLA = USART_RS485_EXT_gc | USART_TXCIE_bm;
     }
-    uint8_t val = USART0.RXDATAL;  // this will clear the CIF flag.
-    return val;
 }
 
-static inline void send(uint8_t *buf, size_t sz) {
-    // Turn off receive, and turn on Transmit.
-    // USART0.CTRLB = USART_TXEN_bm | USART_SFDEN_bm;
-    // Enabling and disabling the UART seems to turn the pin back to an input.  Make sure they're all outputs.
-    // RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;
-    
-    USART0.STATUS = USART_TXCIF_bm; // Clear any existing Receive Complete flags... errr why?
-    RS485_PORT.OUTSET = RS485_DE_bm; // turn DE on 
-    while (sz--) {
-        // wait for TX buffer to be empty.
-        while (!(USART0.STATUS & USART_DREIF_bm)) {
-        }
-        USART0.TXDATAL = *buf++;
-    }
-    // Wait all output to be flushed
-    while (!(USART0.STATUS & USART_TXCIF_bm)) {
-    }
-    USART0.STATUS = USART_TXCIF_bm;
+/**
+ * Once transmission is complete, this ISR is fired, to move us back into receiving state
+ */
+ISR(USART0_TXC_vect) {
+    modbus_reset_buffer();
+    modbus_idle = true;
 
-    // Switch the RS485 transciever back into receive mode.
-    RS485_PORT.OUTCLR = RS485_DE_bm; 
-
-    // Go back to receive mode.
-    // USART0.CTRLB = USART_RXEN_bm | USART_SFDEN_bm;  // enable reception, and wake from sleep
-}
-
-extern bool rs485_process_command() {
-    modbusptr = modbusbuf;
-    modbuscrc = 0xFFFF;
-    modbus_sz = 0;
-    int ch;
-
-    // Reset the Start of Frame flag, if it was set
-
-    do {
-        ch = readch();
-
-        if (ch == -1 || modbus_sz == MAX_PKT_SZ) {
-            return false;
-        }
-
-        if (modbus_sz < MAX_PKT_SZ) {
-            *modbusptr++ = ch;
-            modbus_sz++;
-            uint8_t xor = ch ^ modbuscrc;
-            modbuscrc >>= 8;
-            modbuscrc ^= crc_table[xor];
-        }
-    } while (!inputIsValidModbusCommand());
-
-    uint8_t cmd_addr = modbusbuf[0];
-
-    if (cmd_addr == deviceId || cmd_addr == 0) {
-        switch (modbusbuf[1]) {
-            case MODBUS_READ_COILS_CMD:
-                processGetCoilsCommand();
-                break;
-            case MODBUS_READ_HOLDING_REGISTERS_CMD:
-                sendModbusRegs((uint16_t *)&dali_holding_regs, DALI_MAX_HOLDING_REGISTER);
-                break;
-            case MODBUS_READ_INPUT_REGISTERS_CMD:
-                sendInfo();
-
-                break;
-            case MODBUS_WRITE_COILS_CMD:
-                processSetCoilsCommand();
-                break;
-            case MODBUS_WRITE_SINGLE_COIL_CMD:
-                processSetSingleCoilCommand();
-                break;
-            case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
-                processSetSingleHoldingRegisterCommand();
-                break;
-
-            case MODBUS_CUSTOM_EXEC_DALI_CMD:
-                processCustomDaliCommand();
-                break;
-
-            default:
-                setErrorResponse(MODBUS_ERR_ILLEGAL_FUNCTION);
-                break;
-        }
-
-        // Respond to the caller, unless it was a broadcast
-        if (cmd_addr) {
-            send(modbusbuf, modbus_sz);
-        }
-    }
-    return true;
+    // Clear any pending flags.
+    USART0.STATUS = USART_RXSIE_bm | USART_RXCIE_bm | USART_TXCIF_bm;
+    // ISR on reception.
+    USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
 }
 
 ISR(USART0_RXC_vect) {
-    if (USART0.STATUS & USART_RXSIF_bm) {
-        // Nothing to do here, just clear the interrupt flag.
-        USART0.STATUS = USART_RXSIF_bm;
-    }
+    // Reset the countdown Timer.
+    modbus_idle = false;
+    // if (USART0.STATUS & USART_RXSIF_bm) {
+    USART0.STATUS = USART_RXSIF_bm;  // Nothing to do here, just clear the interrupt flag.
+    // }
 
-    // TODO may as well also implement a receive data ISR.
+    if (USART0.STATUS & USART_RXCIF_bm) {
+        uint8_t val = USART0.RXDATAL;  // this will clear the CIF flag.
+        if (sz < MAX_PKT_SZ) {
+            *ptr++ = val;
+            uint8_t xor = val ^ crc;
+            crc >>= 8;
+            crc ^= crc_table[xor];
+            sz++;
+
+            if (inputIsValidModbusCommand()) {
+                rs485Timer.active = false;
+                USART0.CTRLA = USART_RS485_EXT_gc;  // Remove the Receive ISRs.
+
+                uint8_t cmd_addr = buf[0];
+                switch (buf[1]) {
+                    case MODBUS_READ_COILS_CMD:
+                        processGetCoilsCommand();
+                        break;
+                    case MODBUS_READ_HOLDING_REGISTERS_CMD:
+                        sendModbusRegs((uint16_t *)&dali_holding_regs, DALI_MAX_HOLDING_REGISTER);
+                        break;
+                    case MODBUS_READ_INPUT_REGISTERS_CMD:
+                        sendInfo();
+                        break;
+                    case MODBUS_WRITE_COILS_CMD:
+                        processSetCoilsCommand();
+                        break;
+                    case MODBUS_WRITE_SINGLE_COIL_CMD:
+                        processSetSingleCoilCommand();
+                        break;
+                    case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
+                        processSetSingleHoldingRegisterCommand();
+                        break;
+
+                    case MODBUS_CUSTOM_EXEC_DALI_CMD:
+                        processCustomDaliCommand();
+                        break;
+                    default:
+                        sendError(MODBUS_ERR_ILLEGAL_FUNCTION);
+                        break;
+                }
+            } else {
+                // This timeout will be somewhere between 3 ticks (1.25 millis) and 4 ticks (1.666 millis).
+                // Strictly the limit is 1.5msec, but this will be fine. 
+                rs485Timer.next = timerCurrentTick + 4;
+                rs485Timer.active = true;
+            }
+        }
+    }
 }

@@ -6,70 +6,50 @@
 #include <stdio.h>
 #include <util/atomic.h>
 #include <stdbool.h>
+#include "dali.h"
 #include "timers.h"
 
 
-typedef void (*callback_t)();
-callback_t timeoutCallback = NULL;
+timer_callback_t timeoutCallback = NULL;
+
+timer_t daliTimer = {
+    .active = false,
+};
+timer_t rs485Timer = {
+    .active = false,
+};
 
 
 
-
-void update_timeout(uint16_t to) {
-    TCA0.SINGLE.PER = to;
-}
-
-void update_timeout_callback(callback_t callback) {
-    cli();
-    timeoutCallback = callback;
-    sei();
-}
+volatile uint8_t timerCurrentTick;
 
 
-void timeout_init() {
+void timer_init() {
     TCA0.SINGLE.CTRLA = 0;
     TCA0.SINGLE.INTCTRL = TCA_SINGLE_OVF_bm; // Enable OVF interrupt.
     TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm; 
-    TCA0.SINGLE.PER = 0xFFFF; // Send ISR when clock reaches PER.
+    TCA0.SINGLE.PER = USEC_TO_TICKS(DALI_HALF_BIT_USECS); // Send ISR when clock reaches PER.
     TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_NORMAL_gc; // normal counter mode, no output.
-    TCA0.SINGLE.CNT = 0;  // We try to always reset timer counters, but make sure. 
 
     // Make TCA0.OVF the highest priority interrupt, to ensure it executes first. 
     CPUINT.LVL1VEC = TCA0_OVF_vect_num;
+    // Turn on the timer. It always runs.
+    TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm;
 }
 
 
-void on_timeout(uint16_t timeout, callback_t callback) {
-    cli();
-    TCA0.SINGLE.PER = timeout; // Send ISR when clock reaches PER.
-    timeoutCallback = callback;
-    sei();
-}
-
-inline void start_timeout() {
-    TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm; // Start TCA0 for timeout.
-}
-
-
-inline void cancel_timeout() {
-    TCA0.SINGLE.CTRLA = 0;
-}
-
-
-inline void reset_timeout() {
-    TCA0.SINGLE.CNT = 0;
-}
-
-inline void restart_timeout() {
-    reset_timeout();
-    start_timeout();
-
-}
+#define EXPIRED(t) (((int8_t) (timerCurrentTick - t.next)) >= 0) 
 
 
 ISR(TCA0_OVF_vect) {
-    if (timeoutCallback) {
-        timeoutCallback();
+    timerCurrentTick++;
+    if (daliTimer.active && EXPIRED(daliTimer)) {
+        daliTimer.active = false;
+        daliTimer.callback();
+    }
+    if (rs485Timer.active && EXPIRED(rs485Timer)) {
+        rs485Timer.active = false;
+        rs485Timer.callback();
     }
     TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm; // Clear interrupt flag
 }

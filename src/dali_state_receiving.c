@@ -45,38 +45,33 @@ typedef struct {
 typedef struct {
     reader_action_t shortpulse;
     reader_action_t longpulse;
-    uint16_t timeout;
 } reader_state_t;
 
 static const reader_state_t state_machine[STATE_ERROR] = {
     // START_BIT
-    {.shortpulse = {.shift = NOSHIFT, .next = STATE_MIDDLE_1}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}, .timeout=FULLBIT_MAX_TICKS},
+    {.shortpulse = {.shift = NOSHIFT, .next = STATE_MIDDLE_1}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}},
     // START_0 - or it might be the end of sequence
-    {.shortpulse = {.shift = SHIFT_0, .next = STATE_MIDDLE_0}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}, .timeout=USEC_TO_TICKS(DALI_BIT_USECS * 2)},
+    {.shortpulse = {.shift = SHIFT_0, .next = STATE_MIDDLE_0}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}},
     // START_1
-    {.shortpulse = {.shift = SHIFT_1, .next = STATE_MIDDLE_1}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}, .timeout=HALFBIT_MAX_TICKS},
+    {.shortpulse = {.shift = SHIFT_1, .next = STATE_MIDDLE_1}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}},
     // MIDDLE_0
-    {.shortpulse = {.shift = NOSHIFT, .next = STATE_START_0}, .longpulse = {.shift = SHIFT_1, .next = STATE_MIDDLE_1}, .timeout=FULLBIT_MAX_TICKS},
+    {.shortpulse = {.shift = NOSHIFT, .next = STATE_START_0}, .longpulse = {.shift = SHIFT_1, .next = STATE_MIDDLE_1}},
     // MIDDLE_1 - but it might be the end of the sequence (after the last half)
-    {.shortpulse = {.shift = NOSHIFT, .next = STATE_START_1}, .longpulse = {.shift = SHIFT_0, .next = STATE_MIDDLE_0}, .timeout=USEC_TO_TICKS(DALI_BIT_USECS * 2.5)},
+    {.shortpulse = {.shift = NOSHIFT, .next = STATE_START_1}, .longpulse = {.shift = SHIFT_0, .next = STATE_MIDDLE_0}},
 };
 uint8_t state;
 
 static inline void cleanup() {
-    cli();
     TCB0.CTRLA = 0;
+    daliTimer.active = false;
     TCB0.EVCTRL = 0;   // Disable input capture event.
     TCB0.INTCTRL = 0;  // Turn off CAPT ISR.
-
-    cancel_timeout();
-    sei();
 }
 
 void timerOverflow() {
     // This indicates that a timeout has occurred without a bit flip. This can either be stop bits or a timing error/
     // In either case, we will be leaving this state.  Shut down the timers.
     cleanup();
-
 
     if ((state == STATE_START_0 || state == STATE_MIDDLE_1) && numBits == 8) {
         // We have come to a valid end of sequence.  Process what we have read.
@@ -86,6 +81,7 @@ void timerOverflow() {
         send_command_response(numBits == 0 ? DALI_RESPONSE_NAK : DALI_RESPONSE_MALFORMED, 0);
     }
     dali_wait_for_idle_state_enter();
+
 }
 
 
@@ -120,17 +116,14 @@ void dali_state_receiving_enter() {
     // We want to start TCA0 as soon as possible, to mirror the pulse widths being measured by TCB0.
     // However, in the wait_for_respone state, the timer would have been taken over with its own timeout.
     // As a result, we must take over the timer again.
-    on_timeout(FULLBIT_MAX_TICKS * 2, timerOverflow);
-    // In the waiting_for_responnse state, the timer was already started, but in idle, it wasn't.  To make
-    // sure, start it again.
-    start_timeout();
-
+    daliTimer.callback = timerOverflow;
+    daliTimer.next = timerCurrentTick + 4;
+    daliTimer.active = true;
 }
 
 ISR(TCB0_INT_vect) {
     // TCB0's CNT has been reset automatically, but TCA0's hasn't
     // We do this first so that it closely matches TCB0s as it can
-    reset_timeout();
     uint16_t pulseLengthInTicks = TCB0.CCMP;  // This will clear the interrupt flag.
     uint8_t evctrl = TCB0.EVCTRL;
     // Due to capacitance / collector behaviour, positive pulses are recorded shorter than they actually are.
@@ -158,7 +151,7 @@ ISR(TCB0_INT_vect) {
     } else if (pulseLengthInTicks <= FULLBIT_MAX_TICKS) {
         action = &state_machine[state].longpulse;
     } else {
-        // pulse is too long - Should never happen as the timer will go off first.
+        // pulse is too long. 
         goto error;
     }
 
@@ -170,8 +163,8 @@ ISR(TCB0_INT_vect) {
         shiftreg = shiftreg << 1 | action->shift;
         numBits++;
     }
-    // timeout is based on the new state.
-    update_timeout(state_machine[state].timeout);
+    // We extend the timeout to be in 4 ticks time.  
+    daliTimer.next = timerCurrentTick + 4;
     return;  // Avoid the error handler.
 error:
     // We received an invalid pulse width.

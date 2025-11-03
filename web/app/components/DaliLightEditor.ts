@@ -1,11 +1,11 @@
 import { html, css, LitElement, PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import { ModbusConnection } from "./ModbusConnection";
 import { consume } from "@lit/context";
-import { modbusContext } from "./ModbusConnectionContext";
+import { serialContext } from "./SerialContext";
 import { classMap } from "lit/directives/class-map.js";
 import "./ModbusParameterEditor"
 import { ModbusParameterEditor } from "./ModbusParameterEditor";
+import { SerialConnection } from "./SerialConnection";
 
 export interface ExpandedDetail {
     address: number;
@@ -14,8 +14,8 @@ export interface ExpandedDetail {
 
 @customElement("dali-light-editor")
 export class DaliLightEditor extends LitElement {
-    @consume({ context: modbusContext })
-    public modbus!: ModbusConnection;
+    @consume({ context: serialContext })
+    public modbus!: SerialConnection;
 
     @property({ type: Number })
     deviceId: number = 1;
@@ -54,7 +54,7 @@ export class DaliLightEditor extends LitElement {
     }
 
     toggle = async (evt: MouseEvent) => {
-        await this.modbus?.setCoil(this.deviceId, this.address, "toggle");
+        // await this.modbus?.setCoil(this.deviceId, this.address, "toggle");
         // Dali takes _ages_ to update its values after a command is sent.  
         await new Promise((resolve) => setTimeout(resolve, 100));
         this.requestLevelUpdate();
@@ -74,7 +74,7 @@ export class DaliLightEditor extends LitElement {
 
     private removeEventHandler() {
         if (this.pollHandlerFilter) {
-            this.modbus.removePollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
+            // this.modbus.removePollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
         }
     }
 
@@ -84,7 +84,7 @@ export class DaliLightEditor extends LitElement {
     private refreshEventHandler() {
         this.removeEventHandler();
         this.pollHandlerFilter = { deviceId: this.deviceId, addressRange: [this.address, this.address ] };
-        this.modbus.addPollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
+        // this.modbus.addPollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
     }
 
 
@@ -99,7 +99,7 @@ export class DaliLightEditor extends LitElement {
 
     render() {
 
-        const level = this.modbus.polledValues.get(this.deviceId)?.holding[this.address];
+        const level = 0; //this.modbus.polledValues.get(this.deviceId)?.holding[this.address];
 
         const isOn = level !== 0;
 

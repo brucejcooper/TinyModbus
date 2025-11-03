@@ -8,7 +8,7 @@
 
 #include "dali.h"
 
-#define CMD_Q_SIZE 10
+#define CMD_Q_SIZE 20
 static dali_command_t commandQ[CMD_Q_SIZE];
 static volatile uint8_t q_size = 0;
 volatile bool dali_idle = false;
@@ -19,23 +19,30 @@ static void cleanup() {
 }
 
 
-void send_command_response(dali_response_type_t err, uint8_t res) {
+void process_command_response(dali_response_type_t err, uint8_t res) {
     uint8_t addr;
     if (q_size > 0) {
         // We don't set the callback when we are repeating ourselves, because we need to send the command again (once we re-enter the idle state)
-        if (commandQ->repeat == 0 || --commandQ->repeat == 0) {
+        if (commandQ->repeat == 0 || --(commandQ->repeat) == 0) {
             // In addition to calling the callback, we automatically mirror the output of some DALI commands to our holding registers.  
             // This makes it easier to process when also calling Custom Dali commands. 
-            if (err == DALI_RESPONSE_OK) {
-                switch (commandQ->cmd & 0x81FF) {
-                    case 0x1a0:
-                        addr = DALI_DECODE_ADDR(commandQ->cmd);
-                        dali_holding_regs.power[addr].shortVal = res;
-                        break;
-                }
+            addr = DALI_DECODE_ADDR(commandQ->cmd);
+            switch (commandQ->cmd & 0x81FF) {
+                // Query Actual Level
+                case 0x1a0:
+                    dali_holding_regs.power[addr].low = err != DALI_RESPONSE_OK ? 255 : res;
+                    break;
+                // Query Status
+                case 0x190:
+                    dali_holding_regs.power[addr].high = err != DALI_RESPONSE_OK ? 0 : res;
+                    break;
             }
 
-            commandQ->responseHandler(err, commandQ->cmd, res);
+            // Call the callback handler, if there is one.
+            if (commandQ->callback) {
+                commandQ->callback(err, commandQ->cmd, res);
+            }
+            // Delete the entry from the queue.
             q_size--;
             if (q_size > 0) {
                 memcpy(commandQ, commandQ + 1, q_size * sizeof(dali_command_t));
@@ -55,13 +62,14 @@ void send_command_response(dali_response_type_t err, uint8_t res) {
  * @param responseHandler called once we're done, with the response (if any).  Also called if there is a collision
  * @return dali_result_t
  */
-dali_result_t dali_queue_command(uint16_t cmd, dali_response_callback_t responseHandler, uint8_t repeat) {
+
+dali_result_t dali_queue_command(uint16_t cmd, uint8_t repeat, dali_callback_t callback) {
     if (q_size >= CMD_Q_SIZE) {
         return DALI_ERR_QUEUEFULL;
     }
     commandQ[q_size].cmd = cmd;
-    commandQ[q_size].responseHandler = responseHandler;
-    commandQ[q_size++].repeat = repeat == 0 ? 1 : repeat > 2 ? 2 : repeat;     // Min 1 times, max 2.
+    commandQ[q_size].callback = callback;
+    commandQ[q_size++].repeat = repeat < 2 ? 1 : 2;     // Min 1 times, max 2.
 
     if (dali_idle) {
         cleanup();
@@ -82,7 +90,6 @@ void dali_idle_state_enter() {
     // If we've something to send, send it immediately
     if (q_size > 0) {
         // Immediately start transmitting the next command.
-        cleanup();
         dali_transmitting_state_enter(commandQ);
     } else {
         dali_idle = true;

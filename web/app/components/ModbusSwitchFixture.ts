@@ -4,10 +4,12 @@ import { range } from "lit/directives/range.js";
 import { map } from "lit/directives/map.js";
 import { when } from "lit/directives/when.js";
 import { classMap } from "lit/directives/class-map.js";
-import { ModbusCommand, ModbusConnection } from "./ModbusConnection";
 import { consume } from "@lit/context";
-import { modbusContext } from "./ModbusConnectionContext";
+import { serialContext } from "./SerialContext";
 import { InputCss } from "./shared_styles";
+import { SerialConnection } from "./SerialConnection";
+
+import { DeviceView } from "./Device";
 
 export interface SwitchFixtureID {
     fixture: number;
@@ -48,9 +50,13 @@ function encodeBinding(binding: ButtonBinding): number {
 }
 
 @customElement("modbus-switch-fixture")
-export class ModbusSwitchFixture extends LitElement {
+export class ModbusSwitchFixture extends DeviceView {
     static styles = [
         css`
+            :host {
+                display: inline-block;
+            }
+            
             .switchFixture {
                 border: 1px solid #777;
                 border-radius: 16px;
@@ -115,12 +121,9 @@ export class ModbusSwitchFixture extends LitElement {
         InputCss,
     ];
 
-    @consume({ context: modbusContext })
+    @consume({ context: serialContext })
     @property({ attribute: false })
-    public modbus!: ModbusConnection;
-
-    @property({ type: Number })
-    deviceId: number = 0;
+    public modbus!: SerialConnection;
 
 
     @property({ type: Number })
@@ -135,30 +138,13 @@ export class ModbusSwitchFixture extends LitElement {
     @state()
     dropTargetButton: number = -1;
 
-    private pollHandlerFilter: { deviceId: number; addressRange: [number,number] } | undefined;
-
 
     disconnectedCallback(): void {
         super.disconnectedCallback();
-        this.removeEventHandler();
     }
 
     polledValuesChanged = () => {
         this.requestUpdate();
-    }
-
-    private removeEventHandler() {
-        if (this.pollHandlerFilter) {
-            this.modbus.removePollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
-        }
-    }
-
-
-
-    private refreshEventHandler() {
-        this.removeEventHandler();
-        this.pollHandlerFilter = { deviceId: this.deviceId, addressRange: [this.fixture*7, this.fixture*7+5 ] };
-        this.modbus.addPollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
     }
 
 
@@ -166,7 +152,6 @@ export class ModbusSwitchFixture extends LitElement {
         super.willUpdate(changed);
 
         if (changed.has("deviceId") || changed.has("type") || changed.has("fixture")) {
-            this.refreshEventHandler();
         }
     }
 
@@ -187,7 +172,7 @@ export class ModbusSwitchFixture extends LitElement {
 
 
     private async changeBindingAtIndex(index: number, value: ButtonBinding) {
-        await this.modbus?.setHoldingRegister(this.deviceId, this.fixture * 7 + this.dropTargetButton, encodeBinding(value));
+        // await this.modbus?.setHoldingRegister(this.deviceId, this.fixture * 7 + this.dropTargetButton, encodeBinding(value));
         const newBindings = [...this.bindings];
         newBindings[index] = value;
         this.bindings = newBindings;
@@ -195,7 +180,7 @@ export class ModbusSwitchFixture extends LitElement {
 
     clearBinding = (evt: Event) => {
         const index = parseInt((evt.target as HTMLButtonElement).dataset.index!);
-        this.modbus?.setHoldingRegister(this.deviceId, this.fixture * 7 + index, 0xc000);
+        // this.modbus?.setHoldingRegister(this.deviceId, this.fixture * 7 + index, 0xc000);
         this.changeBindingAtIndex(index, null);
     };
 
@@ -228,7 +213,7 @@ export class ModbusSwitchFixture extends LitElement {
     };
 
     render() {
-        const inputs = this.modbus.polledValues.get(this.deviceId)?.inputs ?? [];
+        const inputs: number[] = []; //this.modbus.polledValues.get(this.deviceId)?.inputs ?? [];
 
         return html`
             <div class="wrapper">

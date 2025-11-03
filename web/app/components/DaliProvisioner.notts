@@ -1,4 +1,4 @@
-import { ModbusConnection } from "./ModbusConnection";
+import { SerialConnection } from "./SerialConnection";
 
 export interface DaliProvisionStatus {
     progress: number;
@@ -13,14 +13,14 @@ export interface ProvisionDaliOpts {
 }
 
 export class DaliProvisioner {
-    modbus: ModbusConnection;
+    modbus: SerialConnection;
 
     private _abort: AbortController;
     private signal: AbortSignal;
     private _completed: boolean = false;
     private eventHandlers: (() => unknown)[] = [];
 
-    constructor(modbus: ModbusConnection) {
+    constructor(modbus: SerialConnection) {
         this.modbus = modbus;
         this._abort = new AbortController();
         this.signal = this._abort.signal;

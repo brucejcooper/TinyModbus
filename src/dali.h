@@ -46,6 +46,7 @@ typedef enum {
   DALI_RESPONSE_NAK = 404,
   DALI_RESPONSE_COLLISION = 409,
   DALI_RESPONSE_MALFORMED = 500,
+  DALI_RESPONSE_PENDING = 255,
 } dali_response_type_t;
 
 
@@ -73,8 +74,9 @@ typedef struct {
 typedef union {
     uint16_t shortVal;
     struct {
-        uint8_t high;
+        // ATMEL is little endian
         uint8_t low;
+        uint8_t high;
     };
 } modbus_register_t;
 
@@ -86,12 +88,15 @@ typedef struct {
     // uint16_t groups[DALI_MAX_DEVICES];
 } dali_all_holding_registers_t;
 
-typedef void (*dali_response_callback_t)(dali_response_type_t type, uint16_t cmd, uint8_t response);
+struct dali_command_t;
+
+typedef void (*dali_callback_t)(dali_response_type_t responseType, uint16_t cmd, uint8_t lastResponse);
+typedef bool (*dali_callback_next_t)(struct dali_command_t *cmd, dali_response_type_t responseType, uint8_t response);
 
 
 typedef struct dali_command_t {
     uint16_t cmd;
-    dali_response_callback_t responseHandler;
+    dali_callback_t callback;
     uint8_t repeat;
 } dali_command_t;
 
@@ -103,12 +108,11 @@ typedef struct dali_command_t {
 extern dali_all_holding_registers_t dali_holding_regs;
 #define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
 
-extern void pulse_led();
+extern void pulse_led(uint8_t times);
 
 extern void dali_init();
 uint8_t dali_is_bus_shorted();
 
-dali_result_t dali_queue_command(uint16_t data, dali_response_callback_t responseCallback, uint8_t repeat);
 
 // State management - each of these functions lives in its own source file. 
 void dali_idle_state_enter();
@@ -129,16 +133,18 @@ void dali_state_receiving_enter();
 
 void dali_wait_for_response_state_enter();
 extern volatile bool dali_idle;
-void send_command_response(dali_response_type_t err, uint8_t res);
+void process_command_response(dali_response_type_t err, uint8_t res);
 void dali_state_init();
 
 
 // Commmands
-extern void dali_start_scan(uint8_t addr);
-extern void dali_goto_last_active(uint8_t addr);
-extern void dali_off(uint8_t addr);
-extern void dali_toggle(uint8_t addr);
-extern void dali_set_level(uint8_t addr, uint8_t level);
+extern void dali_start_background_scan(uint8_t addr);
+extern void dali_goto_last_active(uint8_t addr, dali_callback_t callback);
+extern void dali_off(uint8_t addr, dali_callback_t callback);
+extern void dali_toggle(uint8_t addr, dali_callback_t callback);
+extern void dali_set_level(uint8_t addr, uint8_t level, dali_callback_t callback);
+extern void dali_read_level_and_status(uint8_t addr, dali_callback_t callback);
+extern void dali_custom_command(uint16_t cmd, dali_callback_t responseCallback, uint8_t repeat);
 
 
 #endif

@@ -24,20 +24,20 @@ static void idlePeriodExprired() {
 }
 
 static void onIdleBus() {
-    cli();
+    // cli();
     dali_call_on_rising_once(onBusShorted);
-    daliTimer.callback = idlePeriodExprired;
-    daliTimer.next = timerCurrentTick + IDLE_THRESHOLD_TE;
-    daliTimer.active = true;
-    sei();
+    daliTimerCallback = idlePeriodExprired;
+    daliTimer = IDLE_THRESHOLD_TE;
+    // sei();
 }
 
 static void onBusShorted() {
-    cli();
-    daliTimer.active = false;
+
+    // cli();
+    daliTimer = 0;
     // Wait until we receive a low level (not shorted), then start checking again.
     dali_call_on_low_once(onIdleBus);
-    sei();
+    // sei();
 }
 
 extern void dali_wait_for_idle_state_enter() {

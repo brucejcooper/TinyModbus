@@ -7,21 +7,15 @@
 #include <util/atomic.h>
 #include <stdbool.h>
 #include "dali.h"
+#include "rs485.h"
 #include "timers.h"
 
 
-timer_callback_t timeoutCallback = NULL;
+extern timer_callback_t daliTimerCallback = NULL;
+volatile uint8_t daliTimer = 0;
 
-timer_t daliTimer = {
-    .active = false,
-};
-timer_t rs485Timer = {
-    .active = false,
-};
+volatile uint8_t rs485Timer = 0;
 
-
-
-volatile uint8_t timerCurrentTick;
 
 
 void timer_init() {
@@ -38,18 +32,13 @@ void timer_init() {
 }
 
 
-#define EXPIRED(t) (((int8_t) (timerCurrentTick - t.next)) >= 0) 
-
-
 ISR(TCA0_OVF_vect) {
-    timerCurrentTick++;
-    if (daliTimer.active && EXPIRED(daliTimer)) {
-        daliTimer.active = false;
-        daliTimer.callback();
+    if (daliTimer && (--daliTimer == 0)) {
+        daliTimerCallback();
     }
-    if (rs485Timer.active && EXPIRED(rs485Timer)) {
-        rs485Timer.active = false;
-        rs485Timer.callback();
+
+    if (rs485Timer && (--rs485Timer == 0)) {
+        rs485Timer_timeout();
     }
     TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm; // Clear interrupt flag
 }

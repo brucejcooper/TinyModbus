@@ -1,23 +1,77 @@
-import { html, css, LitElement, TemplateResult } from "lit";
+import { html, css, LitElement, TemplateResult, PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { SerialPort, Serial } from "./serial";
-import { ModbusConnection } from "./ModbusConnection";
 import { provide } from "@lit/context";
-import { modbusContext } from "./ModbusConnectionContext";
+import { serialContext } from "./SerialContext";
 import { SwitchFixtureID } from "./ModbusSwitchFixture";
-import { DaliProvisioner } from "./DaliProvisioner";
-import "./ModbusDevice"
-import "./DaliLightEditor"
-import "./ModbusCoilEditor"
-import "./ModbusInputBindingsEditor"
+import "./LightEditor"
+import "./Device"
+import "./entities/BinarySensor"
+import "./entities/Text"
+import "./entities/Light"
+import "./entities/Button"
+import "./entities/Sensor"
+import { SerialConnection, HADevice, Entity } from "./SerialConnection";
+import { repeat } from "lit/directives/repeat.js";
+import { selectedDeviceContext } from "./SelectedDeviceContext";
+
+
+function stringListChanged(a: string[], b: string[]) {
+    if (Array.isArray(a) && !Array.isArray(b)) {
+        return true;
+    }
+    if (Array.isArray(b) && !Array.isArray(a)) {
+        return true;
+    }
+    if (!a) {
+        return !!b;
+    }
+    if (a.length !== b.length)
+        return true;
+
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function editorForEntity(ent: Entity): TemplateResult<1>|null {
+    if (!ent) {
+        return null;
+    }
+
+    switch (ent.platform) {
+        case "binary_sensor": 
+            return html`<entity-binary-sensor .entity=${ent}></entity-binary-sensor>`
+        case "text": 
+            return html`<entity-text .entity=${ent}></entity-text>`
+        case "light": 
+            return html`<entity-light .entity=${ent}></entity-light>`
+        case "button": 
+            return html`<entity-button .entity=${ent}></entity-button>`
+        case "sensor": 
+            return html`<entity-sensor .entity=${ent}></entity-sensor>`
+        default:
+            return html`<div class="alert alert-warning" role="alert">
+                ${ent.platform} ${ent.id}
+            </div>`;
+    }
+}
+
 
 
 @customElement("modbus-app")
 export class ModbusApplication extends LitElement {
 
 
-    @provide({ context: modbusContext })
-    modbus: ModbusConnection = new ModbusConnection();
+    @provide({ context: serialContext })
+    serialConnection: SerialConnection = new SerialConnection();
+
+    @provide({ context: selectedDeviceContext, })
+    selectedDevice: string|null = null;
+
 
     @state()
     serialInterface?: Serial | null;
@@ -26,28 +80,31 @@ export class ModbusApplication extends LitElement {
     @property({ reflect: false })
     selectedBinding: SwitchFixtureID | null = null;
 
-    @state()
-    daliProvisioner?: DaliProvisioner;
-
-
     @property({ reflect: false })
     expandedDaliLight: number = -1;
 
+
+    @state({ hasChanged: stringListChanged })
+    topLevelDeviceIDs: string[] = []
+
     @state()
-    selectedDevice: string|undefined;
+    device: HADevice|null = null;
 
     createRenderRoot() {
         return this;
     }
 
     startScan() {
-        this.modbus?.startLongRunningProcess(0);
+        // this.modbus?.startLongRunningProcess(0);
     }
 
     private async openPort(port: SerialPort) {
-        console.log("Opening Port");
-        this.modbus.open(port);
-
+        try {
+            await this.serialConnection.open(port);
+            // await this.serialConnection.requestDevices();
+        } catch (ex) {
+            console.log(ex);
+        }
     }
 
     async lookForBoundSerialInterface() {
@@ -70,12 +127,17 @@ export class ModbusApplication extends LitElement {
     }
 
     async disconnectSerial() {
-        this.modbus?.forget();
+        this.serialConnection?.forget();
     }
+
 
     switchSelected = (evt: Event) => {
         this.selectedBinding = (evt as CustomEvent<SwitchFixtureID>).detail;
     };
+
+    topLevelDevicesChanged = (dev:HADevice) => {
+        this.topLevelDeviceIDs = this.serialConnection.child_devices.map(e => e.id);
+    }
 
     connectedCallback(): void {
         super.connectedCallback();
@@ -86,24 +148,27 @@ export class ModbusApplication extends LitElement {
         } else {
             this.serialInterface = null;
         }
+
+        this.serialConnection.addChangeListener(this.topLevelDevicesChanged);
     }
 
+    disconnectedCallback(): void {
+        super.disconnectedCallback();
+        this.serialConnection.removeChangeListener(this.topLevelDevicesChanged);
+        this.removeEventListener("switch-selected", this.switchSelected);
+    }
 
+    deviceSelected = (evt: CustomEvent<string|null>) => {        
+        this.selectedDevice = evt.detail;
+        this.device =  this.selectedDevice ? HADevice.allDevices.get(this.selectedDevice) ?? null : null;
+
+        // this.requestUpdate();
+    }
+
+    
     stopProvision = async () => {
-        this.daliProvisioner?.abort();
+        // this.daliProvisioner?.abort();
     };
-
-    setSelectedDevice = (evt: CustomEvent<string|undefined>) => {
-        const sel = evt.detail;
-
-        console.log("Received Selecting", this.selectedDevice);
-
-        if (sel && sel === this.selectedDevice) {
-            this.selectedDevice = undefined;
-        } else {
-            this.selectedDevice = sel;
-        }
-    }
 
     
 
@@ -112,29 +177,7 @@ export class ModbusApplication extends LitElement {
             return html`<div class="alert alert-danger" role="alert">Serial not supported</div>`;
         }
 
-        let deviceEditor: TemplateResult<1>|null|undefined = null;
-
-        if (this.selectedDevice) {
-            const split = this.selectedDevice.split(/[:\/]/);
-            const type = split[0];
-            const deviceId = parseInt(split[1]);
-            const address = parseInt(split[2]);
-            switch (type) {
-                case 'dali':
-                    deviceEditor = html`<dali-light-editor .deviceId=${deviceId} .address=${address}></dali-light-editor>`;
-                    break;
-                case 'coils':
-                    deviceEditor = html`<modbus-coil-editor .deviceId=${deviceId} .address=${address}></modbus-coil-editor>`;
-                case "inputs":
-                    deviceEditor = html`<modbus-input-bindings-editor .deviceId=${deviceId} .address=${address}></modbus-input-bindings-editor>`;
-            }
-        }
-        if (!deviceEditor) {
-            deviceEditor = html`<div class="alert alert-primary" role="alert">
-  Select a device to edit its properties here
-</div>`;
-        }
-
+        
 
         return html`
             <main class="d-flex flex-nowrap">
@@ -153,7 +196,7 @@ export class ModbusApplication extends LitElement {
                         </li> 
 
                     </ul> 
-                    ${this.modbus.port
+                    ${this.serialConnection.port
                         ? html`<button class="btn btn-secondary" @click=${this.disconnectSerial} type="button">Disconnect</button>`
                         : html`<button class="btn btn-secondary" @click=${this.requestSerial} type="button">Connect</button>`}
 
@@ -173,16 +216,17 @@ export class ModbusApplication extends LitElement {
                     </div> 
                 </nav>
 
-                <div class="d-flex flex-column flex-grow-1 p-3 text-bg-tertiary" style="gap: 1em; overflow-y: auto; max-height: 100vh" @modbus-device-selected=${this.setSelectedDevice}>  
-                    <modbus-device deviceId="2" type="inputs" .numAddresses=${168} .selectedDevice=${this.selectedDevice}></modbus-device>
-                    <modbus-device deviceId="1" type="coils" .numAddresses=${32} .selectedDevice=${this.selectedDevice}></modbus-device>
-                    <modbus-device deviceId="3" type="dali" .numAddresses=${64} .selectedDevice=${this.selectedDevice}></modbus-device>
+                <div class="d-flex flex-column flex-grow-1 p-3 text-bg-tertiary" style="gap: 1em; overflow-y: auto; max-height: 100vh" @ha-device-selected=${this.deviceSelected}>  
+                    ${repeat(this.topLevelDeviceIDs, (id) => html`<ha-device device-id=${id}></ha-device>`)}
                 </div>            
 
                 <div class="" style=" width: 0.5rem; height: 100vh; flex-shrink: 0; background-color: #0000001a; border: solid rgba(0,0,0,.15); border-width: 1px 0; box-shadow: inset 0 .5em 1.5em #0000001a,inset 0 .125em .5em #00000026;"></div>
 
-                <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="min-width: 330px;"> 
-                    ${deviceEditor}
+                <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="min-width: 380px;"> 
+                    <h3>Device ${this.device?.name ?? this.device?.id ?? "none"}</h3>
+                    <div class="keyvalgrid">
+                    ${repeat((this.device?.entities ?? []), e => html`<div class="noshrink">${e.name ?? e.id}:</div>${editorForEntity(e)}`)}
+                    </div>
                 </div>            
             </main>
         `;

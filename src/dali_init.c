@@ -67,19 +67,19 @@ uint8_t dali_is_bus_shorted() {
 
 void dali_call_on_rising_once(void (*callback)()) {
     dali_rx_rising_callback = callback;
-    DALI_PORT.INTFLAGS = DALI_RX_bm;                                // Clear any pending interrupts.
-    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_RISING_gc;  // Enable ISR if there is a callback, otherwise disable.
+    DALI_PORT.INTFLAGS = DALI_RX_bm;                 // Clear any pending interrupts.
+    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_RISING_gc;  // Enable ISR 
 }
 
 void dali_call_on_low_once(void (*callback)()) {
     dali_rx_rising_callback = callback;
-    DALI_PORT.INTFLAGS = DALI_RX_bm;                               // Clear any pending interrupts.
-    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_LEVEL_gc;  // Enable ISR if there is a callback, otherwise disable.
+    DALI_PORT.INTFLAGS = DALI_RX_bm;                // Clear any pending interrupts.
+    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_LEVEL_gc;  // Enable ISR 
 }
 
 void dali_cancel_edge_detect() {
-    dali_rx_rising_callback = NULL;
     DALI_PORT.DALI_RX_PINCTRL = 0;
+    dali_rx_rising_callback = NULL;
 }
 
 // This controls the one-shot event on rising for detecting the start of data.
@@ -96,7 +96,7 @@ ISR(PORTB_PORT_vect) {
 
 ISR(RTC_PIT_vect) {
     if (((++rescan_counter) % RESCAN_PERIOD) == 0) {
-        dali_start_scan(0);
+        dali_start_background_scan(0);
     }
     RTC.PITINTFLAGS = RTC_PI_bm; // Clear the flag.
 }

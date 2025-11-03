@@ -1,11 +1,11 @@
 import { html, css, LitElement, PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import { ModbusConnection } from "./ModbusConnection";
 import { consume } from "@lit/context";
-import { modbusContext } from "./ModbusConnectionContext";
+import { serialContext } from "./SerialContext";
 import { classMap } from "lit/directives/class-map.js";
 import "./ModbusParameterEditor"
 import { ModbusParameterEditor } from "./ModbusParameterEditor";
+import { SerialConnection } from "./SerialConnection";
 
 export interface ExpandedDetail {
     address: number;
@@ -14,8 +14,8 @@ export interface ExpandedDetail {
 
 @customElement("modbus-coil-editor")
 export class ModbusCoilEditor extends LitElement {
-    @consume({ context: modbusContext })
-    public modbus?: ModbusConnection;
+    @consume({ context: serialContext })
+    public modbus?: SerialConnection;
 
     @property({ type: Number })
     deviceId: number = 1;
@@ -37,7 +37,7 @@ export class ModbusCoilEditor extends LitElement {
     }
 
     toggle = async () => {
-        await this.modbus?.setCoil(this.deviceId, this.address, "toggle");
+        // await this.modbus?.setCoil(this.deviceId, this.address, "toggle");
     }
 
 

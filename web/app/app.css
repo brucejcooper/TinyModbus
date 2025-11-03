@@ -28,7 +28,9 @@ main {
 
 
 .daliwrapper {
+    display: inline-block;
     border: 1px solid #aaa;
+    margin: 0.5em;
     border-radius: 5px;
     padding: 0.5em;
     min-width: 2.5em;
@@ -83,7 +85,7 @@ main {
 
 
 .switchfixture {
-    background-color: #6e4d25;
+    background-color: #391802;
     border-radius: 1.5em;
     padding: 0.75em;
     display: flex;
@@ -105,7 +107,7 @@ button.switchfixture:disabled {
 }
 
 .switchfixture .switchplate {
-    border: 1px solid #333;
+    border: 1px solid #000;
     border-radius: 3px;
     width: 18px;
     height: 18px;
@@ -120,10 +122,6 @@ button.switchfixture:disabled {
 }
 
 
-.dalidevice.dragging {
-    opacity: 0.05;
-}
-
 
 .rotate35 {
     width: 1em;
@@ -134,4 +132,17 @@ button.switchfixture:disabled {
     -ms-transform: rotate(-25deg);
     -o-transform: rotate(-25deg);
     transform: rotate(-25deg);
+}
+
+.keyvalgrid {
+    display: grid;
+    grid-template-columns: auto 1fr; 
+    gap: 0.25em;
+    padding-top: 0.5em; 
+    align-items: center;
+   
+}
+
+.noshrink {
+    flex: 0;
 }

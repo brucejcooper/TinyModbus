@@ -1,5 +1,5 @@
 DEVICE     	= attiny1604
-CLOCK      	= 3333333
+CLOCK      	= 10000000
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)

@@ -12,7 +12,7 @@
 #define NORESPONSE_TIMEOUT_TICKS 22
 
 static inline void cleanup() {
-    daliTimer.active = false;
+    daliTimer = 0;
 }
 
 
@@ -23,7 +23,7 @@ static void timeoutWaitingForResponse() {
     // Turn everything off.
     cleanup();
     dali_cancel_edge_detect();
-    send_command_response(DALI_RESPONSE_NAK, 0);
+    process_command_response(DALI_RESPONSE_NAK, 0);
     dali_idle_state_enter();
 }
 
@@ -38,6 +38,6 @@ extern void dali_wait_for_response_state_enter() {
     // For this, we will be reading the line, so we enable the rising line interrupt, and make it interrupt on any change.
     dali_state_receiving_prepare();
     dali_call_on_rising_once(startReceivingResponse);
-    daliTimer.callback = timeoutWaitingForResponse;
-    timer_extend(daliTimer, NORESPONSE_TIMEOUT_TICKS);
+    daliTimerCallback = timeoutWaitingForResponse;
+    daliTimer = NORESPONSE_TIMEOUT_TICKS;
 }

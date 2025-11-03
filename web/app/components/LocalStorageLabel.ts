@@ -9,7 +9,12 @@ export interface ExpandedDetail {
 
 type KeyChangeListener = (key: string) => void;
 
-
+function afterUnderscore(val: string|undefined){
+    if (!val)
+        return val;
+    const pos = val.lastIndexOf("_");
+    return val.substring(pos+1);
+}
 
 @customElement("localstorage-label")
 export class LocalStorageLabel extends LitElement {
@@ -91,15 +96,18 @@ export class LocalStorageLabel extends LitElement {
     }
 
     render() {
+
+        const placeholder = this.placeholder ?? afterUnderscore(this.key);
+
         if (this.editable) {
             return html`<div class="input-group mb-3">
                 <div class="form-floating">
-                    <input class="form-control" id="editor" placeholder=${this.placeholder ?? "No Value"} .value=${this.value} @change=${this.changed}>
+                    <input class="form-control" id="editor" placeholder=${placeholder ?? "No Value"} .value=${this.value ?? placeholder} @change=${this.changed}>
                     <label for="editor">${this.label}</label>
                 </div>
             </div>`;
         }
-        return html`<span>${this.value ?? this.placeholder}</span>`;
+        return html`<span>${this.value ?? placeholder}</span>`;
     }
 }
 

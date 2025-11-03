@@ -1,3 +1,5 @@
+#include "rs485.h"
+
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <avr/pgmspace.h>
@@ -54,8 +56,8 @@ static uint8_t buf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 2
 static volatile uint8_t *ptr = buf;
 static volatile uint8_t sz = 0;
 volatile bool modbus_idle = false;
-
 volatile uint8_t readCountDown;
+static bool modbus_cmd_available = false;
 
 /**
  * Stores an indentifier string for this device.  Clients can fetch 32 registers worth of Input registers at address 0 to get the string.
@@ -77,7 +79,6 @@ static const uint16_t crc_table[256] = {
     0x5CC0, 0x5D80, 0x9D41, 0x5F00, 0x9FC1, 0x9E81, 0x5E40, 0x5A00, 0x9AC1, 0x9B81, 0x5B40, 0x9901, 0x59C0, 0x5880, 0x9841, 0x8801, 0x48C0, 0x4980, 0x8941,
     0x4B00, 0x8BC1, 0x8A81, 0x4A40, 0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41, 0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680,
     0x8641, 0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040};
-
 
 static inline void appendCrc(uint8_t *pkt, uint8_t len) {
     uint16_t crc = 0xFFFF;
@@ -144,6 +145,19 @@ static void sendError(modbus_err_t err) {
     sendResponse(buf, 3);
 }
 
+modbus_err_t dali_response_to_err(dali_response_type_t type) {
+    switch (type) {
+        case DALI_RESPONSE_NAK:
+            return MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND;
+        case DALI_RESPONSE_MALFORMED:
+            return MODBUS_ERR_SLAVE_DEVICE_FAILURE;
+        case DALI_RESPONSE_COLLISION:
+            return MODBUS_ERR_MEMORY_PARITY_ERROR;
+        default:
+            return MODBUS_ERR_ILLEGAL_FUNCTION;
+    }
+}
+
 static void processGetCoilsCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
@@ -202,7 +216,7 @@ static void sendInfo() {
     }
 }
 
-static void dali_cmd_callback(dali_response_type_t type, uint16_t cmd, uint8_t response) {
+static void dali_custom_cmd_callback(dali_response_type_t type, uint16_t cmd, uint8_t response) {
     switch (type) {
         case DALI_RESPONSE_OK:
             buf[2] = response;
@@ -223,6 +237,21 @@ static void dali_cmd_callback(dali_response_type_t type, uint16_t cmd, uint8_t r
     }
 }
 
+static volatile dali_response_type_t daliResponseType;
+static volatile uint8_t daliResponse;
+
+void waitForDaliResponse() {
+    while (daliResponseType == DALI_RESPONSE_PENDING) {
+        // TODO WDT or something.
+        ;
+    }
+}
+
+void dali_cmd_completed(dali_response_type_t responseType, uint16_t cmd, uint8_t response) {
+    daliResponse = response;
+    daliResponseType = responseType;
+}
+
 static void processCustomDaliCommand() {
     uint16_t cmd = buf[2] << 8 | buf[3];
     uint8_t repeat = buf[4];
@@ -230,7 +259,7 @@ static void processCustomDaliCommand() {
         sendError(MODBUS_ERR_ILLEGAL_VALUE);
         return;
     }
-    dali_queue_command(cmd, dali_cmd_callback, repeat);
+    dali_custom_command(cmd, dali_custom_cmd_callback, repeat);
     // dali_cmd_callback() will perform the response
 }
 
@@ -245,7 +274,9 @@ static void processSetSingleHoldingRegisterCommand() {
         case 0:
             // Its power level;
             if (val <= 254) {
-                dali_set_level(bankAddr, val);
+                daliResponseType = DALI_RESPONSE_PENDING;
+                dali_set_level(bankAddr, val, dali_cmd_completed);
+                waitForDaliResponse();
                 sendResponse(buf, sz - 2);
             } else {
                 sendError(MODBUS_ERR_ILLEGAL_VALUE);
@@ -287,13 +318,15 @@ static void processSetSingleCoilCommand() {
     uint8_t val = buf[4];
 
     if (addr < DALI_MAX_DEVICES) {
+        daliResponseType = DALI_RESPONSE_PENDING;
         if (val == 0x55) {
-            dali_toggle(addr);
+            dali_toggle(addr, dali_cmd_completed);
         } else if (val == 0xFF) {
-            dali_goto_last_active(addr);
+            dali_goto_last_active(addr, dali_cmd_completed);
         } else {
-            dali_off(addr);
+            dali_off(addr, dali_cmd_completed);
         }
+        waitForDaliResponse();
         // Simply mirror the request back to the caller
         sendResponse(buf, sz - 2);
     } else {
@@ -305,14 +338,14 @@ static void modbus_reset_buffer() {
     ptr = buf;
     crc = 0xFFFF;
     sz = 0;
+    modbus_cmd_available = false;
 }
 
-static void readTimeout() {
-    cli();
+void rs485Timer_timeout() {
+    // cli();
     modbus_reset_buffer();
-    rs485Timer.active = false;
     modbus_idle = true;
-    sei();
+    // sei();
 }
 
 extern void rs485_init(uint8_t rs485_device_id) {
@@ -338,8 +371,44 @@ extern void rs485_init(uint8_t rs485_device_id) {
     USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;  // ISR for Start of Frmae or reception of data.
     USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_SFDEN_bm;        // enable reception, transmission, and wake from sleep
 
-    rs485Timer.callback = readTimeout;
+    rs485Timer = 0;
+}
 
+void rs485_process_command() {
+    // We decouple receiving data in an ISR from processing the command through the
+    // modbus_cmd_available variable.  When it is set, there is a valid command in
+    // the incoming buffer, and RX has been temporarily turned off. 
+    if (modbus_cmd_available) {
+        uint8_t cmd_addr = buf[0];
+        switch (buf[1]) {
+            case MODBUS_READ_COILS_CMD:
+                processGetCoilsCommand();
+                break;
+            case MODBUS_READ_HOLDING_REGISTERS_CMD:
+                sendModbusRegs((uint16_t *)&dali_holding_regs, DALI_MAX_HOLDING_REGISTER);
+                break;
+            case MODBUS_READ_INPUT_REGISTERS_CMD:
+                sendInfo();
+                break;
+            case MODBUS_WRITE_COILS_CMD:
+                processSetCoilsCommand();
+                break;
+            case MODBUS_WRITE_SINGLE_COIL_CMD:
+                processSetSingleCoilCommand();
+                break;
+            case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
+                processSetSingleHoldingRegisterCommand();
+                break;
+
+            case MODBUS_CUSTOM_EXEC_DALI_CMD:
+                processCustomDaliCommand();
+                break;
+            default:
+                sendError(MODBUS_ERR_ILLEGAL_FUNCTION);
+                break;
+        }
+        modbus_cmd_available = false;
+    }
 }
 
 /**
@@ -372,7 +441,11 @@ ISR(USART0_RXC_vect) {
     // Reset the countdown Timer.
     modbus_idle = false;
     // if (USART0.STATUS & USART_RXSIF_bm) {
-    USART0.STATUS = USART_RXSIF_bm;  // Nothing to do here, just clear the interrupt flag.
+    // This timeout will be somewhere between 3 ticks (1.25 millis) and 4 ticks (1.666 millis).
+    // Strictly the limit is 1.5msec, but this will be fine.
+
+    rs485Timer = 4;
+    USART0.STATUS = USART_RXSIF_bm;  // clear the interrupt flag.
     // }
 
     if (USART0.STATUS & USART_RXCIF_bm) {
@@ -385,42 +458,9 @@ ISR(USART0_RXC_vect) {
             sz++;
 
             if (inputIsValidModbusCommand()) {
-                rs485Timer.active = false;
+                rs485Timer = 0;
+                modbus_cmd_available = true;
                 USART0.CTRLA = USART_RS485_EXT_gc;  // Remove the Receive ISRs.
-
-                uint8_t cmd_addr = buf[0];
-                switch (buf[1]) {
-                    case MODBUS_READ_COILS_CMD:
-                        processGetCoilsCommand();
-                        break;
-                    case MODBUS_READ_HOLDING_REGISTERS_CMD:
-                        sendModbusRegs((uint16_t *)&dali_holding_regs, DALI_MAX_HOLDING_REGISTER);
-                        break;
-                    case MODBUS_READ_INPUT_REGISTERS_CMD:
-                        sendInfo();
-                        break;
-                    case MODBUS_WRITE_COILS_CMD:
-                        processSetCoilsCommand();
-                        break;
-                    case MODBUS_WRITE_SINGLE_COIL_CMD:
-                        processSetSingleCoilCommand();
-                        break;
-                    case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
-                        processSetSingleHoldingRegisterCommand();
-                        break;
-
-                    case MODBUS_CUSTOM_EXEC_DALI_CMD:
-                        processCustomDaliCommand();
-                        break;
-                    default:
-                        sendError(MODBUS_ERR_ILLEGAL_FUNCTION);
-                        break;
-                }
-            } else {
-                // This timeout will be somewhere between 3 ticks (1.25 millis) and 4 ticks (1.666 millis).
-                // Strictly the limit is 1.5msec, but this will be fine. 
-                rs485Timer.next = timerCurrentTick + 4;
-                rs485Timer.active = true;
             }
         }
     }

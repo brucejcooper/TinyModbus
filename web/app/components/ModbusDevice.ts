@@ -3,12 +3,13 @@ import { customElement, property, query, state } from "lit/decorators.js";
 import { range } from "lit/directives/range.js";
 import { map } from "lit/directives/map.js";
 import { classMap } from "lit/directives/class-map.js";
-import { ModbusConnection } from "./ModbusConnection";
 import { consume } from "@lit/context";
-import { modbusContext } from "./ModbusConnectionContext";
+import { serialContext } from "./SerialContext";
 import { when } from "lit/directives/when.js";
 import { DaliProvisioner } from "./DaliProvisioner";
 import "./LocalStorageLabel";
+import { SerialConnection } from "./SerialConnection";
+import { selectedDeviceContext } from "./SelectedDeviceContext";
 
 interface DaliDeviceInfo {
     address: number;
@@ -44,8 +45,12 @@ function arrayChanged(a: number[], b: number[]) {
 @customElement("modbus-device")
 export class ModbusDevice extends LitElement {
 
-    @consume({ context: modbusContext })
-    modbus!: ModbusConnection;
+    @consume({ context: serialContext })
+    modbus!: SerialConnection;
+
+    @consume({ context: selectedDeviceContext })
+    selectedEntity: string|null = null;
+    
 
     @property({ type: Number})
     deviceId: number = 1;
@@ -98,11 +103,11 @@ export class ModbusDevice extends LitElement {
             this.daliProvisioner.abort();
         }
 
-        this.daliProvisioner = new DaliProvisioner(this.modbus);
-        this.daliProvisioner.addEventListener("completed", () => {
-            this.daliProvisioner = undefined;
-        });
-        await this.daliProvisioner.provision({ deviceId: this.deviceId, initAll, onUpdate: this.provisionStatusUpdated });
+        // this.daliProvisioner = new DaliProvisioner(this.modbus);
+        // this.daliProvisioner.addEventListener("completed", () => {
+        //     this.daliProvisioner = undefined;
+        // });
+        // await this.daliProvisioner.provision({ deviceId: this.deviceId, initAll, onUpdate: this.provisionStatusUpdated });
     };
 
     stopProvision = async () => {
@@ -110,7 +115,7 @@ export class ModbusDevice extends LitElement {
     };
 
     startScan() {
-        this.modbus?.startLongRunningProcess(0);
+        // this.modbus?.startLongRunningProcess(0);
     }
     disconnectedCallback(): void {
         super.disconnectedCallback();
@@ -123,33 +128,33 @@ export class ModbusDevice extends LitElement {
 
     private removeEventHandler() {
         if (this.pollHandlerFilter) {
-            this.modbus.removePollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
+            // this.modbus.removePollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
         }
     }
 
     private refreshEventHandler() {
         this.removeEventHandler();
         this.pollHandlerFilter = { deviceId: this.deviceId };
-        this.modbus.addPollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
+        // this.modbus.addPollChangeHandler(this.polledValuesChanged, this.pollHandlerFilter);
     }
 
     protected willUpdate(changed: PropertyValues): void {
         super.willUpdate(changed);
 
-        if (this.modbus && (changed.has("deviceId") || changed.has("type"))) {
-            this.refreshEventHandler();
-            switch (this.type) {
-                case 'coils':
-                    this.deviceLevels = this.modbus.polledValues.get(this.deviceId)?.coils ?? [];
-                    break;
-                case 'dali':
-                    this.deviceLevels = this.modbus.polledValues.get(this.deviceId)?.holding ?? [];
-                    break;
-                case 'inputs':
-                    this.deviceLevels = this.modbus.polledValues.get(this.deviceId)?.inputs ?? [];
-                    break;
-            }
-        }
+        // if (this.modbus && (changed.has("deviceId") || changed.has("type"))) {
+        //     this.refreshEventHandler();
+        //     switch (this.type) {
+        //         case 'coils':
+        //             this.deviceLevels = this.modbus.polledValues.get(this.deviceId)?.coils ?? [];
+        //             break;
+        //         case 'dali':
+        //             this.deviceLevels = this.modbus.polledValues.get(this.deviceId)?.holding ?? [];
+        //             break;
+        //         case 'inputs':
+        //             this.deviceLevels = this.modbus.polledValues.get(this.deviceId)?.inputs ?? [];
+        //             break;
+        //     }
+        // }
     }
 
     startDrag = (evt: DragEvent) => {

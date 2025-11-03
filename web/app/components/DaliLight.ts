@@ -3,12 +3,12 @@ import { customElement, property, state } from "lit/decorators.js";
 import { when } from "lit/directives/when.js";
 import { repeat } from "lit/directives/repeat.js";
 import { styleMap } from "lit/directives/style-map.js";
-import { ModbusConnection } from "./ModbusConnection";
 import { consume } from "@lit/context";
-import { modbusContext } from "./ModbusConnectionContext";
+import { serialContext } from "./SerialContext";
 import { chevronDown, chevronRight, InputCss } from "./shared_styles";
 import { range } from "lit/directives/range.js";
 import { query } from "lit/decorators.js";
+import { SerialConnection } from "./SerialConnection";
 
 function expanderButton({ expand, click }: { expand: boolean; click?: (evt: Event) => void }) {
     return html`<button class="expander" @click=${click}>${expand ? chevronDown : chevronRight}</button>`;
@@ -30,9 +30,9 @@ export interface ExpandedDetail {
 @customElement("dali-light")
 export class DaliLight extends LitElement {
 
-    @consume({ context: modbusContext })
+    @consume({ context: serialContext })
     @property({ attribute: false })
-    public modbus?: ModbusConnection;
+    public modbus?: SerialConnection;
 
     @property({ type: Number })
     address: number = 0;

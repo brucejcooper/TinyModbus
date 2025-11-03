@@ -6,5 +6,6 @@
 
 extern void rs485_init(uint8_t deviceId);
 extern volatile bool modbus_idle;
-
+extern void rs485Timer_timeout();
+extern void rs485_process_command();
 #endif

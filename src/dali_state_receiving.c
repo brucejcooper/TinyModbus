@@ -63,7 +63,7 @@ uint8_t state;
 
 static inline void cleanup() {
     TCB0.CTRLA = 0;
-    daliTimer.active = false;
+    daliTimer = 0;
     TCB0.EVCTRL = 0;   // Disable input capture event.
     TCB0.INTCTRL = 0;  // Turn off CAPT ISR.
 }
@@ -72,13 +72,12 @@ void timerOverflow() {
     // This indicates that a timeout has occurred without a bit flip. This can either be stop bits or a timing error/
     // In either case, we will be leaving this state.  Shut down the timers.
     cleanup();
-
     if ((state == STATE_START_0 || state == STATE_MIDDLE_1) && numBits == 8) {
         // We have come to a valid end of sequence.  Process what we have read.
-        send_command_response(DALI_RESPONSE_OK, shiftreg);
+        process_command_response(DALI_RESPONSE_OK, shiftreg);
     } else {
         // Some timing error or collision occurred.
-        send_command_response(numBits == 0 ? DALI_RESPONSE_NAK : DALI_RESPONSE_MALFORMED, 0);
+        process_command_response(numBits == 0 ? DALI_RESPONSE_NAK : DALI_RESPONSE_MALFORMED, 0);
     }
     dali_wait_for_idle_state_enter();
 
@@ -109,6 +108,7 @@ void dali_state_receiving_prepare() {
  * We also expect dali_state_receiving_prepare to have been called before this one.
  */
 void dali_state_receiving_enter() {
+
     // Start TCB0 for pulse width timing.  It will start counting upon a rising edge (start of start bit.)
     TCB0.CTRLA = TCB_CLKSEL_CLKDIV1_gc | TCB_ENABLE_bm;
     TCB0.INTFLAGS = TCB_CAPT_bm;  // Clear any pending ISR
@@ -116,9 +116,8 @@ void dali_state_receiving_enter() {
     // We want to start TCA0 as soon as possible, to mirror the pulse widths being measured by TCB0.
     // However, in the wait_for_respone state, the timer would have been taken over with its own timeout.
     // As a result, we must take over the timer again.
-    daliTimer.callback = timerOverflow;
-    daliTimer.next = timerCurrentTick + 4;
-    daliTimer.active = true;
+    daliTimerCallback = timerOverflow;
+    daliTimer = 4;
 }
 
 ISR(TCB0_INT_vect) {
@@ -164,11 +163,11 @@ ISR(TCB0_INT_vect) {
         numBits++;
     }
     // We extend the timeout to be in 4 ticks time.  
-    daliTimer.next = timerCurrentTick + 4;
+    daliTimer = 4;
     return;  // Avoid the error handler.
 error:
     // We received an invalid pulse width.
     cleanup();
-    send_command_response(DALI_RESPONSE_MALFORMED, 0);
+    process_command_response(DALI_RESPONSE_MALFORMED, 0);
     dali_wait_for_idle_state_enter();
 }

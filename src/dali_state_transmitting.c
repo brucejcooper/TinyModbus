@@ -22,20 +22,20 @@ static void halfBitToggle();
 
 static void sendOne() {
     DALI_PORT.OUTSET = DALI_TX_bm;
-    daliTimer.callback = halfBitToggle;
-    timer_extend(daliTimer, 1);
+    daliTimerCallback = halfBitToggle;
+    daliTimer = 1;
 }
 
 static void sendZero() {
     DALI_PORT.OUTCLR = DALI_TX_bm;
-    daliTimer.callback = halfBitToggle;
-    timer_extend(daliTimer, 1);
+    daliTimerCallback = halfBitToggle;
+    daliTimer = 1;
 }
 
 static void startStopBits() {
     DALI_PORT.OUTCLR = DALI_TX_bm;
-    daliTimer.callback = finishedTransmission;
-    timer_extend(daliTimer, 2);
+    daliTimerCallback = finishedTransmission;
+    daliTimer = 1;
 }
 
 /** 
@@ -45,12 +45,12 @@ static void halfBitToggle() {
     DALI_PORT.OUTTGL = DALI_TX_bm;
     // set the handler to What happens at the start of the next bit.
     if (--bitsLeft == 0) {
-        daliTimer.callback = startStopBits;
+        daliTimerCallback = startStopBits;
     } else {
-        daliTimer.callback = shiftReg & 0x8000 ? sendOne: sendZero;
+        daliTimerCallback = shiftReg & 0x8000 ? sendOne: sendZero;
         shiftReg <<= 1;
     }
-    timer_extend(daliTimer, 1);
+    daliTimer = 1;
 }
 
 extern void dali_transmitting_state_enter(dali_command_t *cmd) {
@@ -59,10 +59,9 @@ extern void dali_transmitting_state_enter(dali_command_t *cmd) {
     bitsLeft = 17; // One extra for the stop bit. 
 
     // We send a one as the start bit.
-    cli();
-    daliTimer.callback = sendOne;
-    daliTimer.next = timerCurrentTick + 1;
-    daliTimer.active = true;
-    sei();
+    // cli();
+    daliTimerCallback = sendOne;
+    daliTimer = 1;
+    // sei();
 }
 

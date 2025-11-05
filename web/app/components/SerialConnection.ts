@@ -19,8 +19,9 @@ interface DeviceEntityMsg {
     name?: string;
     stat_t?: string;
     cmd_t?: string;
-    availability_topic?: string,
-    unique_id: string;
+    avty?: string[];
+    avty_mode?: string;
+    uniq_id: string;
     p: string;
 }
 
@@ -46,7 +47,7 @@ export class Entity {
 
     constructor(dev: HADevice, msg: DeviceEntityMsg) {
         this.device = dev;
-        this.id = msg.unique_id;
+        this.id = msg.uniq_id;
         this.platform = msg.p;
         this.name = msg.name;
         Entity.allEntities.set(this.id, this);
@@ -134,7 +135,6 @@ export class HADevice {
         dev.parent_device = this;
         dev.dispatchChangeEvent();
         this.dispatchChangeEvent();
-
     }
 
     addEntity(msg: DeviceEntityMsg) {
@@ -211,7 +211,6 @@ export class SerialConnection extends HADevice {
                 }
 
                 console.log("<", line);
-
                 switch (subtopic) {
                     case "available":
                         // console.log("Entity", entity_id, msg)
@@ -227,7 +226,7 @@ export class SerialConnection extends HADevice {
                     case "config":
                         if (platform == "device") {
                             const dev = this.findOrUpdate(msg as any);
-                            console.log("Device", dev);
+                            // console.log("Device", dev);
                         } else {
                             console.warn("Unknown config msg");
                         }

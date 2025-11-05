@@ -4,16 +4,18 @@ import { SerialPort, Serial } from "./serial";
 import { provide } from "@lit/context";
 import { serialContext } from "./SerialContext";
 import { SwitchFixtureID } from "./ModbusSwitchFixture";
-import "./LightEditor"
+// import "./LightEditor"
 import "./Device"
 import "./entities/BinarySensor"
 import "./entities/Text"
 import "./entities/Light"
 import "./entities/Button"
 import "./entities/Sensor"
+import "./entities/Number"
 import { SerialConnection, HADevice, Entity } from "./SerialConnection";
 import { repeat } from "lit/directives/repeat.js";
 import { selectedDeviceContext } from "./SelectedDeviceContext";
+import { when } from "lit/directives/when.js";
 
 
 function stringListChanged(a: string[], b: string[]) {
@@ -53,6 +55,8 @@ function editorForEntity(ent: Entity): TemplateResult<1>|null {
             return html`<entity-button .entity=${ent}></entity-button>`
         case "sensor": 
             return html`<entity-sensor .entity=${ent}></entity-sensor>`
+        case "number": 
+            return html`<entity-number .entity=${ent}></entity-number>`
         default:
             return html`<div class="alert alert-warning" role="alert">
                 ${ent.platform} ${ent.id}
@@ -65,17 +69,14 @@ function editorForEntity(ent: Entity): TemplateResult<1>|null {
 @customElement("modbus-app")
 export class ModbusApplication extends LitElement {
 
-
     @provide({ context: serialContext })
     serialConnection: SerialConnection = new SerialConnection();
 
     @provide({ context: selectedDeviceContext, })
     selectedDevice: string|null = null;
 
-
     @state()
     serialInterface?: Serial | null;
-
 
     @property({ reflect: false })
     selectedBinding: SwitchFixtureID | null = null;
@@ -92,10 +93,6 @@ export class ModbusApplication extends LitElement {
 
     createRenderRoot() {
         return this;
-    }
-
-    startScan() {
-        // this.modbus?.startLongRunningProcess(0);
     }
 
     private async openPort(port: SerialPort) {
@@ -161,23 +158,13 @@ export class ModbusApplication extends LitElement {
     deviceSelected = (evt: CustomEvent<string|null>) => {        
         this.selectedDevice = evt.detail;
         this.device =  this.selectedDevice ? HADevice.allDevices.get(this.selectedDevice) ?? null : null;
-
-        // this.requestUpdate();
     }
-
-    
-    stopProvision = async () => {
-        // this.daliProvisioner?.abort();
-    };
-
     
 
     render() {
         if (this.serialInterface == null) {
             return html`<div class="alert alert-danger" role="alert">Serial not supported</div>`;
         }
-
-        
 
         return html`
             <main class="d-flex flex-nowrap">
@@ -224,6 +211,9 @@ export class ModbusApplication extends LitElement {
 
                 <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="min-width: 380px;"> 
                     <h3>Device ${this.device?.name ?? this.device?.id ?? "none"}</h3>
+
+                    ${when(this.device, () => html`<localstorage-label key=${`ha/label/${this.device!.id}`} editable label="Label" placeholder=${this.device!.name}></localstorage-label>`)}
+
                     <div class="keyvalgrid">
                     ${repeat((this.device?.entities ?? []), e => html`<div class="noshrink">${e.name ?? e.id}:</div>${editorForEntity(e)}`)}
                     </div>

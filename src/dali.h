@@ -20,6 +20,29 @@ typedef enum {
     DALI_ERR_QUEUEFULL,
 } dali_result_t;
 
+#define DALI_CMD_GET_LEVEL 0x1a0
+#define DALI_CMD_QUERY_STATUS 0x190
+#define DALI_CMD_GOTO_LAST_ACTIVE 0x10a
+#define DALI_CMD_GET_MIN 0x1a2
+#define DALI_CMD_SET_MIN 0x12b
+#define DALI_CMD_GET_MAX 0x1a1
+#define DALI_CMD_SET_MAX 0x12a
+#define DALI_CMD_GET_FADE 0x1a5
+#define DALI_CMD_SET_FADE_TIME 0x12e
+#define DALI_CMD_GET_EXT_FADE 0x1a8
+#define DALI_CMD_SET_FADE_RATE 0x12f
+#define DALI_CMD_GET_POWER_ON_LEVEL 0x1a3
+#define DALI_CMD_SET_POWER_ON_LEVEL 0x12d
+#define DALI_CMD_GET_POWER_FAIL_LEVEL 0x1a4
+#define DALI_CMD_SET_POWER_FAIL_LEVEL 0x12c
+#define DALI_CMD_GET_GROUPS0_7 0x1c0
+#define DALI_CMD_GET_GROUPS8_15 0x1c1
+#define DALI_CMD_ADD_TO_GROUP 0x160
+#define DALI_CMD_REMOVE_FROM_GROUP 0x170
+#define DALI_CMD_OFF 0x100
+#define DALI_CMD_SET_DTR0 0xa300
+
+
 
 typedef enum {
     RESPONSE,
@@ -50,27 +73,6 @@ typedef enum {
 } dali_response_type_t;
 
 
-typedef struct {
-    uint8_t level;
-    uint8_t status;
-} dali_pwr_bank_t;
-
-typedef struct {
-    uint8_t min;
-    uint8_t max;
-} dali_minmax_bank_t;
-
-typedef struct {
-    uint8_t rate;
-    uint8_t time;
-} dali_fade_bank_t;
-
-typedef struct {
-    uint8_t powerOnLevel;
-    uint8_t systemFailureLevel;
-} dali_initialvalues_bank_t;
-
-
 typedef union {
     uint16_t shortVal;
     struct {
@@ -80,12 +82,15 @@ typedef union {
     };
 } modbus_register_t;
 
+#define DALI_STATUS_BANK 0
+#define DALI_MINMAX_BANK 1
+#define DALI_FADE_BANK 2
+#define DALI_POWER_BANK 3
+#define DALI_GROUPS_BANK 4
+#define DALI_NUM_REG_BANKS 5
+
 typedef struct {
-    modbus_register_t power[DALI_MAX_DEVICES];
-    // dali_minmax_bank_t minmax[DALI_MAX_DEVICES];
-    // dali_fade_bank_t fade[DALI_MAX_DEVICES];
-    // dali_initialvalues_bank_t initialValues[DALI_MAX_DEVICES];
-    // uint16_t groups[DALI_MAX_DEVICES];
+    modbus_register_t banks[DALI_NUM_REG_BANKS][DALI_MAX_DEVICES];
 } dali_all_holding_registers_t;
 
 struct dali_command_t;
@@ -146,5 +151,16 @@ extern void dali_set_level(uint8_t addr, uint8_t level, dali_callback_t callback
 extern void dali_read_level_and_status(uint8_t addr, dali_callback_t callback);
 extern void dali_custom_command(uint16_t cmd, dali_callback_t responseCallback, uint8_t repeat);
 
+
+
+extern void dali_set_min_level(uint8_t addr, uint8_t val, dali_callback_t callback);
+extern void dali_set_max_level(uint8_t addr, uint8_t val, dali_callback_t callback);
+extern void dali_set_fade_rate(uint8_t addr, uint8_t val, dali_callback_t callback);
+extern void dali_set_fade_time(uint8_t addr, uint8_t val, dali_callback_t callback);
+extern void dali_set_power_on_level(uint8_t addr, uint8_t val, dali_callback_t callback);
+extern void dali_set_power_fail_level(uint8_t addr, uint8_t val, dali_callback_t callback);
+extern void dali_add_to_group(uint8_t addr, uint8_t group, dali_callback_t callback);
+
+extern void dali_remove_from_group(uint8_t addr, uint8_t group, dali_callback_t callback);
 
 #endif

@@ -158,11 +158,38 @@ modbus_err_t dali_response_to_err(dali_response_type_t type) {
     }
 }
 
+
+void got_dali_highreg(dali_response_type_t err, uint16_t cmd, uint8_t res) {
+    switch (err) {
+        case DALI_RESPONSE_OK:
+            buf[3] = res;
+            break;
+        default:
+            buf[3] = 0x00;
+            break;
+    }
+
+}
+void got_dali_lowreg(dali_response_type_t err, uint16_t cmd, uint8_t res) {
+    switch (err) {
+        case DALI_RESPONSE_OK:
+            buf[4] = res;
+            sendResponse(buf, 5);
+            break;
+        default:
+            sendError(dali_response_to_err(err));
+    }
+}
+
+
+
+
+
 static void processGetCoilsCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
     uint8_t *dptr = buf + 2;
-    uint16_t *sptr = (uint16_t *)dali_holding_regs.power + addr;
+    uint16_t *sptr = (uint16_t *)dali_holding_regs.banks[DALI_STATUS_BANK] + addr;
 
     if (count > 0 && addr + count <= DALI_MAX_DEVICES) {
         *dptr = count / 8 + (count % 8 ? 1 : 0);
@@ -179,11 +206,13 @@ static void processGetCoilsCommand() {
     }
 }
 
-static void sendModbusRegs(uint16_t *sptr, uint16_t max) {
+static void sendHoldingRegs() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
 
-    if (count > 0 && count < 128 && addr + count <= max) {
+    uint16_t *sptr = (uint16_t *)&dali_holding_regs;
+
+    if (count > 0 && count < 128 && addr + count <= DALI_MAX_HOLDING_REGISTER) {
         buf[2] = 2 * count;
         sptr += addr;
         uint16_t *end = sptr + count;
@@ -264,28 +293,69 @@ static void processCustomDaliCommand() {
 }
 
 static void processSetSingleHoldingRegisterCommand() {
+    uint16_t existingGroups;
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t val = buf[4] << 8 | buf[5];
 
     uint8_t bank = addr / 64;
-    uint8_t bankAddr = addr % 64;
+    uint8_t daliAddr = addr % 64;
 
     switch (bank) {
-        case 0:
+        case DALI_STATUS_BANK:
             // Its power level;
             if (val <= 254) {
                 daliResponseType = DALI_RESPONSE_PENDING;
-                dali_set_level(bankAddr, val, dali_cmd_completed);
+                dali_set_level(daliAddr, val, dali_cmd_completed);
                 waitForDaliResponse();
-                sendResponse(buf, sz - 2);
             } else {
                 sendError(MODBUS_ERR_ILLEGAL_VALUE);
+                return;
             }
             break;
+        case DALI_MINMAX_BANK:
+            dali_set_min_level(daliAddr, val & 0xFF, NULL);
+            dali_set_max_level(daliAddr, val >> 8 , dali_cmd_completed);
+            dali_holding_regs.banks[DALI_MINMAX_BANK][daliAddr].shortVal = val;
+            waitForDaliResponse();
+
+            break;
+        case DALI_FADE_BANK:
+            dali_set_fade_rate(daliAddr, val & 0xFF, NULL);
+            dali_set_fade_time(daliAddr, val >> 8, dali_cmd_completed);
+            dali_holding_regs.banks[DALI_FADE_BANK][daliAddr].shortVal = val;
+            waitForDaliResponse();
+            break;
+        case DALI_POWER_BANK:
+            dali_set_power_on_level(daliAddr, val & 0xFF, NULL);
+            dali_set_power_fail_level(daliAddr, val >> 8, dali_cmd_completed);
+            dali_holding_regs.banks[DALI_POWER_BANK][daliAddr].shortVal = val;
+            waitForDaliResponse();
+            break;
+        case DALI_GROUPS_BANK:
+            existingGroups = dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal;
+            for (uint8_t i = 0; i < 16; i++) {
+                uint8_t oldBit = (existingGroups >> i) & 0x01;
+                uint8_t newBit = (val >> i) & 0x01;
+                if (oldBit != newBit) {
+                    if (newBit) {
+                        dali_add_to_group(daliAddr, i, NULL);
+                    } else {
+                        dali_remove_from_group(daliAddr, i, NULL);
+                    }
+                }
+            }
+            dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal = val;
+            sendResponse(buf, sz - 2);
+            break;
+        //     dali_set_min_level(bankAddr, val, NULL);
+        //     dali_set_max_level(bankAddr, val, dali_cmd_completed);
+        //     break;
         default:
             sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
-            break;
+            return;
     }
+    sendResponse(buf, sz - 2);
+
 }
 
 static void processSetCoilsCommand() {
@@ -385,7 +455,7 @@ void rs485_process_command() {
                 processGetCoilsCommand();
                 break;
             case MODBUS_READ_HOLDING_REGISTERS_CMD:
-                sendModbusRegs((uint16_t *)&dali_holding_regs, DALI_MAX_HOLDING_REGISTER);
+                sendHoldingRegs();
                 break;
             case MODBUS_READ_INPUT_REGISTERS_CMD:
                 sendInfo();

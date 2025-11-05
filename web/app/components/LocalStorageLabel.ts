@@ -1,6 +1,5 @@
 import { html, LitElement, PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import "./ModbusParameterEditor"
 
 export interface ExpandedDetail {
     address: number;

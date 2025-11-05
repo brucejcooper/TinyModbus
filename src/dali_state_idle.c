@@ -18,24 +18,46 @@ static void cleanup() {
     dali_cancel_edge_detect();
 }
 
+typedef struct {
+    uint16_t command;
+    uint8_t bank;
+    uint8_t byte_offset;
+} command_bank_mapping_t;
+
+static const uint8_t command_bank_mapping[] = {
+    DALI_CMD_GET_LEVEL & 0xFF,
+    DALI_CMD_QUERY_STATUS & 0xFF,
+    DALI_CMD_GET_MIN & 0xFF,
+    DALI_CMD_GET_MAX & 0xFF,
+    DALI_CMD_GET_FADE & 0xFF,
+    DALI_CMD_GET_EXT_FADE & 0xFF,
+    DALI_CMD_GET_POWER_ON_LEVEL & 0xFF,
+    DALI_CMD_GET_POWER_FAIL_LEVEL & 0xFF,
+    DALI_CMD_GET_GROUPS0_7 & 0xFF,
+    DALI_CMD_GET_GROUPS0_7 & 0xFF,
+};
+
+
+#define NUM_COMMAND_MAPPINGS (sizeof(command_bank_mapping) / sizeof(uint16_t))
 
 void process_command_response(dali_response_type_t err, uint8_t res) {
     uint8_t addr;
     if (q_size > 0) {
         // We don't set the callback when we are repeating ourselves, because we need to send the command again (once we re-enter the idle state)
         if (commandQ->repeat == 0 || --(commandQ->repeat) == 0) {
-            // In addition to calling the callback, we automatically mirror the output of some DALI commands to our holding registers.  
-            // This makes it easier to process when also calling Custom Dali commands. 
-            addr = DALI_DECODE_ADDR(commandQ->cmd);
-            switch (commandQ->cmd & 0x81FF) {
-                // Query Actual Level
-                case 0x1a0:
-                    dali_holding_regs.power[addr].low = err != DALI_RESPONSE_OK ? 255 : res;
-                    break;
-                // Query Status
-                case 0x190:
-                    dali_holding_regs.power[addr].high = err != DALI_RESPONSE_OK ? 0 : res;
-                    break;
+            // In addition to calling the callback, we automatically mirror the output of some DALI commands to our holding registers.
+            // This makes it easier to process when also calling Custom Dali commands.
+            if ((commandQ->cmd >> 8) == 0x01) {
+                // It was a device command
+                // The results of some commands map to holding registers.  We update them.
+                uint8_t lowCmd = commandQ->cmd & 0xFF;
+                for (int i = 0; i < NUM_COMMAND_MAPPINGS; i++) {
+                    if (lowCmd == command_bank_mapping[i]) {
+                        uint8_t *ptr = ((uint8_t *) &dali_holding_regs.banks[i/2][DALI_DECODE_ADDR(commandQ->cmd)]) + (i%2);
+                        *ptr = res;
+                        break;
+                    }
+                }
             }
 
             // Call the callback handler, if there is one.
@@ -50,9 +72,6 @@ void process_command_response(dali_response_type_t err, uint8_t res) {
         }
     }
 }
-
-
-
 
 /**
  * Enqueues a command to be sent on the DALI bus, when it becomes available.
@@ -69,7 +88,7 @@ dali_result_t dali_queue_command(uint16_t cmd, uint8_t repeat, dali_callback_t c
     }
     commandQ[q_size].cmd = cmd;
     commandQ[q_size].callback = callback;
-    commandQ[q_size++].repeat = repeat < 2 ? 1 : 2;     // Min 1 times, max 2.
+    commandQ[q_size++].repeat = repeat < 2 ? 1 : 2;  // Min 1 times, max 2.
 
     if (dali_idle) {
         cleanup();

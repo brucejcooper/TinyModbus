@@ -11,7 +11,7 @@
 #include "timers.h"
 
 
-extern timer_callback_t daliTimerCallback = NULL;
+timer_callback_t daliTimerCallback = NULL;
 volatile uint8_t daliTimer = 0;
 
 volatile uint8_t rs485Timer = 0;

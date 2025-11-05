@@ -13,7 +13,7 @@ import "./LocalStorageLabel"
 function renderDevice(d: HADevice) {
     const id = d.id
 
-    if (d.name.startsWith("Switch Fixture ")) {
+    if (d.name.startsWith("Switchplate ")) {
         return html`<ha-fixture device-id=${id}></ha-fixture>`;        
     } else if (d.name.startsWith("Light ")) {
         return html`<ha-light device-id=${id}></ha-light>`;        
@@ -117,7 +117,7 @@ export class FixtureDeviceView extends DeviceView {
         const buttonEntities = device.entities.filter(e => e.platform == 'binary_sensor')
         return html`
             <div style="align-items: center; display: inline-flex; flex-direction: column; margin-top: 2em;" >
-                <div class="rotate35"><localstorage-label key=${`ha/label/${this.deviceId}`}></div>
+                <div class="rotate35"><localstorage-label key=${`ha/label/${device.id}`} placeholder=${device.name}></div>
                 <button 
                     class=${classMap({ 
                         switchfixture: true, 
@@ -164,7 +164,7 @@ export class LightView extends DeviceView {
 
         if (changed.has("deviceId") ) {
             if (this.deviceId) {
-                const m = this.deviceId.match(/modbus(?<did>\d+)_(?<add>\d+)$/)
+                const m = this.deviceId.match(/(modbus|daligw)(?<did>\d+)_(?<add>\d+)$/)
                 if (m) {                    
                     this.modbusDeviceId = parseInt(m.groups!.did)
                     this.address = parseInt(m.groups!.add)
@@ -194,7 +194,7 @@ export class LightView extends DeviceView {
                 "btn-primary": isSelected, 
                 "btn-sm": true, 
             })} draggable="true" data-address=${this.id} @click=${this.selectDevice} ?disabled=${disabled} @dragstart=${this.startDrag}>
-                <localstorage-label key=${`ha/label/${this.deviceId}`} placeholder=${this.address}></localstorage-label>
+                <localstorage-label key=${`ha/label/${device.id}`} placeholder=${device.name}></localstorage-label>
 
                 <i class=${classMap({ bi: true, "bi-lightbulb": !isOn, 'bi-lightbulb-off': disabled, 'bi-lightbulb-fill': isOn })}></i>
             </button>`;

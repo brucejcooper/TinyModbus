@@ -1,55 +1,85 @@
 #include <string.h>
 #include "dali.h"
 
-#define DALI_CMD_GET_LEVEL 0x1a0
-#define DALI_CMD_QUERY_STATUS 0x190
-#define DALI_CMD_GOTO_LAST_ACTIVE 0x10a
-#define DALI_CMD_OFF 0x100
 
 #define ENCODE_CMD(cmd, addr) ((cmd) | ((addr) << 9))
 
 
 static dali_callback_t post_cmd_callback = NULL;
+static const uint16_t scan_command_sequence[] = {
+    DALI_CMD_QUERY_STATUS,
+    DALI_CMD_GET_LEVEL,
+    DALI_CMD_GET_MAX,
+    DALI_CMD_GET_MIN,
+    DALI_CMD_GET_EXT_FADE,
+    DALI_CMD_GET_FADE,
+    DALI_CMD_GET_POWER_FAIL_LEVEL,
+    DALI_CMD_GET_POWER_ON_LEVEL,
+    DALI_CMD_GET_GROUPS0_7,
+    DALI_CMD_GET_GROUPS8_15,
+};
+
+static uint8_t scan_index = 0;
+static uint8_t scan_err_count = 0;
+
 
 static void track_fade(uint8_t addr);
 dali_result_t dali_queue_command(uint16_t data, uint8_t repeat, dali_callback_t final);
 
 
 static inline bool isFading(uint8_t addr) {
-    return dali_holding_regs.power[addr].high & 0x10;
+    return dali_holding_regs.banks[DALI_STATUS_BANK][addr].high & 0x10;
 }
 
 
-static void scan_level_received(dali_response_type_t err, uint16_t cmd, uint8_t response) {
+#define REG_BANK_SZ (DALI_MAX_DEVICES*sizeof(modbus_register_t))
+
+
+
+
+static void scan_result_received(dali_response_type_t err, uint16_t cmd, uint8_t response) {
     // Once we've scanned the level, we also want to scan the status.
     uint8_t addr = DALI_DECODE_ADDR(cmd);
-    modbus_register_t *reg = dali_holding_regs.power + addr;
 
-    if (err == DALI_RESPONSE_OK) {
-       reg->low = response;
-    } else {
-        reg->low = 0xFF;
-    }
-    if (addr < 64) {
-        if (addr < 63) {
+    switch (err) {
+        case DALI_RESPONSE_OK: 
+            scan_err_count = 0;
+            if (scan_index < 9) {
+                // Send the next command
+                dali_queue_command(ENCODE_CMD(scan_command_sequence[++scan_index], addr), 1, scan_result_received); 
+            } else {
+                // We are done with this address. Move onto the next one.
+                dali_start_background_scan(addr + 1);
+            }
+            if (scan_index == 0 && response & 0x10) {
+                // We scanned a device that is currently fading... schedule an ongoing poll
+                track_fade(addr);
+            }
+            break;
+        default:
+            // We try again for a maximum of three times, then we treat it as a device that is not found.
+            if (scan_err_count++ < 3) {
+                // Send the same command again!
+                dali_queue_command(ENCODE_CMD(scan_command_sequence[scan_index], addr), 1, scan_result_received); 
+                break;
+            }
+            // otherwise, fall through to the not found situation.
+        case DALI_RESPONSE_NAK:
+            // Set the current and remaining registers that we haven't fetched to their default values.
+            for (uint8_t i = scan_index ; i < 10; i++) {
+                // We set level to a special marker, but set everything else to 0
+                if (i%2 == 0) {
+                    modbus_register_t *reg = &dali_holding_regs.banks[i/2][addr];
+                    reg->low = i == 0 ? 0xFF : 0;
+                    reg->high = 0;
+
+                }
+            }
+            // We treat a single NAK as the device not being present.
+            scan_err_count = 0;
             dali_start_background_scan(addr + 1);
-        }
+            break;
     }
-    if (reg->high & 0x10) {
-        // Still fading. poll again.
-        // TODO this could call the wrong post_cmd_callback if it interleaves a scan with a command.
-        track_fade(addr);
-    }
-}
-
-static void scan_status_received(dali_response_type_t err, uint16_t cmd, uint8_t response) {
-    uint8_t addr = DALI_DECODE_ADDR(cmd);
-    if (err == DALI_RESPONSE_OK) {
-        dali_holding_regs.power[addr].high = response;
-    } else {
-        dali_holding_regs.power[addr].high = 0x00;
-    }
-    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_LEVEL, addr), 1, scan_level_received); 
 }
 
 
@@ -62,7 +92,11 @@ static void toggle_based_on_level(dali_response_type_t err, uint16_t cmd, uint8_
 }
 
 void dali_start_background_scan(uint8_t addr) { 
-    dali_queue_command(ENCODE_CMD(DALI_CMD_QUERY_STATUS, addr), 1, scan_status_received); 
+    if (addr < 64) {
+        scan_index = 0;
+        scan_err_count = 0;
+        dali_queue_command(ENCODE_CMD(scan_command_sequence[scan_index], addr), 1, scan_result_received); 
+    }
 }
 
 void dali_set_level(uint8_t addr, uint8_t level, dali_callback_t final) { 
@@ -82,6 +116,63 @@ void dali_off(uint8_t addr, dali_callback_t cb) {
     dali_queue_command(ENCODE_CMD(DALI_CMD_OFF, addr), 1, NULL); 
     track_fade(addr);
 }
+
+void dali_set_dtr0(uint8_t val, dali_callback_t callback) {
+    dali_queue_command(DALI_CMD_SET_DTR0 | val, 1, callback); 
+}
+
+
+
+void dali_set_min_level(uint8_t addr, uint8_t val, dali_callback_t callback) {
+    dali_set_dtr0(val, NULL);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_MIN, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_MIN, addr), 1, callback); 
+    track_fade(addr);
+}
+
+void dali_set_max_level(uint8_t addr, uint8_t val, dali_callback_t callback) {
+    dali_set_dtr0(val, NULL);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_MAX, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_MAX, addr), 1, callback); 
+    track_fade(addr);
+}
+
+void dali_set_fade_rate(uint8_t addr, uint8_t val, dali_callback_t callback) {
+    dali_set_dtr0(val, NULL);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_FADE_RATE, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_FADE, addr), 1, callback); 
+}
+
+void dali_set_fade_time(uint8_t addr, uint8_t val, dali_callback_t callback) {
+    dali_set_dtr0(val, NULL);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_FADE_TIME, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_EXT_FADE, addr), 1, callback); 
+}
+
+void dali_set_power_on_level(uint8_t addr, uint8_t val, dali_callback_t callback) {
+    dali_set_dtr0(val, NULL);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_POWER_ON_LEVEL, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_POWER_FAIL_LEVEL, addr), 1, callback); 
+}
+
+void dali_set_power_fail_level(uint8_t addr, uint8_t val, dali_callback_t callback) {
+    dali_set_dtr0(val, NULL);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_POWER_FAIL_LEVEL, addr), 2, NULL); 
+    // Read back the power fail level after writing it.
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_POWER_FAIL_LEVEL, addr), 1, callback); 
+}
+
+void dali_add_to_group(uint8_t addr, uint8_t group, dali_callback_t callback) {
+    dali_queue_command(ENCODE_CMD(DALI_CMD_ADD_TO_GROUP + group, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_GROUPS0_7, addr), 1, callback); 
+}
+
+void dali_remove_from_group(uint8_t addr, uint8_t group, dali_callback_t callback) {
+    dali_queue_command(ENCODE_CMD(DALI_CMD_REMOVE_FROM_GROUP + group, addr), 2, NULL); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_GROUPS8_15, addr), 1, callback); 
+}
+
+
 
 void dali_toggle(uint8_t addr, dali_callback_t cb) {
     // Start by fetching the current level

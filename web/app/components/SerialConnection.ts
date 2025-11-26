@@ -1,241 +1,151 @@
+import { GatewayDeviceState } from "../deviceState";
 import { SerialPort } from "./serial";
 
-export interface ModbusDeviceValues {
-    coils: number[];
-    holding: number[];
-    inputs: number[];
-    failures: number;
-}
 
-const topicRe = /^([a-z0-9_\-\/]+):\s?/
+type DeviceChangedListener = (state: GatewayDeviceState) => void;
+type ConsoleListener = (msg: string) => void;
 
 
-type EntityChangedListener = (changed: Entity) => void;
-type DeviceChangedListener = (changed: HADevice) => void;
-
-
-interface DeviceEntityMsg {
-    "~": string;
-    name?: string;
-    stat_t?: string;
-    cmd_t?: string;
-    avty?: string[];
-    avty_mode?: string;
-    uniq_id: string;
-    p: string;
-}
-
-interface HADeviceMsg {
-    dev: {
-        ids: string[],
-        name: string,
-        via_device?: string,
-    },
-    cmps: DeviceEntityMsg[]
-}
-
-const tenc = new TextEncoder();
-
-export class Entity {
-    id: string;
-    platform: string;
-    value: any = undefined;
-    device: HADevice;
-    name?: string;
-
-    static allEntities = new Map<string, Entity>();
-
-    constructor(dev: HADevice, msg: DeviceEntityMsg) {
-        this.device = dev;
-        this.id = msg.uniq_id;
-        this.platform = msg.p;
-        this.name = msg.name;
-        Entity.allEntities.set(this.id, this);
-    }
-
-
-    is_on(): boolean {
-        switch (this.platform) {
-            case 'light':
-                return this.value?.state == "ON";
-            case 'binary_sensor':
-                return this.value?.toUpperCase() == "ON";
-            default:
-                return false;
-        }
-    }
-
-    setState(state:any) {
-        const current = this.value
-        if (current && typeof current == 'object' && typeof(state) === 'object') {
-            console.log("assigning", state, "to", this.value);
-            Object.assign(this.value, state);
-            console.log("Value now", this.value);
-        } else {
-            this.value = state;
-        }
-        this.device.dispatchEntityChangeEvent(this)
-    }
+function isAlphanumeric(char: string) {
+    return /^[a-z0-9]$/i.test(char);
 }
 
 
 
-export class HADevice {
-    id: string;
-    name: string;
-    entities: Entity[] = [];
-    parent_device: HADevice | undefined = undefined;
+class Tokenizer {
+    str: string;
+    pos: number;
 
-    child_devices: HADevice[] = [];
+    constructor(str: string) {
+        this.str = str;
+        this.pos = 0;
+    }
 
-    static allDevices = new Map<string, HADevice>();
-
-    listeners: DeviceChangedListener[] = []
-    entityChangelisteners: EntityChangedListener[] = []
-
-    constructor(msg: HADeviceMsg) {
-        this.id = msg.dev.ids[0];
-        this.name = msg.dev.name;
-
-        HADevice.allDevices.set(this.id, this);
-        if (msg.dev.via_device) {
-            this.parent_device = HADevice.allDevices.get(msg.dev.via_device);
-            this.parent_device!.addChildDevice(this);
+    expect(char: string) {
+        if (this.str[this.pos] !== char) {
+            throw new Error(`Expected ${char} at position ${this.pos}, but got ${this.str[this.pos]}`);
         }
+        this.pos++;
+    }
 
-        for (const emsg of msg.cmps) {
-            this.addEntity(emsg)
+    identifier(): string {
+        const start = this.pos;
+        while (isAlphanumeric(this.str[this.pos])) {
+            this.pos++;
         }
+        return this.str.substring(start, this.pos);
     }
 
-    addChangeListener(l: DeviceChangedListener) {
-        this.listeners.push(l);
-
+    isNumber() {
+        const cc = this.str.charCodeAt(this.pos) - 48;
+        return cc >= 0 && cc <= 9
     }
-    removeChangeListener(l: DeviceChangedListener) {
-        const idx = this.listeners.indexOf(l);
-        if (idx !== -1) {
-            this.listeners.splice(idx, 1);
+
+
+    numericIndex(): number {
+        this.expect('[');
+        const start = this.pos;
+        if (!this.isNumber()) {
+            throw new Error(`Expected at least one digit, but got ${this.str[this.pos]}`);
         }
-    }
-
-    addEntityChangeListener(l: EntityChangedListener) {
-        this.entityChangelisteners.push(l);
-
-    }
-    removeEntityChangeListener(l: EntityChangedListener) {
-        const idx = this.entityChangelisteners.indexOf(l);
-        if (idx !== -1) {
-            this.entityChangelisteners.splice(idx, 1);
+        this.pos++;
+        while (this.isNumber()) {
+            this.pos++;
         }
+        const strVal = this.str.substring(start, this.pos);
+        this.expect(']');
+        return parseInt(strVal);
     }
 
-    addChildDevice(dev: HADevice) {
-        this.child_devices.push(dev);
-        dev.parent_device = this;
-        dev.dispatchChangeEvent();
-        this.dispatchChangeEvent();
+    nextPathElement(): string|number|null {
+        if (this.pos > this.str.length) {
+            throw new Error("Overflow")
+        }
+        const startChar = this.str[this.pos];
+        if (isAlphanumeric(startChar)) {
+            return this.identifier()
+        } 
+        if (startChar == '[') {
+            return this.numericIndex();
+        }
+        if (startChar == ".") {
+            this.pos++;
+            return this.identifier();
+        }
+        if (startChar == '=') {
+            this.pos++;
+            return null;
+        }
+        throw new Error(`Parse Error at position ${this.pos} - Unexpected character ${startChar}`)
     }
 
-    addEntity(msg: DeviceEntityMsg) {
-        const e = new Entity(this, msg)
-        this.entities.push(e);
-        this.dispatchEntityChangeEvent(e);
-        this.dispatchChangeEvent();
-    }
+    tokenize(): [(string|number)[], any] {
+        let tok: string|number|null;
 
-    dispatchChangeEvent() {
-        this.listeners.forEach(l => l(this));
-    }
-
-    dispatchEntityChangeEvent(ent: Entity) {
-        this.entityChangelisteners.forEach(l => l(ent));
+        const path: (string|number)[] = []
+        while ((tok = this.nextPathElement()) !== null) {
+            path.push(tok);                    
+        }
+        const remainder = this.str.substring(this.pos);
+        return [path, JSON.parse(remainder)]
     }
 }
 
-
-
-
-
-export class SerialConnection extends HADevice {
+export class SerialConnection {
     port?: SerialPort;
     closed = true;
 
-    changeList = new Set<string>();
-    notificationTimer: number = -1;
+    listeners: DeviceChangedListener[] = [];
+    console_listeners: ConsoleListener[]= [];
 
-
-    constructor() {
-        super({ dev: { ids: ["root"], name:"Root"}, cmps: []});
-    }
-
+    state: GatewayDeviceState|null = null;
 
     open = async (port: SerialPort) => {
         console.log("Opening serial port", port);
         this.port = port;
-        await this.port.open({ baudRate: 115200 });
+        await this.port.open({ baudRate: 460800 });
         console.log("Port now open.  Starting read loop");
         // An independent process to receive responses. 
-        await this.resetDevice();
+        await this.requestDevices();
         console.log("Starting read loop");
         this.readLoop();
+
+
 
         // setTimeout(this.dumpDevices, 8000);
         // this.dispatch("open");
     }
 
-    findOrUpdate(msg: HADeviceMsg): HADevice {
-        let dev = HADevice.allDevices.get(msg.dev.ids[0]);
-        if (!dev) {
-            dev = new HADevice(msg);
-            if (!dev.parent_device) {
-                this.addChildDevice(dev);
-            }
-        } else {
-            // TODO update device with new config.
-            dev.dispatchChangeEvent();
-        }
-        return dev;
-    }
-
 
     processIncomingLine = (line: string) => {
-        try {
-            if (line.match(topicRe)) {
+        try {            
+            if (line.startsWith("{")) {
+                // Its a full statement
+                this.state = JSON.parse(line);
+                this.dispatchChange();
+                return;
+            } 
 
-                const colPos = line.indexOf(':');
-                const [platform, entity_id, subtopic] = line.substring(0, colPos).split('/');
-                let msg: string | object = line.substring(colPos + 1);
-                if (msg.startsWith("{")) {
-                    msg = JSON.parse(msg);
-                }
+            try {
+                const [path, val] = new Tokenizer(line).tokenize();
+                console.log("Path", path, "=", val);
 
-                console.log("<", line);
-                switch (subtopic) {
-                    case "available":
-                        // console.log("Entity", entity_id, msg)
-                        break;
-                    case "state":
-                        const entity = Entity.allEntities.get(entity_id);
-                        if (entity) {
-                            entity.setState(msg);
-                        } else {
-                            console.warn("received set message for entity", entity_id, "that isn't registered");
-                        }
-                        break;
-                    case "config":
-                        if (platform == "device") {
-                            const dev = this.findOrUpdate(msg as any);
-                            // console.log("Device", dev);
-                        } else {
-                            console.warn("Unknown config msg");
-                        }
-                        break;
-                    default:
-                        console.warn("Ignoring subtopic", subtopic);
+                const newState: GatewayDeviceState = {...this.state!};
+                let parentObj: any = newState;
+                const lastPe = path.pop()!;
+                for (let pe of path) {
+                    const existing = parentObj[pe];
+                    const copy = Array.isArray(existing) ? [...existing] : {...existing};
+                    parentObj[pe] = copy;
+                    parentObj = copy;
                 }
-            } else {
-                console.log("<", line);
+                parentObj[lastPe] = val;
+                this.state = newState;
+                this.dispatchChange();
+
+
+            } catch (ex) {
+                // That is okay.. It just means it isn't a line.
             }
         } catch (ex) {
             console.log("Error processing line", line, ex)
@@ -243,43 +153,66 @@ export class SerialConnection extends HADevice {
     }
 
     sendLine = async (line: string) => {
-        console.log(">", line);
         const encoder = new TextEncoder();
         const writer = this.port!.writable!.getWriter()
-        await writer.write(encoder.encode(line + "\n"));
+        const buf = new Uint8Array(1000);
+        buf[0] = 1; // This will disable echo for this command
+        const res = encoder.encodeInto(line + "\n", buf.subarray(1));
+
+        const toSend = buf.subarray(0,res.written + 1);
+
+        await writer.write(toSend);
         writer.releaseLock();
-    }
-
-    setEntity = async(entityId: string, value: any) => {
-        const ent = Entity.allEntities.get(entityId)
-
-        let sval;
-        if (value == null || value == undefined) {
-            sval = "None"
-        } else if (typeof(value) === 'object') {
-            sval = JSON.stringify(value);
-        } else {
-            sval = value.toString();
-        }
-
-        await this.sendLine(`${ent?.platform}/${entityId}/set:${sval}`)
-        
-        // light/meche660d441571f4a2e_modbus1_26_coil/available:unavailable
     }
 
     resetDevice = async () => {
-        const writer = this.port!.writable!.getWriter()
-        await writer.write(new Uint8Array([3]));
-        await new Promise((resolve, reject) => setTimeout(resolve, 200))
-        await writer.write(new Uint8Array([4]));
-        await new Promise((resolve, reject) => setTimeout(resolve, 200))
-        writer.releaseLock();
+        await this.sendLine("")
+        await this.sendLine("reboot()")
     }
 
     requestDevices = async () => {
-        console.log("Requesting ")
-        await this.sendLine("status:online")
+        console.log("Requesting Devices")
+        await this.sendLine("")
+        await this.sendLine("devices")
     }
+
+    addChangeListener(listener: DeviceChangedListener) {
+        this.listeners.push(listener);
+    }
+
+    addConsoleListener(listener: ConsoleListener) {
+        this.console_listeners.push(listener);
+    }
+
+
+    removeConsoleListener(listener: ConsoleListener) {
+        const idx = this.console_listeners.indexOf(listener);
+        if (idx !== -1) {
+            this.console_listeners.splice(idx, 1);
+        }
+    }
+
+    removeChangeListener(listener: DeviceChangedListener) {
+        const idx = this.listeners.indexOf(listener);
+        if (idx !== -1) {
+            this.listeners.splice(idx, 1);
+        }
+    }
+
+    dispatchChange() {
+        if (this.state) {
+            for (const l of this.listeners) {
+                l(this.state);
+            }
+        }
+    }
+
+    dispatchConsole(line: string) {
+        for (const l of this.console_listeners) {
+            l(line);
+        }
+    }
+
 
 
     readLoop = async () => {
@@ -290,16 +223,15 @@ export class SerialConnection extends HADevice {
 
         while (!this.closed) {
             const { done, value } = await reader.read()
-
             if (done) {
                 closed = true;
             }
-
             if (value) {
                 buf = buf + decoder.decode(value)
                 let nlPos;
                 while ((nlPos = buf.indexOf("\n")) != -1) {
                     const line = buf.substring(0, nlPos).trimEnd();
+                    this.dispatchConsole(line);
                     this.processIncomingLine(line);
                     buf = buf.substring(nlPos + 1);
                 }

@@ -1,71 +1,73 @@
-import { html, css, LitElement, PropertyValues } from "lit";
+import { html, LitElement, PropertyValues } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import { when } from "lit/directives/when.js";
-import { repeat } from "lit/directives/repeat.js";
-import { styleMap } from "lit/directives/style-map.js";
-import { consume } from "@lit/context";
-import { serialContext } from "./SerialContext";
-import { chevronDown, chevronRight, InputCss } from "./shared_styles";
-import { range } from "lit/directives/range.js";
-import { query } from "lit/decorators.js";
-import { SerialConnection } from "./SerialConnection";
+import { classMap } from "lit/directives/class-map.js";
+import "./LocalStorageLabel"
+import { DeviceSelection } from "./ModbusApp";
 
-function expanderButton({ expand, click }: { expand: boolean; click?: (evt: Event) => void }) {
-    return html`<button class="expander" @click=${click}>${expand ? chevronDown : chevronRight}</button>`;
-}
 
-interface SliderProps {
-    value: number;
-    max: number;
-    min: number;
-    lastActive?: number;
-    width?: number;
-}
 
-export interface ExpandedDetail {
-    address: number;
-    expanded: boolean;
-}
 
-@customElement("dali-light")
-export class DaliLight extends LitElement {
+@customElement("ha-dali-light")
+export class DaliLightView extends LitElement {
 
-    @consume({ context: serialContext })
-    @property({ attribute: false })
-    public modbus?: SerialConnection;
 
-    @property({ type: Number })
+    // @property({ attribute: false})
+    // light: DaliLight|null = null;
+
+    @property({ attribute: false})
+    device_id: number = 0;
+
+    @property({ attribute: false})
     address: number = 0;
 
-    @property()
-    deviceId: number = 1;
+    @property({ attribute: false})
+    on: boolean = false;
 
+    @property({ attribute: false})
+    disabled: boolean = false;
 
+    @property({ attribute: false})
+    selected: boolean = false;
+
+    
     protected createRenderRoot(): HTMLElement | DocumentFragment {
         return this;
     }
 
-
-    startDrag = (evt: Event) => {
-        const dragEvent = evt as DragEvent;
-        if (dragEvent.dataTransfer) {
-            const content = `dali:${this.address}`;
-            console.log("Drag", content);
-            dragEvent.dataTransfer.setData("modbus/device-address", content);
-            dragEvent.dataTransfer.effectAllowed = "link";
+    startDrag(evt: DragEvent) {
+        if (evt.dataTransfer) {
+            const content = this.device_id << 8 | this.address;
+            evt.dataTransfer.setData("ha/binding", content.toString());
+            evt.dataTransfer.effectAllowed = "link";
+            // src.classList.add("dragging");
         }
-    };
+    }
+
+    selectDevice(evt: MouseEvent) {
+        this.dispatchEvent(new CustomEvent<DeviceSelection>("ha-device-selected", { detail: { device_id: this.device_id, address: this.address}, bubbles: true }))
+        evt.stopPropagation();
+    }
+
+
 
     render() {
-        return html`<div class="daliwrapper" draggable="true" @dragstart=${this.startDrag} >
-        ${this.address} 
-        <i class="bi bi-lightbulb-off"></i>
-        </div>`;
+        return html`<button type="button"  class=${classMap({
+                btn: true, 
+                "m-1": true,
+                "btn-secondary": !this.selected, 
+                "btn-primary": this.selected, 
+                "btn-sm": true, 
+            })} draggable="true" data-address=${this.id} @click=${this.selectDevice} ?disabled=${this.disabled} @dragstart=${this.startDrag}>
+                <localstorage-label key=${`ha/${this.device_id}/light${this.address}`} placeholder=${`${this.address}`}></localstorage-label>
+
+                <i class=${classMap({ bi: true, "bi-lightbulb": !this.on && !this.disabled, 'bi-lightbulb-off': this.disabled, 'bi-lightbulb-fill': this.on })}></i>
+            </button>`;
     }
 }
 
+
 declare global {
     interface HTMLElementTagNameMap {
-        "dali-light": DaliLight;
+        "ha-dalilight": DaliLightView;
     }
 }

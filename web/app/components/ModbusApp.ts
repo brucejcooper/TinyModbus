@@ -3,65 +3,37 @@ import { customElement, property, state } from "lit/decorators.js";
 import { SerialPort, Serial } from "./serial";
 import { provide } from "@lit/context";
 import { serialContext } from "./SerialContext";
-import { SwitchFixtureID } from "./ModbusSwitchFixture";
-// import "./LightEditor"
-import "./Device"
-import "./entities/BinarySensor"
-import "./entities/Text"
-import "./entities/Light"
-import "./entities/Button"
-import "./entities/Sensor"
-import "./entities/Number"
-import { SerialConnection, HADevice, Entity } from "./SerialConnection";
-import { repeat } from "lit/directives/repeat.js";
-import { selectedDeviceContext } from "./SelectedDeviceContext";
-import { when } from "lit/directives/when.js";
+import "./GatewayDevice"
+import { SerialConnection } from "./SerialConnection";
+import { GatewayDeviceState } from "../deviceState";
+import { renderBindingsEditor } from "./FixtureEditor";
+import "./DaliLightEditor"
 
+export type DeviceSelection = null|{
+    device_id: number;
+    address: number
+};
 
-function stringListChanged(a: string[], b: string[]) {
-    if (Array.isArray(a) && !Array.isArray(b)) {
-        return true;
-    }
-    if (Array.isArray(b) && !Array.isArray(a)) {
-        return true;
-    }
-    if (!a) {
-        return !!b;
-    }
-    if (a.length !== b.length)
-        return true;
-
-    for (let i = 0; i < a.length; i++) {
-        if (a[i] !== b[i]) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function editorForEntity(ent: Entity): TemplateResult<1>|null {
-    if (!ent) {
+function editorForEntity(sel: DeviceSelection, gw: GatewayDeviceState|null ): TemplateResult<1>|null {
+    if (!sel || !gw) {
         return null;
     }
 
-    switch (ent.platform) {
-        case "binary_sensor": 
-            return html`<entity-binary-sensor .entity=${ent}></entity-binary-sensor>`
-        case "text": 
-            return html`<entity-text .entity=${ent}></entity-text>`
-        case "light": 
-            return html`<entity-light .entity=${ent}></entity-light>`
-        case "button": 
-            return html`<entity-button .entity=${ent}></entity-button>`
-        case "sensor": 
-            return html`<entity-sensor .entity=${ent}></entity-sensor>`
-        case "number": 
-            return html`<entity-number .entity=${ent}></entity-number>`
-        default:
+    switch (sel.device_id) {
+        case 0:
+            return renderBindingsEditor(sel.address, gw.bindings.slice(sel.address*8, sel.address*8+7));
+            
+        case 2: 
+        case 3:
+            const gwdev = gw.dali[sel.device_id];
+            return html`<ha-dali-light-editor .light=${gwdev ? gwdev[sel.address] : null} .deviceid=${sel.device_id} .address=${sel.address} ></ha-dali-light-editor>`;
+        case 1:
+            default:
             return html`<div class="alert alert-warning" role="alert">
-                ${ent.platform} ${ent.id}
+                No Editor for device ${sel.device_id}/${sel.address}
             </div>`;
     }
+
 }
 
 
@@ -72,24 +44,19 @@ export class ModbusApplication extends LitElement {
     @provide({ context: serialContext })
     serialConnection: SerialConnection = new SerialConnection();
 
-    @provide({ context: selectedDeviceContext, })
-    selectedDevice: string|null = null;
+    @state()
+    gatewayDevice: GatewayDeviceState|null = null;
+
+    @state()
+    selectedDevice: DeviceSelection = null;
 
     @state()
     serialInterface?: Serial | null;
 
-    @property({ reflect: false })
-    selectedBinding: SwitchFixtureID | null = null;
+    @state() 
+    deviceLog: string[] = [];
+    scrollTimer?: number;
 
-    @property({ reflect: false })
-    expandedDaliLight: number = -1;
-
-
-    @state({ hasChanged: stringListChanged })
-    topLevelDeviceIDs: string[] = []
-
-    @state()
-    device: HADevice|null = null;
 
     createRenderRoot() {
         return this;
@@ -98,7 +65,7 @@ export class ModbusApplication extends LitElement {
     private async openPort(port: SerialPort) {
         try {
             await this.serialConnection.open(port);
-            // await this.serialConnection.requestDevices();
+            await this.serialConnection.requestDevices();
         } catch (ex) {
             console.log(ex);
         }
@@ -127,18 +94,17 @@ export class ModbusApplication extends LitElement {
         this.serialConnection?.forget();
     }
 
+    // switchSelected = (evt: Event) => {
+    //     // this.selectedBinding = (evt as CustomEvent<string>).detail;
+    // };
 
-    switchSelected = (evt: Event) => {
-        this.selectedBinding = (evt as CustomEvent<SwitchFixtureID>).detail;
-    };
-
-    topLevelDevicesChanged = (dev:HADevice) => {
-        this.topLevelDeviceIDs = this.serialConnection.child_devices.map(e => e.id);
+    topLevelDevicesChanged = (dev:GatewayDeviceState) => {
+        this.gatewayDevice = dev;
     }
 
     connectedCallback(): void {
         super.connectedCallback();
-        this.addEventListener("switch-selected", this.switchSelected);
+        // this.addEventListener("switch-selected", this.switchSelected);
         this.serialInterface = (navigator as any).serial as Serial | undefined;
         if (this.serialInterface) {
             this.lookForBoundSerialInterface();
@@ -147,17 +113,41 @@ export class ModbusApplication extends LitElement {
         }
 
         this.serialConnection.addChangeListener(this.topLevelDevicesChanged);
+        this.serialConnection.addConsoleListener(this.consoleLogReceived);
     }
 
     disconnectedCallback(): void {
         super.disconnectedCallback();
         this.serialConnection.removeChangeListener(this.topLevelDevicesChanged);
-        this.removeEventListener("switch-selected", this.switchSelected);
+        this.serialConnection.removeConsoleListener(this.consoleLogReceived);
+
+        // this.removeEventListener("switch-selected", this.switchSelected);
     }
 
-    deviceSelected = (evt: CustomEvent<string|null>) => {        
+    deviceSelected = (evt: CustomEvent<DeviceSelection>) => {        
         this.selectedDevice = evt.detail;
-        this.device =  this.selectedDevice ? HADevice.allDevices.get(this.selectedDevice) ?? null : null;
+        // this.device =  this.selectedDevice ? HADevice.allDevices.get(this.selectedDevice) ?? null : null;
+    }
+
+    consoleInputEntered = (evt: Event) => {
+        const input = (evt.target as HTMLInputElement)
+        this.serialConnection.sendLine(input.value);
+        input.value = "";
+    }
+
+    consoleLogReceived = (line: string) => {
+        if (this.deviceLog.length > 1000) {
+            this.deviceLog.shift();
+        }
+        this.deviceLog.push(line + "\n");
+        this.requestUpdate();
+        if (this.scrollTimer) {
+            clearTimeout(this.scrollTimer);
+        }
+        this.scrollTimer = setTimeout(() => {
+            this.querySelector("#log")?.scrollTo(0, 1000000000);
+        }, 100) as any;
+        
     }
     
 
@@ -167,7 +157,7 @@ export class ModbusApplication extends LitElement {
         }
 
         return html`
-            <main class="d-flex flex-nowrap">
+            <main class="d-flex flex-nowrap" @ha-device-selected=${this.deviceSelected}>
                 <nav class="nav d-flex flex-column flex-shrink-0 p-3 text-bg-dark" style="width: 280px;"> 
                     <a href="/" class="d-flex align-items-center mb-3 mb-md-0 me-md-auto text-white text-decoration-none"> 
                         <svg class="bi pe-none me-2" width="40" height="32" aria-hidden="true"><use xlink:href="#bootstrap"></use></svg> 
@@ -203,20 +193,21 @@ export class ModbusApplication extends LitElement {
                     </div> 
                 </nav>
 
-                <div class="d-flex flex-column flex-grow-1 p-3 text-bg-tertiary" style="gap: 1em; overflow-y: auto; max-height: 100vh" @ha-device-selected=${this.deviceSelected}>  
-                    ${repeat(this.topLevelDeviceIDs, (id) => html`<ha-device device-id=${id}></ha-device>`)}
+                <div class="d-flex flex-column flex-grow-1 p-3 text-bg-tertiary" style="gap: 1em; overflow-y: auto; max-height: 100vh" >  
+                    <ha-gw-device .state=${this.gatewayDevice} .selectedDevice=${this.selectedDevice}></ha-gw-device>
                 </div>            
 
                 <div class="" style=" width: 0.5rem; height: 100vh; flex-shrink: 0; background-color: #0000001a; border: solid rgba(0,0,0,.15); border-width: 1px 0; box-shadow: inset 0 .5em 1.5em #0000001a,inset 0 .125em .5em #00000026;"></div>
 
-                <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="min-width: 380px;"> 
-                    <h3>Device ${this.device?.name ?? this.device?.id ?? "none"}</h3>
-
-                    ${when(this.device, () => html`<localstorage-label key=${`ha/label/${this.device!.id}`} editable label="Label" placeholder=${this.device!.name}></localstorage-label>`)}
-
-                    <div class="keyvalgrid">
-                    ${repeat((this.device?.entities ?? []), e => html`<div class="noshrink">${e.name ?? e.id}:</div>${editorForEntity(e)}`)}
+                <div class="d-flex flex-column flex-grow-0 p-3 text-bg-tertiary" style="min-width: 380px; height: 100vh;"> 
+                    <div style="flex:1; overflow-y: auto;">
+                        ${editorForEntity(this.selectedDevice, this.gatewayDevice)}
                     </div>
+                    <div style="flex:0">
+                        <h4>Console</h4>
+                        <input type="text" style="width: 100%" @change=${this.consoleInputEntered}/>
+                    </div>
+                    <pre id="log" style="border: 1px solid #aaa; max-width: 380px; min-height: 5em; flex: 0.4; white-space: perw-wrap;">${this.deviceLog}</pre>
                 </div>            
             </main>
         `;

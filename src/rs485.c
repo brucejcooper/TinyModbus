@@ -36,7 +36,7 @@ typedef enum {
     MODBUS_ERR_NEGATIVE_ACKNOWLEDGE = 0x07,
     MODBUS_ERR_MEMORY_PARITY_ERROR = 0x08,
     MODBUS_ERR_GATEWAY_PATH_UNAVAILABLE = 0x09,
-    MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND = 0x0a,
+    MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND = 0x0b,
 } modbus_err_t;
 
 #define MODBUS_BAUD 9600
@@ -293,18 +293,18 @@ static void processCustomDaliCommand() {
 }
 
 static void processSetSingleHoldingRegisterCommand() {
-    uint16_t existingGroups;
+    uint16_t groupChanges;
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t val = buf[4] << 8 | buf[5];
 
     uint8_t bank = addr / 64;
     uint8_t daliAddr = addr % 64;
 
+    daliResponseType = DALI_RESPONSE_PENDING;
     switch (bank) {
         case DALI_STATUS_BANK:
             // Its power level;
             if (val <= 254) {
-                daliResponseType = DALI_RESPONSE_PENDING;
                 dali_set_level(daliAddr, val, dali_cmd_completed);
                 waitForDaliResponse();
             } else {
@@ -317,7 +317,6 @@ static void processSetSingleHoldingRegisterCommand() {
             dali_set_max_level(daliAddr, val >> 8 , dali_cmd_completed);
             dali_holding_regs.banks[DALI_MINMAX_BANK][daliAddr].shortVal = val;
             waitForDaliResponse();
-
             break;
         case DALI_FADE_BANK:
             dali_set_fade_rate(daliAddr, val & 0xFF, NULL);
@@ -332,20 +331,24 @@ static void processSetSingleHoldingRegisterCommand() {
             waitForDaliResponse();
             break;
         case DALI_GROUPS_BANK:
-            existingGroups = dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal;
-            for (uint8_t i = 0; i < 16; i++) {
-                uint8_t oldBit = (existingGroups >> i) & 0x01;
-                uint8_t newBit = (val >> i) & 0x01;
-                if (oldBit != newBit) {
-                    if (newBit) {
-                        dali_add_to_group(daliAddr, i, NULL);
-                    } else {
-                        dali_remove_from_group(daliAddr, i, NULL);
+            groupChanges = dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal ^ val;
+            if (groupChanges > 0) {
+                dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal = val;
+                for (uint8_t bit = 0; bit < 16; bit++) {
+                    if (groupChanges & 0x01) {
+                        // We only want the callback for the very last change.
+                        dali_callback_t cb = groupChanges == 1 ? dali_cmd_completed : NULL;
+                        if (val & 0x01) {
+                            dali_add_to_group(daliAddr, bit, cb);
+                        } else {
+                            dali_remove_from_group(daliAddr, bit, cb);
+                        }
                     }
+                    groupChanges >>= 1;
+                    val >>= 1;
                 }
+                waitForDaliResponse();
             }
-            dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal = val;
-            sendResponse(buf, sz - 2);
             break;
         //     dali_set_min_level(bankAddr, val, NULL);
         //     dali_set_max_level(bankAddr, val, dali_cmd_completed);
@@ -449,6 +452,9 @@ void rs485_process_command() {
     // modbus_cmd_available variable.  When it is set, there is a valid command in
     // the incoming buffer, and RX has been temporarily turned off. 
     if (modbus_cmd_available) {
+        // MODBUS requires a small delay between receiving a request, and responding.
+        _delay_us(1500);
+
         uint8_t cmd_addr = buf[0];
         switch (buf[1]) {
             case MODBUS_READ_COILS_CMD:

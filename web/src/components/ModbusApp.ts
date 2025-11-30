@@ -1,4 +1,4 @@
-import { html, css, LitElement, TemplateResult, PropertyValues } from "lit";
+import { html, css, LitElement, TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { SerialPort, Serial } from "./serial";
 import { provide } from "@lit/context";

@@ -2,5 +2,5 @@
 *.js.map
 *.d.ts
 *.d.ts.map
-!app/components/serial.d.ts
+!src/components/serial.d.ts
 node_modules/

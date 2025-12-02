@@ -4,7 +4,6 @@
 #include <avr/sleep.h>
 #include <avr/wdt.h>
 #include <stdbool.h>
-#include <string.h>
 #include <util/atomic.h>
 #include <util/delay.h>
 #include "rs485.h"
@@ -13,10 +12,29 @@
 
 
 void pulse_led(uint8_t times) {
-    while (times--) {
-        PORTB.OUTTGL = PIN3_bm;
-        PORTB.OUTTGL = PIN3_bm;
+    int bits = 8;
+    // Start bit
+    PORTB.OUTCLR = PIN3_bm;
+    _delay_us(104);
+    while (bits--) {
+        if (times & 0x01) {
+            PORTB.OUTSET = PIN3_bm;
+        } else {
+            PORTB.OUTCLR = PIN3_bm;
+        }
+        _delay_us(103);
+        times >>=1;
     }
+    PORTB.OUTSET = PIN3_bm;
+    _delay_us(208); // Stop bit
+
+
+
+
+    // while (times--) {
+    //     PORTB.OUTTGL = PIN3_bm;
+    //     PORTB.OUTTGL = PIN3_bm;
+    // }
 }
     
 
@@ -28,6 +46,9 @@ int main(void) {
     // 10Mhz is the best we can reliably do at 3.3V (according to the datasheet)
     CLKCTRL.MCLKCTRLB = CLKCTRL_PDIV_2X_gc | CLKCTRL_PEN_bm;
 
+    // LED pin
+    PORTB.DIRSET = PIN3_bm;
+    PORTB.OUTSET = PIN3_bm;
 
     // Device ID is stored in the first byte of the USERRROW EEPROM.  It is offset by 2, so that when set to the
     // default value (0xFF), it comes out as Device no 1.  If you want device 2, write 0x00
@@ -37,21 +58,22 @@ int main(void) {
     set_sleep_mode(SLEEP_MODE_STANDBY);
     sei();  // Enable Interrupts
 
-    // LED pin
-    PORTB.DIRSET = PIN3_bm;
+    // Set up a WDT, with a timeout of 8.2 seconds. This is ooodles more than needed.
+    WDT.CTRLA = WDT_PERIOD_8KCLK_gc;
+    wdt_reset();
+
+
     sleep_enable();
 
     // Do an inital scan of the bus.
     dali_start_background_scan(0);
-    // dali_set_level(0, 0, NULL);
-    // dali_set_level(0, 254, NULL);
-    // dali_set_level(0, 0, NULL);
 
-    PORTB.OUTSET = PIN3_bm;
     for (;;) {
         rs485_process_command();
+        wdt_reset();
+
         // We are idle, so go to sleep
-        if (dali_idle && modbus_idle) {
+        if (dali_idle &&  modbus_idle) {
             // PORTB.OUTCLR = PIN3_bm;
             sleep_cpu();
             // PORTB.OUTSET = PIN3_bm;

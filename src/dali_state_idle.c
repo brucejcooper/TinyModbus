@@ -24,39 +24,38 @@ typedef struct {
     uint8_t byte_offset;
 } command_bank_mapping_t;
 
-static const uint8_t command_bank_mapping[] = {
-    DALI_CMD_GET_LEVEL & 0xFF,
-    DALI_CMD_QUERY_STATUS & 0xFF,
-    DALI_CMD_GET_MIN & 0xFF,
-    DALI_CMD_GET_MAX & 0xFF,
-    DALI_CMD_GET_FADE & 0xFF,
-    DALI_CMD_GET_EXT_FADE & 0xFF,
-    DALI_CMD_GET_POWER_ON_LEVEL & 0xFF,
-    DALI_CMD_GET_POWER_FAIL_LEVEL & 0xFF,
-    DALI_CMD_GET_GROUPS0_7 & 0xFF,
-    DALI_CMD_GET_GROUPS0_7 & 0xFF,
+static const uint16_t command_bank_mapping[] = {
+    DALI_CMD_GET_LEVEL,
+    DALI_CMD_QUERY_STATUS,
+    DALI_CMD_GET_MIN,
+    DALI_CMD_GET_MAX,
+    DALI_CMD_GET_FADE,
+    DALI_CMD_GET_EXT_FADE,
+    DALI_CMD_GET_POWER_ON_LEVEL,
+    DALI_CMD_GET_POWER_FAIL_LEVEL,
+    DALI_CMD_GET_GROUPS0_7,
+    DALI_CMD_GET_GROUPS8_15,
 };
 
 
 #define NUM_COMMAND_MAPPINGS (sizeof(command_bank_mapping) / sizeof(uint16_t))
 
 void process_command_response(dali_response_type_t err, uint8_t res) {
-    uint8_t addr;
     if (q_size > 0) {
         // We don't set the callback when we are repeating ourselves, because we need to send the command again (once we re-enter the idle state)
         if (commandQ->repeat == 0 || --(commandQ->repeat) == 0) {
             // In addition to calling the callback, we automatically mirror the output of some DALI commands to our holding registers.
             // This makes it easier to process when also calling Custom Dali commands.
-            if ((commandQ->cmd >> 8) == 0x01) {
-                // It was a device command
-                // The results of some commands map to holding registers.  We update them.
-                uint8_t lowCmd = commandQ->cmd & 0xFF;
-                for (int i = 0; i < NUM_COMMAND_MAPPINGS; i++) {
-                    if (lowCmd == command_bank_mapping[i]) {
-                        uint8_t *ptr = ((uint8_t *) &dali_holding_regs.banks[i/2][DALI_DECODE_ADDR(commandQ->cmd)]) + (i%2);
-                        *ptr = res;
-                        break;
-                    }
+            uint16_t masked = commandQ -> cmd & 0x81FF;
+            // It was a device command
+            // The results of some commands map to holding registers.  We update them.
+            int i;
+            for (i = 0; i < NUM_COMMAND_MAPPINGS; i++) {
+                if (masked == command_bank_mapping[i]) {
+                    uint8_t addr = DALI_DECODE_ADDR(commandQ->cmd);
+                    uint8_t *ptr = ((uint8_t *) &dali_holding_regs.banks[i/2][addr]) + (i%2);
+                    *ptr = res;
+                    break;
                 }
             }
 
@@ -106,6 +105,7 @@ void externalDaliMessageStarted() {
 }
 
 void dali_idle_state_enter() {
+    // pulse_led(5);
     // If we've something to send, send it immediately
     if (q_size > 0) {
         // Immediately start transmitting the next command.

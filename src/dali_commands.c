@@ -36,7 +36,6 @@ static inline bool isFading(uint8_t addr) {
 
 
 
-
 static void scan_result_received(dali_response_type_t err, uint16_t cmd, uint8_t response) {
     // Once we've scanned the level, we also want to scan the status.
     uint8_t addr = DALI_DECODE_ADDR(cmd);

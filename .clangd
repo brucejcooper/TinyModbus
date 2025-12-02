@@ -3,6 +3,7 @@ CompileFlags:
     - "-I/opt/avr-gcc/avr/include/"
     - "-DF_CPU=3333333"
     - "-D__AVR_ATtiny806__"
+    - "-D__AVR_TINY__"
     - "-DSM1"
     - "-DFW_VER_MAJOR=1"
     - "-DFW_VER_MINOR=0"

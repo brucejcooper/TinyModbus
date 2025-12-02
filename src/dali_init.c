@@ -18,10 +18,12 @@
  */
 void (*dali_rx_rising_callback)() = NULL;
 
-static volatile uint8_t rescan_counter = 0;
+// By default, we go off once per 64 seconds (8 x 1 second periods)
+#define RESCAN_PERIOD 64
 
-// By default, we go off once per 64 seconds (8 x 8 second periods)
-#define RESCAN_PERIOD 8
+
+static volatile uint8_t rescan_counter = RESCAN_PERIOD;
+
 
 void dali_init() {
     // Transmission set up
@@ -40,15 +42,14 @@ void dali_init() {
 
     dali_state_init();  // Initialise the state machine.
 
-    // Set up the PIT to go off occasionally to scan the dali devices.
+    // Set up the PIT to go off occasionally to scan the dali devices and feed the WDT
 
     // Run off internal 1Khz clock;
     RTC.CLKSEL = RTC_CLKSEL_INT1K_gc;
 
     // Turn the PIT on, to execute every 8ish seconds.
     while (RTC.PITSTATUS & RTC_CTRLABUSY_bm) {};
-    RTC.PITCTRLA = RTC_PERIOD_CYC8192_gc | RTC_PITEN_bm;
-
+    RTC.PITCTRLA = RTC_PERIOD_CYC1024_gc | RTC_PITEN_bm;
     RTC.PITINTCTRL = RTC_PI_bm; // Enable PIT interrupts. 
 
     // We start in the reset state (which we should exit in short order).
@@ -95,8 +96,10 @@ ISR(PORTB_PORT_vect) {
 
 
 ISR(RTC_PIT_vect) {
-    if (((++rescan_counter) % RESCAN_PERIOD) == 0) {
+    if (--rescan_counter == 0) {
+        // pulse_led(2);
         dali_start_background_scan(0);
+        rescan_counter = RESCAN_PERIOD;
     }
     RTC.PITINTFLAGS = RTC_PI_bm; // Clear the flag.
 }

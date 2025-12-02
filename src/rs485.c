@@ -55,7 +55,7 @@ static volatile uint16_t crc = 0xFFFF;
 static uint8_t buf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 256 that MODBUS allows for)
 static volatile uint8_t *ptr = buf;
 static volatile uint8_t sz = 0;
-volatile bool modbus_idle = false;
+volatile bool modbus_idle = true;
 volatile uint8_t readCountDown;
 static bool modbus_cmd_available = false;
 

@@ -3,6 +3,9 @@ import { customElement, property, state } from "lit/decorators.js";
 import { classMap } from "lit/directives/class-map.js";
 import "./LocalStorageLabel"
 import { DeviceSelection } from "./ModbusApp";
+import { consume } from "@lit/context";
+import { serialContext } from "./SerialContext";
+import { SerialConnection } from "./SerialConnection";
 
 
 
@@ -29,6 +32,10 @@ export class DaliLightView extends LitElement {
     @property({ attribute: false})
     selected: boolean = false;
 
+    @consume({ context: serialContext })
+    serialConnection!: SerialConnection;
+    
+
     
     protected createRenderRoot(): HTMLElement | DocumentFragment {
         return this;
@@ -44,6 +51,9 @@ export class DaliLightView extends LitElement {
     }
 
     selectDevice(evt: MouseEvent) {
+        if (this.device_id == 1) { 
+            this.serialConnection.sendLine(`modbus[${this.device_id}][${this.address}] = not modbus[${this.device_id}][${this.address}]`)
+        }
         this.dispatchEvent(new CustomEvent<DeviceSelection>("ha-device-selected", { detail: { device_id: this.device_id, address: this.address}, bubbles: true }))
         evt.stopPropagation();
     }
@@ -58,7 +68,7 @@ export class DaliLightView extends LitElement {
                 "btn-primary": this.selected, 
                 "btn-sm": true, 
             })} draggable="true" data-address=${this.id} @click=${this.selectDevice} ?disabled=${this.disabled} @dragstart=${this.startDrag}>
-                <localstorage-label key=${`ha/${this.device_id}/light${this.address}`} placeholder=${`${this.address}`}></localstorage-label>
+                <localstorage-label .deviceId=${this.device_id} .address =${this.address} placeholder=${`${this.address}`}></localstorage-label>
 
                 <i class=${classMap({ bi: true, "bi-lightbulb": !this.on && !this.disabled, 'bi-lightbulb-off': this.disabled, 'bi-lightbulb-fill': this.on })}></i>
             </button>`;
@@ -66,8 +76,8 @@ export class DaliLightView extends LitElement {
 }
 
 
-declare global {
-    interface HTMLElementTagNameMap {
-        "ha-dalilight": DaliLightView;
-    }
-}
+// declare global {
+//     interface HTMLElementTagNameMap {
+//         "ha-dalilight": DaliLightView;
+//     }
+// }

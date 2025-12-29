@@ -1,5 +1,4 @@
-import { GatewayDeviceState } from "../deviceState";
-import { SerialPort } from "./serial";
+import { GatewayDeviceState } from "./deviceState";
 
 
 type DeviceChangedListener = (state: GatewayDeviceState) => void;
@@ -9,8 +8,6 @@ type ConsoleListener = (msg: string) => void;
 function isAlphanumeric(char: string) {
     return /^[a-z0-9]$/i.test(char);
 }
-
-
 
 class Tokenizer {
     str: string;
@@ -57,14 +54,14 @@ class Tokenizer {
         return parseInt(strVal);
     }
 
-    nextPathElement(): string|number|null {
+    nextPathElement(): string | number | null {
         if (this.pos > this.str.length) {
             throw new Error("Overflow")
         }
         const startChar = this.str[this.pos];
         if (isAlphanumeric(startChar)) {
             return this.identifier()
-        } 
+        }
         if (startChar == '[') {
             return this.numericIndex();
         }
@@ -79,12 +76,12 @@ class Tokenizer {
         throw new Error(`Parse Error at position ${this.pos} - Unexpected character ${startChar}`)
     }
 
-    tokenize(): [(string|number)[], any] {
-        let tok: string|number|null;
+    tokenize(): [(string | number)[], any] {
+        let tok: string | number | null;
 
-        const path: (string|number)[] = []
+        const path: (string | number)[] = []
         while ((tok = this.nextPathElement()) !== null) {
-            path.push(tok);                    
+            path.push(tok);
         }
         const remainder = this.str.substring(this.pos);
         return [path, JSON.parse(remainder)]
@@ -92,50 +89,48 @@ class Tokenizer {
 }
 
 export class SerialConnection {
-    port?: SerialPort;
-    closed = true;
-
     listeners: DeviceChangedListener[] = [];
-    console_listeners: ConsoleListener[]= [];
+    console_listeners: ConsoleListener[] = [];
+    state: GatewayDeviceState | null = null;
+    ws?: WebSocket;
 
-    state: GatewayDeviceState|null = null;
+    open = async () => {
+        this.ws = new WebSocket("/ws");
+        this.ws.addEventListener("message", this.msgReceived);
+        this.ws.addEventListener("close", this.wsClosed);
+    }
 
-    open = async (port: SerialPort) => {
-        console.log("Opening serial port", port);
-        this.port = port;
-        await this.port.open({ baudRate: 460800 });
-        console.log("Port now open.  Starting read loop");
-        // An independent process to receive responses. 
-        await this.requestDevices();
-        console.log("Starting read loop");
-        this.readLoop();
+    msgReceived = (evt: MessageEvent<any>) => {
+        const line = evt.data;
+        this.dispatchConsole(line);
+        this.processIncomingLine(line);
 
+    }
 
-
-        // setTimeout(this.dumpDevices, 8000);
-        // this.dispatch("open");
+    wsClosed = (evt: CloseEvent) => {
+        console.log("Websocket closed");
     }
 
 
     processIncomingLine = (line: string) => {
-        try {            
+        try {
             if (line.startsWith("{")) {
                 // Its a full statement
                 this.state = JSON.parse(line);
                 this.dispatchChange();
                 return;
-            } 
+            }
 
             try {
                 const [path, val] = new Tokenizer(line).tokenize();
-                console.log("Path", path, "=", val);
+                // console.log("Path", path, "=", val);
 
-                const newState: GatewayDeviceState = {...this.state!};
+                const newState: GatewayDeviceState = { ...this.state! };
                 let parentObj: any = newState;
                 const lastPe = path.pop()!;
                 for (let pe of path) {
                     const existing = parentObj[pe];
-                    const copy = Array.isArray(existing) ? [...existing] : {...existing};
+                    const copy = Array.isArray(existing) ? [...existing] : { ...existing };
                     parentObj[pe] = copy;
                     parentObj = copy;
                 }
@@ -153,21 +148,15 @@ export class SerialConnection {
     }
 
     sendLine = async (line: string) => {
-        const encoder = new TextEncoder();
-        const writer = this.port!.writable!.getWriter()
-        const buf = new Uint8Array(1000);
-        buf[0] = 1; // This will disable echo for this command
-        const res = encoder.encodeInto(line + "\n", buf.subarray(1));
-
-        const toSend = buf.subarray(0,res.written + 1);
-
-        await writer.write(toSend);
-        writer.releaseLock();
+        if (!this.ws) {
+            throw new Error("WS not open");
+        }
+        this.ws.send(line);
     }
 
     resetDevice = async () => {
-        await this.sendLine("")
-        await this.sendLine("reboot()")
+        await this.sendLine("");
+        await this.sendLine("reboot()");
     }
 
     requestDevices = async () => {
@@ -213,43 +202,13 @@ export class SerialConnection {
         }
     }
 
-
-
-    readLoop = async () => {
-        const reader = this.port!.readable!.getReader()
-        this.closed = false;
-        let buf = "";
-        const decoder = new TextDecoder();
-
-        while (!this.closed) {
-            const { done, value } = await reader.read()
-            if (done) {
-                closed = true;
-            }
-            if (value) {
-                buf = buf + decoder.decode(value)
-                let nlPos;
-                while ((nlPos = buf.indexOf("\n")) != -1) {
-                    const line = buf.substring(0, nlPos).trimEnd();
-                    this.dispatchConsole(line);
-                    this.processIncomingLine(line);
-                    buf = buf.substring(nlPos + 1);
-                }
-            }
-        }
-        console.log("Serial Port closed");
-    }
-
     async close() {
         console.log("closing serial port");
         // Wait for our reader to finish operation.
-        await this.port?.close();
-        this.port = undefined;
         // this.dispatch("close");
     }
 
     async forget() {
         await this.close();
-        await this.port?.forget();
     }
 }

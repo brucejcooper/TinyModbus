@@ -1,13 +1,15 @@
 import { html, css, LitElement, TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
-import { SerialPort, Serial } from "./serial";
+// import { SerialPort, Serial } from "./serial";
 import { provide } from "@lit/context";
 import { serialContext } from "./SerialContext";
 import "./GatewayDevice"
 import { SerialConnection } from "./SerialConnection";
-import { GatewayDeviceState } from "../deviceState";
+import { GatewayDeviceState } from "./deviceState";
 import { renderBindingsEditor } from "./FixtureEditor";
 import "./DaliLightEditor"
+import "./ModbusEditor"
+import { loadMappings, NameMappings } from "./names";
 
 export type DeviceSelection = null|{
     device_id: number;
@@ -28,7 +30,8 @@ function editorForEntity(sel: DeviceSelection, gw: GatewayDeviceState|null ): Te
             const gwdev = gw.dali[sel.device_id];
             return html`<ha-dali-light-editor .light=${gwdev ? gwdev[sel.address] : null} .deviceid=${sel.device_id} .address=${sel.address} ></ha-dali-light-editor>`;
         case 1:
-            default:
+            return html`<ha-modbus-editor .deviceid=${sel.device_id} .address=${sel.address} ></ha-modbus-editor>`;
+        default:
             return html`<div class="alert alert-warning" role="alert">
                 No Editor for device ${sel.device_id}/${sel.address}
             </div>`;
@@ -50,8 +53,12 @@ export class ModbusApplication extends LitElement {
     @state()
     selectedDevice: DeviceSelection = null;
 
-    @state()
-    serialInterface?: Serial | null;
+
+    @state() 
+    mappings: NameMappings = {};
+
+    // @state()
+    // serialInterface?: Serial | null;
 
     @state() 
     deviceLog: string[] = [];
@@ -62,33 +69,6 @@ export class ModbusApplication extends LitElement {
         return this;
     }
 
-    private async openPort(port: SerialPort) {
-        try {
-            await this.serialConnection.open(port);
-            await this.serialConnection.requestDevices();
-        } catch (ex) {
-            console.log(ex);
-        }
-    }
-
-    async lookForBoundSerialInterface() {
-
-        if (!this.serialInterface) {
-            return;
-        }
-        const ports = await this.serialInterface.getPorts();
-        console.log("Looking for serial interface", this.serialInterface, ports);
-        if (ports.length > 0) {
-            this.openPort(ports[0]);
-        }
-    }
-
-    async requestSerial() {
-        const port = await this.serialInterface?.requestPort();
-        if (port) {
-            this.openPort(port);
-        }
-    }
 
     async disconnectSerial() {
         this.serialConnection?.forget();
@@ -105,15 +85,14 @@ export class ModbusApplication extends LitElement {
     connectedCallback(): void {
         super.connectedCallback();
         // this.addEventListener("switch-selected", this.switchSelected);
-        this.serialInterface = (navigator as any).serial as Serial | undefined;
-        if (this.serialInterface) {
-            this.lookForBoundSerialInterface();
-        } else {
-            this.serialInterface = null;
-        }
+        this.serialConnection.open();
 
         this.serialConnection.addChangeListener(this.topLevelDevicesChanged);
         this.serialConnection.addConsoleListener(this.consoleLogReceived);
+
+        loadMappings().then(() => {
+            this.requestUpdate();
+        });
     }
 
     disconnectedCallback(): void {
@@ -149,12 +128,24 @@ export class ModbusApplication extends LitElement {
         }, 100) as any;
         
     }
+
+    sendFile = () => {
+        console.log("Uploading file");
+        this.serialConnection.sendLine("upload");
+    }
+
+
+    sendBindings = () => {
+        console.log("Uploading Bindings");
+        this.serialConnection.sendLine("upload_bindings");
+    }
+
     
 
     render() {
-        if (this.serialInterface == null) {
-            return html`<div class="alert alert-danger" role="alert">Serial not supported</div>`;
-        }
+        // if (this.serialInterface == null) {
+        //     return html`<div class="alert alert-danger" role="alert">Serial not supported</div>`;
+        // }
 
         return html`
             <main class="d-flex flex-nowrap" @ha-device-selected=${this.deviceSelected}>
@@ -173,9 +164,11 @@ export class ModbusApplication extends LitElement {
                         </li> 
 
                     </ul> 
-                    ${this.serialConnection.port
-                        ? html`<button class="btn btn-secondary" @click=${this.disconnectSerial} type="button">Disconnect</button>`
-                        : html`<button class="btn btn-secondary" @click=${this.requestSerial} type="button">Connect</button>`}
+
+                    
+                    <button class="btn btn-secondary" @click=${this.sendFile} type="button">Upload script</button>
+                    <button class="btn btn-secondary" @click=${this.sendBindings} type="button">Upload Bindings</button>
+
 
                     <hr> 
 
@@ -214,8 +207,8 @@ export class ModbusApplication extends LitElement {
     }
 }
 
-declare global {
-    interface HTMLElementTagNameMap {
-        "modbus-app": ModbusApplication;
-    }
-}
+// declare global {
+//     interface HTMLElementTagNameMap {
+//         "modbus-app": ModbusApplication;
+//     }
+// }

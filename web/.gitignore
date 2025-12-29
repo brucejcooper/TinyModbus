@@ -4,3 +4,6 @@
 *.d.ts.map
 !src/components/serial.d.ts
 node_modules/
+dist/
+bindings.txt
+names.db

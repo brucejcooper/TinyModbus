@@ -146,3 +146,52 @@ button.switchfixture:disabled {
 .noshrink {
     flex: 0;
 }
+
+
+.imagestack {
+    align-self: stretch;
+    overflow: hidden;
+    border: 1px solid gray;
+    background: white;
+    height: 861px;
+}
+
+
+.imagestack .device-map-device {
+    position: absolute;
+
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    transform: translateX(-50%);
+
+}
+
+.imagestack .device-map-device img {
+    width: 16px;
+}
+
+.imagestack .device-map-device span {
+    font-size: 40%;
+}
+
+.device-map-device.light span {
+    color: blue;
+
+}
+
+.device-map-device.fixture span {
+    color: orange;
+
+}
+
+ha-device-map {
+    display: flex;
+    flex-direction: column;
+}
+
+.device {
+    display: flex;
+    flex-direction: column;
+}

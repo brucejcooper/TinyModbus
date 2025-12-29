@@ -1,1 +1,1 @@
-export { ModbusApplication } from "./components/ModbusApp"
+export { ModbusApplication } from "./ModbusApp"

@@ -6,8 +6,9 @@ import { when } from "lit/directives/when.js";
 import { consume } from "@lit/context";
 import "./LocalStorageLabel"
 import "./DaliLight"
+import "./DeviceMap"
 import "./Fixture"
-import { GatewayDeviceState } from "../deviceState";
+import { GatewayDeviceState } from "./deviceState";
 import "./Fixture";
 import { DeviceSelection } from "./ModbusApp";
 import { serialContext } from "./SerialContext";
@@ -57,6 +58,7 @@ export class GatewayDeviceView extends LitElement {
             return html``;
         }
         return html`<div class="device" @click=${this.selectDevice}>
+            <ha-device-map></ha-device-map>
             <h3>Switches</h3>
 
             <div style="display: flex; flex-direction: row; gap: 0.2em; flex-wrap: wrap;">
@@ -115,8 +117,8 @@ export class GatewayDeviceView extends LitElement {
 
 
 
-declare global {
-    interface HTMLElementTagNameMap {
-        "ha-gw-device": GatewayDeviceView;
-    }
-}
+// declare global {
+//     interface HTMLElementTagNameMap {
+//         "ha-gw-device": GatewayDeviceView;
+//     }
+// }

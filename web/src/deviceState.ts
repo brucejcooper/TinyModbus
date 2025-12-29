@@ -19,6 +19,6 @@ export type ModbusGatewayDevice = PotentiallyDisabled<boolean[]>;
 export type GatewayDeviceState = {
     modbus: Record<string,ModbusGatewayDevice>;
     dali: Record<string,DaliGatewayDevice>;
-    bindings: number[];
+    bindings: number[][];
     buttons: boolean[];
 };

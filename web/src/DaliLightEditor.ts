@@ -4,7 +4,7 @@ import { consume } from "@lit/context";
 import "./LocalStorageLabel"
 import "./DaliLight"
 import "./Fixture"
-import { DaliLight } from "../deviceState";
+import { DaliLight } from "./deviceState";
 import { live } from "lit/directives/live.js";
 import { serialContext } from "./SerialContext";
 import { SerialConnection } from "./SerialConnection";
@@ -43,17 +43,17 @@ export class GroupEditor extends LitElement {
         const bit = parseInt(input.dataset.bit!);
 
         let newVal = this.value ^ (1 << bit);
-        console.log("New Group value", newVal.toString(16));
+        console.log("New Group value", newVal?.toString(16));
 
         this.dispatchEvent(new CustomEvent<UpdateDetail>("attribute-change", { bubbles: true, detail: { attribute: "groups", value: newVal }}))
     }
 
     render() {
         const disabled = false;
+        console.log("Groups is", this.value?.toString(16), this.light)
         return html`
             ${repeat(range(16), (bit) => bit, (bit) => html`
-                ${when(bit == 8, () => html`<br/>`)}
-                <input id="inp" name="level" type="checkbox" ?checked=${(this.value >> bit) & 0x01} data-bit=${bit} ?disabled=${disabled} @change=${this.valueChange}/>
+                <input id="inp" name="level" type="checkbox" .checked=${live((this.value >> bit) & 0x01)} data-bit=${bit} ?disabled=${disabled} @change=${this.valueChange}/>
             `)}
         `;
     }
@@ -164,6 +164,11 @@ export class DaliLightEditor extends LitElement {
         evt.stopPropagation();
     }
 
+    toggle = () => {
+        this.serialConnection.sendLine(`dali[${this.deviceid}][${this.address}]:toggle()`)
+
+    }
+
 
 
     render() {
@@ -171,7 +176,9 @@ export class DaliLightEditor extends LitElement {
         return html`
             <h3>Dali light ${this.deviceid}/${this.address}</h3>
 
-            <localstorage-label key=${`ha/${this.deviceid}/light${this.address}`} label="label" ?editable=${true} placeholder=${`${this.address}`}></localstorage-label>
+            <localstorage-label .deviceId=${this.deviceid} .address =${this.address}  label="label" ?editable=${true} placeholder=${`${this.address}`}></localstorage-label>
+
+            <button class="btn btn-secondary" @click=${this.toggle}>Toggle</button>
 
             <div class="keyvalgrid" @attribute-change=${this.valueChanged}>
                 <span>Status</span>     <ha-light-status .light=${light} .value=${light.status}></ha-light-status>
@@ -182,7 +189,7 @@ export class DaliLightEditor extends LitElement {
                 <span>Power Fail</span> <ha-attribute-editor .light=${light} attribute="powerfail"  .value=${light.powerfail}></ha-attribute-editor>
                 <span>Fade Rate</span>  <ha-attribute-editor .light=${light} attribute="faderate"   .value=${light.faderate}></ha-attribute-editor>
                 <span>Fade Time</span>  <ha-attribute-editor .light=${light} attribute="fadetime"   .value=${light.fadetime}></ha-attribute-editor>
-                <span>Groups</span>     <ha-group-editor .light=${light}                            .value=${light.groups}></ha-group-editor>
+                <span>Groups0-7</span>  <ha-group-editor     .light=${light} attribute="groups"    .value=${light.groups}></ha-group-editor>
             </div>
         `;
     }
@@ -192,10 +199,10 @@ export class DaliLightEditor extends LitElement {
 
 
 
-declare global {
-    interface HTMLElementTagNameMap {
-        "ha-dali-light-editor": DaliLightEditor;
-        "ha-group-editor": GroupEditor; 
-        "ha-light-status": LightStatus;
-    }
-}
+// declare global {
+//     interface HTMLElementTagNameMap {
+//         "ha-dali-light-editor": DaliLightEditor;
+//         "ha-group-editor": GroupEditor; 
+//         "ha-light-status": LightStatus;
+//     }
+// }

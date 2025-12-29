@@ -76,7 +76,7 @@ export class SwitchFixture extends LitElement {
 
         return html`
                 <div style="align-items: center; display: inline-flex; flex-direction: column; margin-top: 2em;" @click = ${this.selectDevice}>
-                    <div class="rotate35"><localstorage-label key=${`ha/fixture${this.fixture}`} placeholder=${`fixture ${this.fixture}`}></localstorage-label></div>
+                    <div class="rotate35"><localstorage-label .deviceId=${0} .address =${this.fixture} placeholder=${`fixture ${this.fixture}`}></localstorage-label></div>
                     <button 
                         class=${classMap({ 
                             switchfixture: true, 
@@ -104,10 +104,10 @@ export class SwitchFixture extends LitElement {
 
 
 
-declare global {
-    interface HTMLElementTagNameMap {
-        "ha-switchfixture": SwitchFixture;
-    }
-}
+// declare global {
+//     interface HTMLElementTagNameMap {
+//         "ha-switchfixture": SwitchFixture;
+//     }
+// }
 
 

@@ -5,6 +5,7 @@ import { koaBody } from "koa-body";
 require('dotenv').config()
 import { DatabaseSync } from "node:sqlite"
 import websockify from 'koa-websocket';
+import { setupWebSocket } from "./websocket-server";
 
 const database = new DatabaseSync("names.db");
 database.exec("CREATE TABLE IF NOT EXISTS names ( device INTEGER NOT NULL, address INTEGER NOT NULL, name TEXT, x INTEGER NOT NULL, y INTEGER NOT NULL, PRIMARY KEY (device, address))");

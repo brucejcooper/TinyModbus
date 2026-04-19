@@ -134,14 +134,14 @@ typedef struct {
 } action_reg_t;
 
 static const action_reg_t action_regs[] PROGMEM = {
-    { 0x1002, DALI_CMD_GOTO_LAST_ACTIVE, true  },
-    { 0x1003, DALI_CMD_OFF,              false },
-    { 0x1004, DALI_CMD_UP,               false },
-    { 0x1005, DALI_CMD_DOWN,             false },
-    { 0x1006, DALI_CMD_STEP_UP,          false },
-    { 0x1007, DALI_CMD_STEP_DOWN,        false },
-    { 0x1008, DALI_CMD_RECALL_MAX,       false },
-    { 0x1009, DALI_CMD_RECALL_MIN,       false },
+    { 0x1002, DALI_CMD_GOTO_LAST_ACTIVE, true },
+    { 0x1003, DALI_CMD_OFF,              true },
+    { 0x1004, DALI_CMD_UP,               true },
+    { 0x1005, DALI_CMD_DOWN,             true },
+    { 0x1006, DALI_CMD_STEP_UP,          true },
+    { 0x1007, DALI_CMD_STEP_DOWN,        true },
+    { 0x1008, DALI_CMD_RECALL_MAX,       true },
+    { 0x1009, DALI_CMD_RECALL_MIN,       true },
 };
 #define NUM_ACTION_REGS (sizeof(action_regs) / sizeof(action_regs[0]))
 

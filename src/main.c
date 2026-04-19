@@ -12,21 +12,6 @@
 #include "modbus.h"
 #include "bg_tasks.h"
 
-// Diagnostic: transmit a byte as a serial pulse-train on PB3 (scope/analyser only)
-void pulse_led(uint8_t times) {
-    int bits = 8;
-    PORTB.OUTCLR = PIN3_bm;
-    _delay_us(104);
-    while (bits--) {
-        if (times & 0x01) PORTB.OUTSET = PIN3_bm;
-        else              PORTB.OUTCLR = PIN3_bm;
-        _delay_us(103);
-        times >>= 1;
-    }
-    PORTB.OUTSET = PIN3_bm;
-    _delay_us(208);
-}
-
 int main(void) {
     // Drive DE low immediately — prevents floating pin from enabling RS-485 TX
     // during the startup window before modbus_init() configures the pin.
@@ -36,14 +21,6 @@ int main(void) {
     // 10 MHz internal oscillator (safe at 3.3 V, per datasheet)
     CCP = CCP_IOREG_gc;
     CLKCTRL.MCLKCTRLB = CLKCTRL_PDIV_2X_gc | CLKCTRL_PEN_bm;
-
-    // Diagnostic LED pin
-    PORTB.DIRSET = PIN3_bm;
-    PORTB.OUTSET = PIN3_bm;
-
-    // PA7 used elsewhere (keep high-Z output as original)
-    PORTA.DIRSET = PIN7_bm;
-    PORTA.OUTSET = PIN7_bm;
 
     // Initialise subsystems
     regs_init();

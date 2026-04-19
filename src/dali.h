@@ -42,6 +42,14 @@
 #define DALI_CMD_QUERY_GROUP_0_7      0xC0u
 #define DALI_CMD_QUERY_GROUP_8_15     0xC1u
 
+// Configuration commands — require SEND_TWICE; DTR0 loaded with new value first
+#define DALI_CMD_SET_MAX_LEVEL        0x2Au
+#define DALI_CMD_SET_MIN_LEVEL        0x2Bu
+#define DALI_CMD_SET_SYS_FAIL_LEVEL   0x2Cu
+#define DALI_CMD_SET_POWER_ON_LEVEL   0x2Du
+#define DALI_CMD_SET_FADE_TIME        0x2Eu
+#define DALI_CMD_SET_FADE_RATE        0x2Fu
+
 // DTR set commands: addr byte = opcode, cmd byte = value to load
 #define DALI_ADDR_SET_DTR0  0xA3u
 #define DALI_ADDR_SET_DTR1  0xC3u

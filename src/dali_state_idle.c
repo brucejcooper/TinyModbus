@@ -51,13 +51,8 @@ void cmdq_result_received(dali_response_type_t type, uint8_t value) {
     }
 
     // Apply result to register map
-    if (cmd.reg_target != REG_NONE && type == DALI_RESPONSE_OK) {
+    if (cmd.reg_target != REG_NONE && type == DALI_RESPONSE_OK)
         regs_apply_result(cmd.ballast_idx, cmd.reg_target, value);
-    } else if (cmd.reg_target == REG_RAW_RESPONSE && type != DALI_RESPONSE_OK) {
-        // Signal NAK/error to the FC44 busy-wait loop even on failure
-        g_raw_resp_type = type;
-        g_raw_resp_byte = 0;
-    }
 
     // Fire optional callback (used by scan and fade tracking)
     if (cmd.on_result)

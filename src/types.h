@@ -36,7 +36,6 @@ typedef enum __attribute__((packed)) {
     REG_FADE_TIME,
     REG_GROUP_0_7,
     REG_GROUP_8_15,
-    REG_RAW_RESPONSE,  // FC44 synchronous raw command
 } reg_target_t;
 
 // Callback for complex multi-step operations (scan, fade tracking).

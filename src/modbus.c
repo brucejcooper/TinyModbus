@@ -28,7 +28,6 @@
 #define FC_WRITE_SINGLE_REG  0x06
 #define FC_WRITE_COILS       0x0F
 #define FC_WRITE_MULTI_REG   0x10
-#define FC_CUSTOM_DALI       0x44   // synchronous raw DALI command (legacy)
 
 typedef enum {
     MB_ERR_ILLEGAL_FUNCTION    = 0x01,
@@ -150,6 +149,75 @@ static const action_reg_t action_regs[] PROGMEM = {
 };
 #define NUM_ACTION_REGS (sizeof(action_regs) / sizeof(action_regs[0]))
 
+// ---- Raw command post-action (register update driven by command bytes) -------
+//
+// Decoded once when the raw command is queued; consumed by the completion callback.
+// Safe to use as a static because only one raw command can be in flight at a time
+// (enforced by the RAW_RESULT_PENDING busy-check in dispatch_action_reg).
+
+static struct {
+    uint8_t      ballast_idx;   // 0xFF = no follow-up needed
+    uint8_t      query_cmd;     // DALI query to issue (0 when fade poll)
+    reg_target_t query_target;  // REG_NONE when fade poll is the action
+} s_raw_post;
+
+// Decode the forward frame (addr_byte, cmd_byte) and populate s_raw_post.
+// Group/broadcast addresses: no per-ballast update possible → ballast_idx 0xFF.
+// Short-address DAPC or modification cmds (0x00-0x0A): fade poll.
+// Short-address setting cmds (0x2A-0x2F): queue a follow-up query.
+static void classify_raw_cmd(uint8_t addr_byte, uint8_t cmd_byte) {
+    s_raw_post.ballast_idx  = 0xFF;
+    s_raw_post.query_cmd    = 0;
+    s_raw_post.query_target = REG_NONE;
+
+    if (addr_byte & 0x80u) return;  // group or broadcast
+
+    uint8_t bidx = (addr_byte >> 1) & 0x3Fu;
+
+    if (!(addr_byte & DALI_CMD_FLAG)) {
+        // DAPC: arc level change / fade
+        s_raw_post.ballast_idx = bidx;
+        return;
+    }
+
+    if (cmd_byte <= DALI_CMD_GOTO_LAST_ACTIVE) {
+        // Modification commands 0x00-0x0A: affect brightness/status
+        s_raw_post.ballast_idx = bidx;
+        return;
+    }
+
+    // Setting commands: queue a read-back query after completion
+    uint8_t      qcmd    = 0;
+    reg_target_t qtarget = REG_NONE;
+    switch (cmd_byte) {
+        case DALI_CMD_SET_MAX_LEVEL:      qcmd = DALI_CMD_QUERY_MAX_LEVEL;      qtarget = REG_MAX;       break;
+        case DALI_CMD_SET_MIN_LEVEL:      qcmd = DALI_CMD_QUERY_MIN_LEVEL;      qtarget = REG_MIN;       break;
+        case DALI_CMD_SET_SYS_FAIL_LEVEL: qcmd = DALI_CMD_QUERY_FAIL_LEVEL;     qtarget = REG_SYS_FAIL;  break;
+        case DALI_CMD_SET_POWER_ON_LEVEL: qcmd = DALI_CMD_QUERY_POWER_ON_LEVEL; qtarget = REG_POWER_ON;  break;
+        case DALI_CMD_SET_FADE_TIME:      qcmd = DALI_CMD_QUERY_FADE_TIME;      qtarget = REG_FADE_TIME; break;
+        case DALI_CMD_SET_FADE_RATE:      qcmd = DALI_CMD_QUERY_FADE_RATE;      qtarget = REG_FADE_RATE; break;
+        default: return;
+    }
+    s_raw_post.ballast_idx  = bidx;
+    s_raw_post.query_cmd    = qcmd;
+    s_raw_post.query_target = qtarget;
+}
+
+// Execute the follow-up action determined by classify_raw_cmd().
+// Called from both ISR callback context (cmdq_kick is a no-op; state machine picks
+// up queued commands naturally) and main-loop context (cmdq_kick starts transmission).
+static void raw_do_post_action(void) {
+    if (s_raw_post.ballast_idx == 0xFF) return;
+    uint8_t ballast = s_raw_post.ballast_idx;
+    if (s_raw_post.query_target == REG_NONE) {
+        bgtasks_start_fade_poll(ballast);
+    } else {
+        uint8_t dali_addr = DALI_SHORT_ADDR(ballast) | DALI_CMD_FLAG;
+        if (cmdq_push_query(dali_addr, s_raw_post.query_cmd, ballast, s_raw_post.query_target) == SYS_OK)
+            cmdq_kick();
+    }
+}
+
 // ---- Callbacks for async raw DALI result (registers 0x1000 / 0x1001) ----
 
 static void raw_cmd_single_done(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
@@ -160,6 +228,9 @@ static void raw_cmd_single_done(dali_response_type_t type, uint8_t ballast_idx, 
         g_regs.raw_cmd_result = RAW_RESULT_NAK;
     else
         g_regs.raw_cmd_result = RAW_RESULT_ERR((uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u);
+
+    if (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK)
+        raw_do_post_action();
 }
 
 static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
@@ -169,6 +240,9 @@ static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, u
         g_regs.raw_cmd_result = RAW_RESULT_NAK;
     else
         g_regs.raw_cmd_result = RAW_RESULT_ERR((uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u);
+
+    if (type == DALI_RESPONSE_NAK)
+        raw_do_post_action();
 }
 
 // ---- FC04 — read input registers ----------------------------------------
@@ -255,6 +329,7 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         if (pending) return MB_ERR_DEVICE_BUSY;
 
         bool is_twice = (mb_reg == MBREG_RAW_CMD_TWICE);
+        classify_raw_cmd((uint8_t)(val >> 8), (uint8_t)val);
         cmd_entry_t entry = {
             .type        = is_twice ? CMD_SEND_TWICE : CMD_QUERY,
             .dali_addr   = (uint8_t)(val >> 8),
@@ -353,62 +428,82 @@ static void process_fc10(void) {
     start_tx(6);
 }
 
-// ---- FC44 — synchronous raw DALI command (legacy, blocking) ------------
+// ---- FC01 / FC05 / FC0F — coils (ballast on/off state) ------------------
+//
+// Coil N maps to ballast N (0-63).  A coil reads as 1 when brightness > 0 and
+// the ballast is present (brightness != 0xFF absent sentinel).
+// Write ON  → GOTO_LAST_ACTIVE; Write OFF → OFF; both start fade polling.
+// Write 0x5500 (non-normative toggle) checks the current brightness and
+// inverts the state.
 
-// Map a DALI response error to the nearest Modbus exception code.
-static mb_err_t dali_err_to_mb(dali_response_type_t t) {
-    switch (t) {
-        case DALI_RESPONSE_NAK:             return MB_ERR_TARGET_FAILED;
-        case DALI_RESPONSE_MALFORMED:
-        case DALI_RESPONSE_PULSE_TOO_SHORT:
-        case DALI_RESPONSE_PULSE_IN_MIDDLE:
-        case DALI_RESPONSE_PULSE_TOO_LONG:
-            return (mb_err_t)(MB_ERR_DALI_PULSE_INVALID +
-                              (uint8_t)(t - DALI_RESPONSE_MALFORMED));
-        default:                            return MB_ERR_DEVICE_FAILURE;
-    }
-}
+static void process_fc01(void) {
+    uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
+    uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-// Handle FC44 (legacy synchronous raw DALI command).
-// Blocks the Modbus loop for up to 300 ms while the DALI response arrives.
-// Prefer MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE for new integrations.
-static void process_fc44(void) {
-    uint16_t dali_cmd = ((uint16_t)buf[2] << 8) | buf[3];
-    uint8_t  repeat   = buf[4];
-    if (repeat > 2) { send_error(MB_ERR_ILLEGAL_VALUE); return; }
-    if (repeat == 0) repeat = 1;
-
-    cmd_entry_t e = {
-        .type        = (repeat == 2) ? CMD_SEND_TWICE : CMD_QUERY,
-        .dali_addr   = (uint8_t)(dali_cmd >> 8),
-        .dali_cmd    = (uint8_t)dali_cmd,
-        .ballast_idx = 0xFF,
-        .reg_target  = REG_RAW_RESPONSE,
-        .repeat      = repeat,
-        .on_result   = NULL,
-    };
-
-    g_raw_resp_type = DALI_RESPONSE_PENDING;
-
-    if (cmdq_push(&e) != SYS_OK) {
-        send_error(MB_ERR_DEVICE_BUSY);
+    if (count == 0 || addr >= 64u || addr + count > 64u) {
+        send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
-    cmdq_kick();
 
-    // Busy-wait — TCA0 ISRs continue firing so the DALI state machine runs.
-    for (uint16_t t = 300u; t > 0u && g_raw_resp_type == DALI_RESPONSE_PENDING; t--)
-        _delay_ms(1);
-
-    if (g_raw_resp_type == DALI_RESPONSE_PENDING)
-        g_raw_resp_type = DALI_RESPONSE_NAK;
-
-    if (g_raw_resp_type == DALI_RESPONSE_OK) {
-        buf[2] = g_raw_resp_byte;
-        start_tx(3);
-    } else {
-        send_error(dali_err_to_mb(g_raw_resp_type));
+    uint8_t nbytes = (uint8_t)((count + 7u) >> 3);
+    buf[2] = nbytes;
+    memset(buf + 3, 0, nbytes);
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t bidx   = (uint8_t)(addr + i);
+        bool    present = (g_regs.present[bidx >> 4] >> (bidx & 0x0Fu)) & 1u;
+        if (present && g_regs.block0[bidx].brightness > 0)
+            buf[3 + (i >> 3)] |= (uint8_t)(1u << (i & 7u));
     }
+    start_tx(3 + nbytes);
+}
+
+static void process_fc05(void) {
+    uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
+    uint16_t val  = ((uint16_t)buf[4] << 8) | buf[5];
+
+    if (addr >= 64u) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
+    if (val != 0xFF00u && val != 0x0000u && val != 0x5500u) {
+        send_error(MB_ERR_ILLEGAL_VALUE);
+        return;
+    }
+
+    bool on;
+    if (val == 0x5500u) {
+        uint8_t bright = g_regs.block0[addr].brightness;
+        on = (bright == 0);  // currently off → turn on
+    } else {
+        on = (val == 0xFF00u);
+    }
+
+    uint8_t dali_addr = DALI_SHORT_ADDR((uint8_t)addr) | DALI_CMD_FLAG;
+    cmdq_push_cmd(dali_addr, on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, (uint8_t)addr);
+    bgtasks_start_fade_poll((uint8_t)addr);
+    start_tx(6);  // echo request
+}
+
+static void process_fc0f(void) {
+    uint16_t addr   = ((uint16_t)buf[2] << 8) | buf[3];
+    uint16_t count  = ((uint16_t)buf[4] << 8) | buf[5];
+    uint8_t  nbytes = buf[6];
+
+    if (count == 0 || addr >= 64u || addr + count > 64u ||
+            nbytes != (uint8_t)((count + 7u) >> 3)) {
+        send_error(MB_ERR_ILLEGAL_VALUE);
+        return;
+    }
+
+    // Push all action commands first so fade-poll STATUS queries trail behind them.
+    uint8_t *data = buf + 7;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t bidx = (uint8_t)(addr + i);
+        bool    on   = (data[i >> 3] >> (i & 7u)) & 1u;
+        cmdq_push_cmd(DALI_SHORT_ADDR(bidx) | DALI_CMD_FLAG,
+                      on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, bidx);
+    }
+    for (uint16_t i = 0; i < count; i++)
+        bgtasks_start_fade_poll((uint8_t)(addr + i));
+
+    start_tx(6);
 }
 
 // ---- Frame validation --------------------------------------------------
@@ -431,8 +526,6 @@ static bool frame_is_valid(void) {
         case FC_WRITE_COILS:
         case FC_WRITE_MULTI_REG:
             expected_size = (uint8_t)(9u + buf[6]); break;
-        case FC_CUSTOM_DALI:
-            expected_size = 7; break;
         default: break;
     }
     return rx_sz == expected_size;
@@ -489,11 +582,13 @@ void modbus_process(void) {
     _delay_us(1500);  // Modbus turnaround guard
 
     switch (buf[1]) {
+        case FC_READ_COILS:        process_fc01(); break;
         case FC_READ_INPUT:        process_fc04(); break;
         case FC_READ_HOLDING:      process_fc03(); break;
+        case FC_WRITE_SINGLE_COIL: process_fc05(); break;
         case FC_WRITE_SINGLE_REG:  process_fc06(); break;
+        case FC_WRITE_COILS:       process_fc0f(); break;
         case FC_WRITE_MULTI_REG:   process_fc10(); break;
-        case FC_CUSTOM_DALI:       process_fc44(); break;
         default:                   send_error(MB_ERR_ILLEGAL_FUNCTION); break;
     }
 

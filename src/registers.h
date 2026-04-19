@@ -45,11 +45,6 @@ typedef struct {
 
 extern register_map_t g_regs;
 
-// Written by regs_apply_result() when reg_target == REG_RAW_RESPONSE.
-// Polled by the FC44 busy-wait loop in modbus.c.
-extern volatile dali_response_type_t g_raw_resp_type;
-extern volatile uint8_t              g_raw_resp_byte;
-
 // ---- FC04 input register addresses ----------------------------------------
 
 #define FC04_DIRTY_BASE     0x0159u  // first dirty word register (4 words: 0x0159-0x015C)

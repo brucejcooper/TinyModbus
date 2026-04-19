@@ -8,9 +8,6 @@ register_map_t g_regs;
 
 static uint16_t s_rescan_interval = 64u;
 
-volatile dali_response_type_t g_raw_resp_type = DALI_RESPONSE_OK;
-volatile uint8_t              g_raw_resp_byte  = 0;
-
 // EEPROM layout: byte 0 = slave address, byte 1 = baud index, bytes 2-3 = rescan interval
 static uint8_t  EEMEM ee_slave_addr      = 0xFF;
 static uint8_t  EEMEM ee_baud_index      = 0xFF;
@@ -18,11 +15,6 @@ static uint16_t EEMEM ee_rescan_interval = 0xFFFF;
 
 void regs_init(void) {
     memset(&g_regs, 0, sizeof(g_regs));
-
-    // Brightness 0xFF = ballast absent sentinel (matches legacy init)
-    for (uint8_t i = 0; i < 64; i++) {
-        g_regs.block0[i].brightness = 0xFF;
-    }
 
     uint16_t rescan_val = eeprom_read_word(&ee_rescan_interval);
     s_rescan_interval = (rescan_val == 0xFFFFu) ? 64u : rescan_val;
@@ -148,10 +140,6 @@ void regs_apply_result(uint8_t idx, reg_target_t target, uint8_t value) {
         case REG_GROUP_8_15:
             regs_update_group_mask(idx, value, true);
             break;
-        case REG_RAW_RESPONSE:
-            g_raw_resp_byte = value;
-            g_raw_resp_type = DALI_RESPONSE_OK;
-            break;
         default:
             break;
     }
@@ -169,7 +157,7 @@ void regs_set_present(uint8_t idx, bool present) {
 
 void regs_clear_ballast(uint8_t idx) {
     g_regs.block0[idx].status     = 0;
-    g_regs.block0[idx].brightness = 0xFF;
+    g_regs.block0[idx].brightness = 0;
     memset(&g_regs.block1[idx], 0, sizeof(ballast_mm_t));
     memset(&g_regs.block2[idx], 0, sizeof(ballast_pf_t));
     memset(&g_regs.block3[idx], 0, sizeof(ballast_fade_t));

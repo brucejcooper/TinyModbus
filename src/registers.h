@@ -39,7 +39,7 @@ typedef struct {
     uint16_t       dirty[4];
     uint16_t       raw_cmd_result;   // FC04 0x015D, see RAW_RESULT_* below
     // Config (mirrored in holding regs 0x1011-0x1013)
-    uint16_t       poll_interval;   // units: 100ms, default 5
+    uint16_t       poll_interval;   // units: 100ms, default 5 (retained for register-map compatibility; no longer drives polling)
     uint8_t        mb_slave_addr;   // 1-247
     uint8_t        baud_index;      // 0=9600 1=19200 2=38400
 } register_map_t;

@@ -9,10 +9,6 @@
 // PER = USEC_TO_TICKS(DALI_HALF_BIT_USECS) ≈ 4167 ticks at 10 MHz → 416.7 µs per tick.
 #define USEC_TO_TICKS(u) ((uint16_t)(((float)(u)) * (F_CPU / 1000000.0) + 0.5))
 
-// Ticks per 100 ms at DALI 1200-baud half-bit period (416.67 µs/tick):
-//   100000 µs / 416.67 µs = 240 ticks
-#define TICKS_PER_100MS  240u
-
 typedef void (*tick_cb_t)(void);
 
 // One-shot countdown timer used by the DALI state machine.

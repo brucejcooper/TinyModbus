@@ -276,8 +276,8 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         uint8_t arc_level      = (uint8_t)val;
         uint8_t ballast_idx    = (dali_addr_byte >> 1) & 0x3F;
         cmdq_push_arc(dali_addr_byte, arc_level, (dali_addr_byte & 0x80) ? 0xFF : ballast_idx);
-        if (ballast_idx < DALI_MAX_DEVICES)
-            g_regs.fading[ballast_idx >> 4] |= (uint16_t)1u << (ballast_idx & 0x0F);
+        if (!(dali_addr_byte & 0x80))
+            bgtasks_start_fade_poll(ballast_idx);
         cmdq_kick();
         return 0;
     }
@@ -301,8 +301,8 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
             uint8_t ballast_idx    = (dali_addr_byte >> 1) & 0x3F;
             bool    marks_fading   = pgm_read_byte(&action_regs[i].marks_fading);
             cmdq_push_cmd(dali_addr_byte, dali_cmd_byte, ballast_idx);
-            if (marks_fading && ballast_idx < DALI_MAX_DEVICES)
-                g_regs.fading[ballast_idx >> 4] |= (uint16_t)1u << (ballast_idx & 0x0F);
+            if (marks_fading && !(dali_addr_byte & 0x80))
+                bgtasks_start_fade_poll(ballast_idx);
             cmdq_kick();
             return 0;
         }

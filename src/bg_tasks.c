@@ -16,12 +16,12 @@
 static volatile uint8_t  rescan_counter  = RESCAN_PERIOD_S;
 static volatile bool     scan_trigger    = false;
 
-// ---- Fade poll timer -----------------------------------------------
-// Decremented by bgtasks_tick() at one tick (≈416 µs) per count.
-// Reloaded from g_regs.poll_interval × TICKS_PER_100MS each run.
+// ---- Fade chain state ---------------------------------------------
+// One bit per ballast (64 ballasts = 4 × uint16_t).
+// Set while a self-sustaining STATUS → BRIGHTNESS → STATUS chain
+// is active for that ballast.  Prevents duplicate chains.
 
-static volatile uint16_t fade_poll_timer = 1;  // fire shortly after boot
-static volatile bool     fade_poll_due   = false;
+static uint16_t fade_chain_active[4];
 
 // ---- Bus scan state ------------------------------------------------
 
@@ -50,6 +50,27 @@ static const scan_query_t scan_queries[] PROGMEM = {
     { DALI_CMD_QUERY_GROUP_8_15,     REG_GROUP_8_15 },
 };
 #define NUM_SCAN_QUERIES (sizeof(scan_queries) / sizeof(scan_queries[0]))
+
+// ---- Fade chain callbacks (run in ISR context) ---------------------
+
+// ISR callback: if FADE_RUNNING is still set, re-queue BRIGHTNESS + STATUS
+// to continue tracking; otherwise clear the active flag and let the chain expire.
+// Queuing one pair at a time bounds the queue depth to 2 per active chain.
+static void fade_poll_status_cb(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
+    uint8_t  word = ballast_idx >> 4;
+    uint16_t bit  = (uint16_t)1u << (ballast_idx & 0x0Fu);
+
+    if (type != DALI_RESPONSE_OK || !(response & DALI_STATUS_FADE_RUNNING)) {
+        fade_chain_active[word] &= ~bit;
+        return;
+    }
+
+    uint8_t dali_addr = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
+    cmdq_push_query(dali_addr, DALI_CMD_QUERY_ACTUAL_LEVEL, ballast_idx, REG_BRIGHTNESS);
+    if (cmdq_push_query_cb(dali_addr, DALI_CMD_QUERY_STATUS, ballast_idx, REG_STATUS,
+                           fade_poll_status_cb) != SYS_OK)
+        fade_chain_active[word] &= ~bit;  // queue full; chain expires gracefully
+}
 
 // ---- Scan callbacks (run in ISR context) ---------------------------
 
@@ -126,38 +147,23 @@ void bgtasks_trigger_scan(void) {
     scan_trigger = true;
 }
 
+void bgtasks_start_fade_poll(uint8_t ballast_idx) {
+    uint8_t  word = ballast_idx >> 4;
+    uint16_t bit  = (uint16_t)1u << (ballast_idx & 0x0Fu);
+    if (fade_chain_active[word] & bit) return;  // chain already active for this ballast
+    fade_chain_active[word] |= bit;
+    uint8_t dali_addr = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
+    if (cmdq_push_query_cb(dali_addr, DALI_CMD_QUERY_STATUS, ballast_idx, REG_STATUS,
+                           fade_poll_status_cb) != SYS_OK)
+        fade_chain_active[word] &= ~bit;
+    cmdq_kick();
+}
+
 void bgtasks_tick(void) {
-    // Fade poll timer (TCA0 ticks ≈ 416 µs each)
-    if (fade_poll_timer && (--fade_poll_timer == 0))
-        fade_poll_due = true;
+    // No timer-based work remains; kept for API compatibility with tick.c ISR.
 }
 
 void bgtasks_run(void) {
-    // Fade poller
-    if (fade_poll_due) {
-        fade_poll_due = false;
-        // Reload timer before pushing so polls can't pile up
-        fade_poll_timer = (uint16_t)g_regs.poll_interval * (uint16_t)TICKS_PER_100MS;
-        if (fade_poll_timer == 0) fade_poll_timer = 1;
-
-        for (uint8_t word_idx = 0; word_idx < 4; word_idx++) {
-            uint16_t fading_mask;
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { fading_mask = g_regs.fading[word_idx]; }
-            uint16_t pending_bits = fading_mask;
-            while (pending_bits) {
-                uint8_t  bit_pos    = 0;
-                uint16_t scan_word  = pending_bits;
-                while (!(scan_word & 1u)) { bit_pos++; scan_word >>= 1u; }
-                uint8_t ballast_idx    = (uint8_t)(word_idx * 16u + bit_pos);
-                uint8_t dali_addr_byte = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-                cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_STATUS,       ballast_idx, REG_STATUS);
-                cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_ACTUAL_LEVEL, ballast_idx, REG_BRIGHTNESS);
-                pending_bits &= pending_bits - 1u;
-            }
-        }
-        cmdq_kick();
-    }
-
     // Bus scan
     if (scan_trigger) {
         scan_trigger = false;

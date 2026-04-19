@@ -455,7 +455,6 @@ void modbus_init(uint8_t addr) {
     modbus_idle = true;
 
     PORTMUX.CTRLB          = PORTMUX_USART0_ALTERNATE_gc;
-    RS485_PORT.PIN7CTRL    = PORT_PULLUPEN_bm;
     RS485_PORT.PIN1CTRL    = PORT_PULLUPEN_bm;
     RS485_PORT.OUTSET      = RS485_TX_bm;
     RS485_PORT.OUTCLR      = RS485_DE_bm;

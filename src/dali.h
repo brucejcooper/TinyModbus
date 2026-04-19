@@ -106,7 +106,4 @@ void dali_state_receiving_enter(void);
 // repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
 void cmdq_result_received(dali_response_type_t type, uint8_t value);
 
-// Diagnostic: bit-bang a byte at ~9600 baud on PB3 for oscilloscope/analyser.
-void pulse_led(uint8_t times);
-
 #endif

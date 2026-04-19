@@ -11,6 +11,41 @@
 #include "timers.h"
 
 
+
+
+#define BLIP_PORT PORTB
+#define BLIP_PIN PIN3_bm
+
+
+void blip(uint8_t ch) {
+    // Start bit
+    cli();
+    BLIP_PORT.OUTCLR = BLIP_PIN;
+    _delay_us(8.1);
+    if (ch & 0x01) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x02) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x04) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x08) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x10) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x20) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x40) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    if (ch & 0x80) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
+    _delay_us(8.1);
+    BLIP_PORT.OUTSET = BLIP_PIN;
+    _delay_us(8.1); // Stop bit
+    sei();
+}
+    
+
+
+
 void pulse_led(uint8_t times) {
     int bits = 8;
     // Start bit
@@ -49,6 +84,11 @@ int main(void) {
     // LED pin
     PORTB.DIRSET = PIN3_bm;
     PORTB.OUTSET = PIN3_bm;
+
+
+    PORTA.DIRSET = PIN7_bm;
+    PORTA.OUTSET = PIN7_bm;
+
 
     // Device ID is stored in the first byte of the USERRROW EEPROM.  It is offset by 2, so that when set to the
     // default value (0xFF), it comes out as Device no 1.  If you want device 2, write 0x00

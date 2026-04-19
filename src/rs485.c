@@ -35,8 +35,10 @@ typedef enum {
     MODBUS_ERR_SLAVE_DEVICE_BUSY = 0x06,
     MODBUS_ERR_NEGATIVE_ACKNOWLEDGE = 0x07,
     MODBUS_ERR_MEMORY_PARITY_ERROR = 0x08,
-    MODBUS_ERR_GATEWAY_PATH_UNAVAILABLE = 0x09,
+    MODBUS_ERR_GATEWAY_PATH_UNAVAILABLE = 0x0a,
     MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND = 0x0b,
+    MODBUS_ERR_DALI_RESPONSE_SHORT = 0x20,
+    MODBUS_ERR_DALI_PULSE_WIDTH_INVALID = 0x30,
 } modbus_err_t;
 
 #define MODBUS_BAUD 9600
@@ -150,10 +152,16 @@ modbus_err_t dali_response_to_err(dali_response_type_t type) {
         case DALI_RESPONSE_NAK:
             return MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND;
         case DALI_RESPONSE_MALFORMED:
-            return MODBUS_ERR_SLAVE_DEVICE_FAILURE;
+        case DALI_RESPONSE_PULSE_TOO_SHORT:
+        case DALI_RESPONSE_PULSE_IN_MIDDLE:
+        case DALI_RESPONSE_PULSE_TOO_LONG:
+            return MODBUS_ERR_DALI_PULSE_WIDTH_INVALID + (type - DALI_RESPONSE_MALFORMED);
         case DALI_RESPONSE_COLLISION:
             return MODBUS_ERR_MEMORY_PARITY_ERROR;
         default:
+            if (type >= DALI_RESPONSE_SHORT && type < DALI_RESPONSE_SHORT+16) {
+                return MODBUS_ERR_DALI_RESPONSE_SHORT + (type - DALI_RESPONSE_SHORT);
+            }
             return MODBUS_ERR_ILLEGAL_FUNCTION;
     }
 }
@@ -245,27 +253,6 @@ static void sendInfo() {
     }
 }
 
-static void dali_custom_cmd_callback(dali_response_type_t type, uint16_t cmd, uint8_t response) {
-    switch (type) {
-        case DALI_RESPONSE_OK:
-            buf[2] = response;
-            sendResponse(buf, 3);
-            break;
-        case DALI_RESPONSE_NAK:
-            sendError(MODBUS_ERR_GATEWAY_TARGET_DEVICE_FAILED_TO_RESPOND);
-            break;
-        case DALI_RESPONSE_MALFORMED:
-            sendError(MODBUS_ERR_SLAVE_DEVICE_FAILURE);
-            break;
-        case DALI_RESPONSE_COLLISION:
-            sendError(MODBUS_ERR_MEMORY_PARITY_ERROR);
-            break;
-        default:
-            sendError(MODBUS_ERR_ILLEGAL_FUNCTION);
-            break;
-    }
-}
-
 static volatile dali_response_type_t daliResponseType;
 static volatile uint8_t daliResponse;
 
@@ -288,8 +275,18 @@ static void processCustomDaliCommand() {
         sendError(MODBUS_ERR_ILLEGAL_VALUE);
         return;
     }
-    dali_custom_command(cmd, dali_custom_cmd_callback, repeat);
+    daliResponseType = DALI_RESPONSE_PENDING;
+
+    dali_custom_command(cmd, dali_cmd_completed, repeat);
+    waitForDaliResponse();
     // dali_cmd_callback() will perform the response
+    if (daliResponseType == DALI_RESPONSE_OK) {
+        buf[2] = daliResponse;
+        sendResponse(buf, 3);
+    } else {
+        sendError(dali_response_to_err(daliResponseType));
+    }
+
 }
 
 static void processSetSingleHoldingRegisterCommand() {

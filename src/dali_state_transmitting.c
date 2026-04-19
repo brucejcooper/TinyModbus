@@ -35,7 +35,7 @@ static void sendZero() {
 static void startStopBits() {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     daliTimerCallback = finishedTransmission;
-    daliTimer = 1;
+    daliTimer = 4;
 }
 
 /** 

@@ -8,7 +8,8 @@
 #include "dali.h"
 #include "timers.h"
 
-#define DALI_READ_TOLERANCE_USECS USEC_TO_TICKS(20)
+// 20% tolerance on bit timings.
+#define DALI_READ_TOLERANCE_USECS (DALI_HALF_BIT_USECS/5)
 #define HALFBIT_MIN_TICKS USEC_TO_TICKS(DALI_HALF_BIT_USECS - DALI_READ_TOLERANCE_USECS)
 #define HALFBIT_MAX_TICKS USEC_TO_TICKS(DALI_HALF_BIT_USECS + DALI_READ_TOLERANCE_USECS)
 #define FULLBIT_MIN_TICKS USEC_TO_TICKS(DALI_BIT_USECS - DALI_READ_TOLERANCE_USECS)
@@ -33,33 +34,35 @@ static volatile pulse_received_cb_t handler;
 #define STATE_MIDDLE_1 4
 #define STATE_ERROR 5
 
-#define NOSHIFT 3
+#define STATE_BP 4
+
 #define SHIFT_0 0
 #define SHIFT_1 1
+#define NOSHIFT 2
+
 
 typedef struct {
-    uint8_t shift;
-    uint8_t next;
-} reader_action_t;
-
-typedef struct {
-    reader_action_t shortpulse;
-    reader_action_t longpulse;
+    uint8_t shortpulse;
+    uint8_t longpulse;
 } reader_state_t;
 
-static const reader_state_t state_machine[STATE_ERROR] = {
+static const reader_state_t state_machine[STATE_ERROR+1] = {
     // START_BIT
-    {.shortpulse = {.shift = NOSHIFT, .next = STATE_MIDDLE_1}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}},
+    {.shortpulse = NOSHIFT | (STATE_MIDDLE_1 << STATE_BP), .longpulse = STATE_ERROR << STATE_BP},
     // START_0 - or it might be the end of sequence
-    {.shortpulse = {.shift = SHIFT_0, .next = STATE_MIDDLE_0}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}},
+    {.shortpulse = 0 | (STATE_MIDDLE_0 << STATE_BP), .longpulse = (STATE_ERROR << STATE_BP)},
     // START_1
-    {.shortpulse = {.shift = SHIFT_1, .next = STATE_MIDDLE_1}, .longpulse = {.shift = NOSHIFT, .next = STATE_ERROR}},
+    {.shortpulse = 1 | (STATE_MIDDLE_1 << STATE_BP), .longpulse = (STATE_ERROR << STATE_BP)},
     // MIDDLE_0
-    {.shortpulse = {.shift = NOSHIFT, .next = STATE_START_0}, .longpulse = {.shift = SHIFT_1, .next = STATE_MIDDLE_1}},
-    // MIDDLE_1 - but it might be the end of the sequence (after the last half)
-    {.shortpulse = {.shift = NOSHIFT, .next = STATE_START_1}, .longpulse = {.shift = SHIFT_0, .next = STATE_MIDDLE_0}},
+    {.shortpulse = NOSHIFT | (STATE_START_0 << STATE_BP), .longpulse = 1 | (STATE_MIDDLE_1 << STATE_BP)},
+    // MIDDLE_1- but it might be the end of the sequence (after the last half)
+    {.shortpulse = NOSHIFT | (STATE_START_1 << STATE_BP), .longpulse = 0 | (STATE_MIDDLE_0 << STATE_BP)},
+
+    // this isn't strictly necessary, but we're trying to fix a pernicious bug
+    {.shortpulse = STATE_ERROR << STATE_BP, .longpulse = STATE_ERROR << STATE_BP}
 };
-uint8_t state;
+
+static volatile uint8_t state;
 
 static inline void cleanup() {
     TCB0.CTRLA = 0;
@@ -68,16 +71,19 @@ static inline void cleanup() {
     TCB0.INTCTRL = 0;  // Turn off CAPT ISR.
 }
 
-void timerOverflow() {
+static void timerOverflow() {
+    // blip(2);
+
     // This indicates that a timeout has occurred without a bit flip. This can either be stop bits or a timing error/
     // In either case, we will be leaving this state.  Shut down the timers.
     cleanup();
+
     if ((state == STATE_START_0 || state == STATE_MIDDLE_1) && numBits == 8) {
         // We have come to a valid end of sequence.  Process what we have read.
         process_command_response(DALI_RESPONSE_OK, shiftreg);
     } else {
         // Some timing error or collision occurred.
-        process_command_response(numBits == 0 ? DALI_RESPONSE_NAK : DALI_RESPONSE_MALFORMED, 0);
+        process_command_response(DALI_RESPONSE_MALFORMED, 0);
     }
     dali_wait_for_idle_state_enter();
 
@@ -93,6 +99,7 @@ void dali_state_receiving_prepare() {
     shiftreg = 0;
     numBits = 0;
 
+    // Timer is not running yet
     TCB0.CTRLA = 0;
     // We'll be using TCB0 to read pulse widths.
     TCB0.CNT = 73;                              // Account for startup latencies
@@ -108,6 +115,8 @@ void dali_state_receiving_prepare() {
  * We also expect dali_state_receiving_prepare to have been called before this one.
  */
 void dali_state_receiving_enter() {
+    // blip(1);
+
 
     // Start TCB0 for pulse width timing.  It will start counting upon a rising edge (start of start bit.)
     TCB0.CTRLA = TCB_CLKSEL_CLKDIV1_gc | TCB_ENABLE_bm;
@@ -117,57 +126,68 @@ void dali_state_receiving_enter() {
     // However, in the wait_for_respone state, the timer would have been taken over with its own timeout.
     // As a result, we must take over the timer again.
     daliTimerCallback = timerOverflow;
-    daliTimer = 4;
+    daliTimer = 5; // Anything between 2 and 2.5 bits
+}
+
+static inline void sendError(dali_response_type_t err) {
+    cleanup();
+    process_command_response(err, 0);
+    dali_wait_for_idle_state_enter();
 }
 
 ISR(TCB0_INT_vect) {
-    // TCB0's CNT has been reset automatically, but TCA0's hasn't
-    // We do this first so that it closely matches TCB0s as it can
+    uint8_t action;
+
+    // We extend the timeout to be in 4 half bits time.  
+    daliTimer = 5;
+    // blip(state);
+
     uint16_t pulseLengthInTicks = TCB0.CCMP;  // This will clear the interrupt flag.
     uint8_t evctrl = TCB0.EVCTRL;
     // Due to capacitance / collector behaviour, positive pulses are recorded shorter than they actually are.
     // We adjust the pulse lengths to be more representative of what the source device wished.
-    if (evctrl & TCB_EDGE_bm) {
-        // It was a falling edge (from high)
-        pulseLengthInTicks += USEC_TO_TICKS(54);
-    } else {
-        // It was a rising edge (from low)
-        pulseLengthInTicks -= USEC_TO_TICKS(52);
-    }
+    // if (evctrl & TCB_EDGE_bm) {
+    //     // It was a falling edge (from high)
+    //     pulseLengthInTicks += USEC_TO_TICKS(54);
+    // } else {
+    //     // It was a rising edge (from low)
+    //     pulseLengthInTicks -= USEC_TO_TICKS(52);
+    // }
     TCB0.EVCTRL = evctrl ^ TCB_EDGE_bm;  // Toggle the EDGE value to make it so that we capture the other edge
 
     // What action we take is dependent on the pulse length
-    const reader_action_t *action;
     // Now process our pulse.
+    // blip(pulseLengthInTicks /100);
     if (pulseLengthInTicks < HALFBIT_MIN_TICKS) {
         // Pulse is too short
-        goto error;
+        sendError(DALI_RESPONSE_PULSE_TOO_SHORT);
+        return;
     } else if (pulseLengthInTicks <= HALFBIT_MAX_TICKS) {
-        action = &state_machine[state].shortpulse;
+        action = state_machine[state].shortpulse;
     } else if (pulseLengthInTicks <= FULLBIT_MIN_TICKS) {
         // pulse width is too long for a half bit, and too short for a full bit
-        goto error;
+        sendError(DALI_RESPONSE_PULSE_IN_MIDDLE);
+        return;
     } else if (pulseLengthInTicks <= FULLBIT_MAX_TICKS) {
-        action = &state_machine[state].longpulse;
+        action = state_machine[state].longpulse;
     } else {
         // pulse is too long. 
-        goto error;
+        sendError(DALI_RESPONSE_PULSE_TOO_LONG);
+        return;
     }
+    // blip(action);
 
-    state = action->next;
+
+    // Change to next state.
+    state = action >> STATE_BP;
     if (state == STATE_ERROR) {
-        goto error;
+        sendError(DALI_RESPONSE_MALFORMED);
+        return;
     }
-    if (action->shift != NOSHIFT) {
-        shiftreg = shiftreg << 1 | action->shift;
+    // Take the action (from the old state.
+    uint8_t bitSet = action & 0x03;
+    if (bitSet != NOSHIFT) {
+        shiftreg = (shiftreg << 1) | bitSet;
         numBits++;
     }
-    // We extend the timeout to be in 4 ticks time.  
-    daliTimer = 4;
-    return;  // Avoid the error handler.
-error:
-    // We received an invalid pulse width.
-    cleanup();
-    process_command_response(DALI_RESPONSE_MALFORMED, 0);
-    dali_wait_for_idle_state_enter();
 }

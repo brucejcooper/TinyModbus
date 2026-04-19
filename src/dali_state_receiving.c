@@ -101,9 +101,9 @@ ISR(TCB0_INT_vect) {
         send_rx_error(DALI_RESPONSE_MALFORMED); return;
     }
 
-    uint8_t bit = action & 0x03u;
-    if (bit != NOSHIFT) {
-        shift_reg = (shift_reg << 1) | bit;
+    uint8_t decoded_bit = action & 0x03u;
+    if (decoded_bit != NOSHIFT) {
+        shift_reg = (shift_reg << 1) | decoded_bit;
         num_bits++;
     }
 }

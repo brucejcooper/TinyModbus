@@ -20,16 +20,16 @@ uint8_t cmdq_count(void) {
     return (uint8_t)((g_cmd_queue.tail - g_cmd_queue.head) & (CMD_QUEUE_SIZE - 1u));
 }
 
-sys_result_t cmdq_push(const cmd_entry_t *e) {
+sys_result_t cmdq_push(const cmd_entry_t *entry) {
     if (cmdq_full()) return SYS_ERR_QUEUE_FULL;
-    g_cmd_queue.entries[g_cmd_queue.tail] = *e;
+    g_cmd_queue.entries[g_cmd_queue.tail] = *entry;
     g_cmd_queue.tail = (g_cmd_queue.tail + 1u) & (CMD_QUEUE_SIZE - 1u);
     return SYS_OK;
 }
 
-bool cmdq_peek(cmd_entry_t *e) {
+bool cmdq_peek(cmd_entry_t *entry) {
     if (cmdq_empty()) return false;
-    *e = g_cmd_queue.entries[g_cmd_queue.head];
+    *entry = g_cmd_queue.entries[g_cmd_queue.head];
     return true;
 }
 
@@ -39,7 +39,7 @@ void cmdq_pop(void) {
 }
 
 sys_result_t cmdq_push_arc(uint8_t dali_addr, uint8_t level, uint8_t ballast_idx) {
-    cmd_entry_t e = {
+    cmd_entry_t entry = {
         .type        = CMD_DIRECT_ARC,
         .dali_addr   = dali_addr,
         .dali_cmd    = level,
@@ -48,11 +48,11 @@ sys_result_t cmdq_push_arc(uint8_t dali_addr, uint8_t level, uint8_t ballast_idx
         .repeat      = 1,
         .on_result   = NULL,
     };
-    return cmdq_push(&e);
+    return cmdq_push(&entry);
 }
 
 sys_result_t cmdq_push_cmd(uint8_t dali_addr, uint8_t dali_cmd, uint8_t ballast_idx) {
-    cmd_entry_t e = {
+    cmd_entry_t entry = {
         .type        = CMD_SEND,
         .dali_addr   = dali_addr,
         .dali_cmd    = dali_cmd,
@@ -61,11 +61,11 @@ sys_result_t cmdq_push_cmd(uint8_t dali_addr, uint8_t dali_cmd, uint8_t ballast_
         .repeat      = 1,
         .on_result   = NULL,
     };
-    return cmdq_push(&e);
+    return cmdq_push(&entry);
 }
 
 sys_result_t cmdq_push_twice(uint8_t dali_addr, uint8_t dali_cmd, uint8_t ballast_idx) {
-    cmd_entry_t e = {
+    cmd_entry_t entry = {
         .type        = CMD_SEND_TWICE,
         .dali_addr   = dali_addr,
         .dali_cmd    = dali_cmd,
@@ -74,12 +74,12 @@ sys_result_t cmdq_push_twice(uint8_t dali_addr, uint8_t dali_cmd, uint8_t ballas
         .repeat      = 2,
         .on_result   = NULL,
     };
-    return cmdq_push(&e);
+    return cmdq_push(&entry);
 }
 
 sys_result_t cmdq_push_query(uint8_t dali_addr, uint8_t dali_cmd,
                               uint8_t ballast_idx, reg_target_t target) {
-    cmd_entry_t e = {
+    cmd_entry_t entry = {
         .type        = CMD_QUERY,
         .dali_addr   = dali_addr,
         .dali_cmd    = dali_cmd,
@@ -88,13 +88,13 @@ sys_result_t cmdq_push_query(uint8_t dali_addr, uint8_t dali_cmd,
         .repeat      = 1,
         .on_result   = NULL,
     };
-    return cmdq_push(&e);
+    return cmdq_push(&entry);
 }
 
 sys_result_t cmdq_push_query_cb(uint8_t dali_addr, uint8_t dali_cmd,
                                  uint8_t ballast_idx, reg_target_t target,
                                  cmd_result_cb_t cb) {
-    cmd_entry_t e = {
+    cmd_entry_t entry = {
         .type        = CMD_QUERY,
         .dali_addr   = dali_addr,
         .dali_cmd    = dali_cmd,
@@ -103,7 +103,7 @@ sys_result_t cmdq_push_query_cb(uint8_t dali_addr, uint8_t dali_cmd,
         .repeat      = 1,
         .on_result   = cb,
     };
-    return cmdq_push(&e);
+    return cmdq_push(&entry);
 }
 
 void cmdq_kick(void) {

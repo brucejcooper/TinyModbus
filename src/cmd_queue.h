@@ -20,8 +20,8 @@ bool         cmdq_empty(void);
 bool         cmdq_full(void);
 uint8_t      cmdq_count(void);
 
-sys_result_t cmdq_push(const cmd_entry_t *e);
-bool         cmdq_peek(cmd_entry_t *e);   // false if empty
+sys_result_t cmdq_push(const cmd_entry_t *entry);
+bool         cmdq_peek(cmd_entry_t *entry);   // false if empty
 void         cmdq_pop(void);
 
 // Convenience push helpers

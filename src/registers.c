@@ -34,17 +34,17 @@ void regs_init(void) {
             g_regs.mb_slave_addr = 1;
     }
 
-    uint8_t bi = eeprom_read_byte(&ee_baud_index);
-    g_regs.baud_index = (bi <= 2) ? bi : 0;
+    uint8_t baud_idx = eeprom_read_byte(&ee_baud_index);
+    g_regs.baud_index = (baud_idx <= 2) ? baud_idx : 0;
 }
 
 // ---- bitmask helpers ---------------------------------------------------
 
 static void bm_set(uint16_t *words, uint8_t idx, bool val) {
-    uint8_t  wi  = idx >> 4;
-    uint16_t bit = (uint16_t)1u << (idx & 0x0F);
-    if (val) words[wi] |=  bit;
-    else     words[wi] &= ~bit;
+    uint8_t  word_idx = idx >> 4;
+    uint16_t bit_mask = (uint16_t)1u << (idx & 0x0F);
+    if (val) words[word_idx] |=  bit_mask;
+    else     words[word_idx] &= ~bit_mask;
 }
 
 // ---- FC04 bulk read ----------------------------------------------------
@@ -52,8 +52,8 @@ static void bm_set(uint16_t *words, uint8_t idx, bool val) {
 void regs_read_input_bulk(uint16_t addr, uint8_t count, uint8_t *buf) {
     // The register_map_t is laid out so that each FC04 word occupies exactly 2 bytes
     // in the same order as the Modbus wire, so memcpy is safe for aligned regions.
-    const uint8_t *src = (const uint8_t *)&g_regs + (uint16_t)addr * 2u;
-    memcpy(buf, src, (uint16_t)count * 2u);
+    const uint8_t *source_ptr = (const uint8_t *)&g_regs + (uint16_t)addr * 2u;
+    memcpy(buf, source_ptr, (uint16_t)count * 2u);
 }
 
 // ---- FC03 holding read -------------------------------------------------
@@ -178,24 +178,24 @@ void regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups)
     uint8_t byte_idx = ballast_idx >> 3;
     uint8_t bit_mask = (uint8_t)(1u << (ballast_idx & 7u));
 
-    for (uint8_t g = 0; g < 8; g++) {
-        if (bits & (1u << g))
-            g_regs.group_mask[base + g][byte_idx] |=  bit_mask;
+    for (uint8_t group_idx = 0; group_idx < 8; group_idx++) {
+        if (bits & (1u << group_idx))
+            g_regs.group_mask[base + group_idx][byte_idx] |=  bit_mask;
         else
-            g_regs.group_mask[base + g][byte_idx] &= ~bit_mask;
+            g_regs.group_mask[base + group_idx][byte_idx] &= ~bit_mask;
     }
 
-    for (uint8_t g = 0; g < 16; g++)
-        regs_rebuild_group_status(g);
+    for (uint8_t group_idx = 0; group_idx < 16; group_idx++)
+        regs_rebuild_group_status(group_idx);
 }
 
 void regs_rebuild_group_status(uint8_t group_idx) {
-    uint8_t or_status = 0;
-    for (uint8_t b = 0; b < 64; b++) {
-        if (g_regs.group_mask[group_idx][b >> 3] & (1u << (b & 7u)))
-            or_status |= g_regs.block0[b].status;
+    uint8_t merged_status = 0;
+    for (uint8_t ballast_idx = 0; ballast_idx < 64; ballast_idx++) {
+        if (g_regs.group_mask[group_idx][ballast_idx >> 3] & (1u << (ballast_idx & 7u)))
+            merged_status |= g_regs.block0[ballast_idx].status;
     }
-    g_regs.group_status[group_idx].status = or_status;
+    g_regs.group_status[group_idx].status = merged_status;
 }
 
 void regs_set_poll_interval(uint16_t val) {

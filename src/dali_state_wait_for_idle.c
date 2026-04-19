@@ -8,8 +8,13 @@
 #include "dali.h"
 #include "timers.h"
 
-// The DALi Specification says that the bus must be idle for 22 Te (half byte periods) between commands. 
+// The DALi Specification says that the bus must be idle for 22 Te (half byte periods) between commands.
 #define IDLE_THRESHOLD_TE 22
+
+// If the bus stays active longer than this, something is wrong (ballast fault, wiring short, etc.).
+// Force the state machine out of WAIT_FOR_IDLE rather than hanging forever.
+// 200 Te × 416.67 µs ≈ 83 ms — well beyond any legitimate DALI frame.
+#define BUS_STUCK_TIMEOUT_TE 200
 
 static void onBusShorted();
 
@@ -24,20 +29,30 @@ static void idlePeriodExprired() {
 }
 
 static void onIdleBus() {
-    // cli();
     dali_call_on_rising_once(onBusShorted);
     daliTimerCallback = idlePeriodExprired;
     daliTimer = IDLE_THRESHOLD_TE;
-    // sei();
+}
+
+/**
+ * @brief Bus has been stuck active (low) for too long — escape the wait.
+ * Releases our TX pin defensively, cancels edge detection, and returns to the
+ * idle state. The state machine will attempt to transmit or wait for a new
+ * command. If the external fault persists it will re-enter this path and keep
+ * retrying rather than hanging indefinitely.
+ */
+static void busStuckTimeout() {
+    DALI_PORT.OUTCLR = DALI_TX_bm;
+    dali_cancel_edge_detect();
+    dali_idle_state_enter();
 }
 
 static void onBusShorted() {
-
-    // cli();
-    daliTimer = 0;
-    // Wait until we receive a low level (not shorted), then start checking again.
+    // Wait for the bus to return to idle (RX pin goes low).
     dali_call_on_low_once(onIdleBus);
-    // sei();
+    // Safety net: if the bus never recovers, escape after BUS_STUCK_TIMEOUT_TE.
+    daliTimerCallback = busStuckTimeout;
+    daliTimer = BUS_STUCK_TIMEOUT_TE;
 }
 
 extern void dali_wait_for_idle_state_enter() {

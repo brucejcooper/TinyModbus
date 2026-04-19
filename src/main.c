@@ -13,39 +13,6 @@
 
 
 
-#define BLIP_PORT PORTB
-#define BLIP_PIN PIN3_bm
-
-
-void blip(uint8_t ch) {
-    // Start bit
-    cli();
-    BLIP_PORT.OUTCLR = BLIP_PIN;
-    _delay_us(8.1);
-    if (ch & 0x01) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x02) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x04) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x08) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x10) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x20) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x40) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    if (ch & 0x80) { BLIP_PORT.OUTSET = BLIP_PIN; } else { BLIP_PORT.OUTCLR = BLIP_PIN;}
-    _delay_us(8.1);
-    BLIP_PORT.OUTSET = BLIP_PIN;
-    _delay_us(8.1); // Stop bit
-    sei();
-}
-    
-
-
-
 void pulse_led(uint8_t times) {
     int bits = 8;
     // Start bit
@@ -75,6 +42,13 @@ void pulse_led(uint8_t times) {
 
 
 int main(void) {
+
+    // Drive RS485 DE low before anything else so the transceiver does not drive the
+    // RS485 bus during the startup window after a WDT or power-on reset (the pin
+    // floats high-Z on reset; an external pull-up or the chip's internal default
+    // would otherwise assert the driver and block other devices on the bus).
+    PORTA.DIRSET = PIN4_bm;
+    PORTA.OUTCLR = PIN4_bm;
 
     // Set ourselves up to run at 10Mhz.  We will spend most of our time asleep, so going fast while in operation is fine.
     CCP = CCP_IOREG_gc;

@@ -257,9 +257,14 @@ static volatile dali_response_type_t daliResponseType;
 static volatile uint8_t daliResponse;
 
 void waitForDaliResponse() {
-    while (daliResponseType == DALI_RESPONSE_PENDING) {
-        // TODO WDT or something.
-        ;
+    // Bound the wait to ~300 ms — enough for 3 queued DALI commands (each ≤ ~56 ms worst case)
+    // but short enough to give the Modbus master a timely error response instead of an 8-second silence.
+    // TCA0 ISRs continue to fire during _delay_ms, so the DALI state machine keeps running.
+    for (uint16_t t = 300; t > 0 && daliResponseType == DALI_RESPONSE_PENDING; t--) {
+        _delay_ms(1);
+    }
+    if (daliResponseType == DALI_RESPONSE_PENDING) {
+        daliResponseType = DALI_RESPONSE_NAK;
     }
 }
 
@@ -505,7 +510,7 @@ ISR(USART0_TXC_vect) {
     modbus_idle = true;
 
     // Clear any pending flags.
-    USART0.STATUS = USART_RXSIE_bm | USART_RXCIE_bm | USART_TXCIF_bm;
+    USART0.STATUS = USART_RXSIF_bm | USART_TXCIF_bm;
     // ISR on reception.
     USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
 }

@@ -8,12 +8,13 @@ register_map_t g_regs;
 
 static uint16_t s_rescan_interval = 64u;
 
-volatile dali_response_type_t g_raw_resp_type = DALI_RESPONSE_PENDING;
+volatile dali_response_type_t g_raw_resp_type = DALI_RESPONSE_OK;
 volatile uint8_t              g_raw_resp_byte  = 0;
 
-// EEPROM layout: byte 0 = slave address, byte 1 = baud index
-static uint8_t EEMEM ee_slave_addr = 0xFF;
-static uint8_t EEMEM ee_baud_index = 0xFF;
+// EEPROM layout: byte 0 = slave address, byte 1 = baud index, bytes 2-3 = rescan interval
+static uint8_t  EEMEM ee_slave_addr      = 0xFF;
+static uint8_t  EEMEM ee_baud_index      = 0xFF;
+static uint16_t EEMEM ee_rescan_interval = 0xFFFF;
 
 void regs_init(void) {
     memset(&g_regs, 0, sizeof(g_regs));
@@ -23,7 +24,8 @@ void regs_init(void) {
         g_regs.block0[i].brightness = 0xFF;
     }
 
-    s_rescan_interval = 64u;
+    uint16_t rescan_val = eeprom_read_word(&ee_rescan_interval);
+    s_rescan_interval = (rescan_val == 0xFFFFu) ? 64u : rescan_val;
 
     // Slave address: EEPROM first, fall back to USERROW formula
     uint8_t ee_addr = eeprom_read_byte(&ee_slave_addr);
@@ -84,7 +86,8 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
 bool regs_write_holding(uint16_t addr, uint16_t val) {
     switch (addr) {
         case MBREG_RESCAN_INTERVAL:
-            s_rescan_interval = val;  // 0 = disable periodic rescans
+            s_rescan_interval = val;
+            eeprom_update_word(&ee_rescan_interval, val);
             return true;
         case MBREG_SLAVE_ADDR:
             if (val < 1 || val > 247) return false;

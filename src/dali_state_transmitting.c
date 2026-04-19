@@ -1,67 +1,52 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
-#include <avr/sleep.h>
 #include <stdbool.h>
-#include <util/atomic.h>
-#include <util/delay.h>
 
 #include "dali.h"
-#include "timers.h"
+#include "tick.h"
 
-// Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
+static volatile uint16_t shift_reg;
+static volatile uint8_t  bits_left;
 
-static volatile uint16_t shiftReg;
-static volatile uint8_t bitsLeft;
-
-static void finishedTransmission() {
-    // Turn off timer.
+static void finished_transmission(void) {
     dali_wait_for_response_state_enter();
 }
 
-static void halfBitToggle();
+static void half_bit_toggle(void);
 
-static void sendOne() {
-    DALI_PORT.OUTSET = DALI_TX_bm;
-    daliTimerCallback = halfBitToggle;
-    daliTimer = 1;
+static void send_one(void) {
+    DALI_PORT.OUTSET     = DALI_TX_bm;
+    dali_timer_cb = half_bit_toggle;
+    dali_timer    = 1;
 }
 
-static void sendZero() {
-    DALI_PORT.OUTCLR = DALI_TX_bm;
-    daliTimerCallback = halfBitToggle;
-    daliTimer = 1;
+static void send_zero(void) {
+    DALI_PORT.OUTCLR     = DALI_TX_bm;
+    dali_timer_cb = half_bit_toggle;
+    dali_timer    = 1;
 }
 
-static void startStopBits() {
-    DALI_PORT.OUTCLR = DALI_TX_bm;
-    daliTimerCallback = finishedTransmission;
-    daliTimer = 4;
+static void start_stop_bits(void) {
+    DALI_PORT.OUTCLR     = DALI_TX_bm;
+    dali_timer_cb = finished_transmission;
+    dali_timer    = 4;
 }
 
-/** 
- * Called in the middle of each output but.  As we are using manchester, it simply toggles the output, then works out what the next bit will be
- */
-static void halfBitToggle() {
+static void half_bit_toggle(void) {
     DALI_PORT.OUTTGL = DALI_TX_bm;
-    // set the handler to What happens at the start of the next bit.
-    if (--bitsLeft == 0) {
-        daliTimerCallback = startStopBits;
+    if (--bits_left == 0) {
+        dali_timer_cb = start_stop_bits;
     } else {
-        daliTimerCallback = shiftReg & 0x8000 ? sendOne: sendZero;
-        shiftReg <<= 1;
+        dali_timer_cb = (shift_reg & 0x8000u) ? send_one : send_zero;
+        shift_reg <<= 1;
     }
-    daliTimer = 1;
+    dali_timer = 1;
 }
 
-extern void dali_transmitting_state_enter(dali_command_t *cmd) {
-    // Before we start messing with stuff, make sure the timer is off
-    shiftReg = cmd->cmd;
-    bitsLeft = 17; // One extra for the stop bit. 
-
-    // We send a one as the start bit.
-    // cli();
-    daliTimerCallback = sendOne;
-    daliTimer = 1;
-    // sei();
+void dali_transmitting_state_enter(const cmd_entry_t *cmd) {
+    // Build the 16-bit DALI forward frame from the queue entry
+    shift_reg = ((uint16_t)cmd->dali_addr << 8) | cmd->dali_cmd;
+    bits_left = 17;  // 16 data bits + 1 extra for the stop-bit transition
+    dali_timer_cb = send_one;
+    dali_timer    = 1;
 }
-

@@ -125,7 +125,8 @@ static void send_error(mb_err_t err) {
     start_tx(3);
 }
 
-// ---- Dispatch table for action registers 0x1002–0x1009 -----------------
+// ---- Dispatch table for action registers 0x1003–0x100A -----------------
+// Write value low byte = DALI address byte; high byte ignored.
 
 typedef struct {
     uint16_t mb_reg;
@@ -134,16 +135,37 @@ typedef struct {
 } action_reg_t;
 
 static const action_reg_t action_regs[] PROGMEM = {
-    { 0x1002, DALI_CMD_GOTO_LAST_ACTIVE, true },
-    { 0x1003, DALI_CMD_OFF,              true },
-    { 0x1004, DALI_CMD_UP,               true },
-    { 0x1005, DALI_CMD_DOWN,             true },
-    { 0x1006, DALI_CMD_STEP_UP,          true },
-    { 0x1007, DALI_CMD_STEP_DOWN,        true },
-    { 0x1008, DALI_CMD_RECALL_MAX,       true },
-    { 0x1009, DALI_CMD_RECALL_MIN,       true },
+    { 0x1003, DALI_CMD_GOTO_LAST_ACTIVE, true },
+    { 0x1004, DALI_CMD_OFF,              true },
+    { 0x1005, DALI_CMD_UP,               true },
+    { 0x1006, DALI_CMD_DOWN,             true },
+    { 0x1007, DALI_CMD_STEP_UP,          true },
+    { 0x1008, DALI_CMD_STEP_DOWN,        true },
+    { 0x1009, DALI_CMD_RECALL_MAX,       true },
+    { 0x100A, DALI_CMD_RECALL_MIN,       true },
 };
 #define NUM_ACTION_REGS (sizeof(action_regs) / sizeof(action_regs[0]))
+
+// ---- Callbacks for async raw DALI result (registers 0x1000 / 0x1001) ----
+
+static void raw_cmd_single_done(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
+    (void)ballast_idx;
+    if (type == DALI_RESPONSE_OK)
+        g_regs.raw_cmd_result = RAW_RESULT_OK(response);
+    else if (type == DALI_RESPONSE_NAK)
+        g_regs.raw_cmd_result = RAW_RESULT_NAK;
+    else
+        g_regs.raw_cmd_result = RAW_RESULT_ERR((uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u);
+}
+
+static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
+    (void)ballast_idx; (void)response;
+    // Send-twice commands don't return a response; NAK on completion is normal
+    if (type == DALI_RESPONSE_NAK)
+        g_regs.raw_cmd_result = RAW_RESULT_NAK;
+    else
+        g_regs.raw_cmd_result = RAW_RESULT_ERR((uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u);
+}
 
 // ---- FC04 — read input registers ----------------------------------------
 
@@ -192,60 +214,89 @@ static void process_fc03(void) {
     if (count == 0 || count > MAX_REG_RD) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
 
     buf[2] = (uint8_t)(count * 2u);
-    uint8_t *dst = buf + 3;
-    for (uint16_t a = addr; a < addr + count; a++) {
-        uint16_t val = 0;
-        if (!regs_read_holding(a, &val)) {
+    uint8_t *response_ptr = buf + 3;
+    for (uint16_t reg_addr = addr; reg_addr < addr + count; reg_addr++) {
+        uint16_t reg_value = 0;
+        if (!regs_read_holding(reg_addr, &reg_value)) {
             send_error(MB_ERR_ILLEGAL_ADDRESS);
             return;
         }
-        *dst++ = (uint8_t)(val >> 8);
-        *dst++ = (uint8_t)val;
+        *response_ptr++ = (uint8_t)(reg_value >> 8);
+        *response_ptr++ = (uint8_t)reg_value;
     }
     start_tx(3 + buf[2]);
 }
 
 // ---- FC06 / FC10 — write register(s) -----------------------------------
 
-static void dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
-    if (mb_reg == 0x1000) {
-        // Raw DALI command: [15:8]=addr byte, [7:0]=cmd byte
-        uint8_t da = (uint8_t)(val >> 8);
-        uint8_t dc = (uint8_t)val;
-        cmdq_push_cmd(da, dc, 0xFF);
+// Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
+static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
+    if (mb_reg == 0x1000 || mb_reg == 0x1001) {
+        // Raw DALI: [15:8]=addr byte, [7:0]=cmd byte.
+        // 0x1000 = single send (queries for response); 0x1001 = send twice (no response expected).
+        // Reject if a previous raw command is still pending.
+        bool pending;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            pending = (g_regs.raw_cmd_result == RAW_RESULT_PENDING);
+            if (!pending) g_regs.raw_cmd_result = RAW_RESULT_PENDING;
+        }
+        if (pending) return MB_ERR_DEVICE_BUSY;
+
+        bool is_twice = (mb_reg == 0x1001);
+        cmd_entry_t entry = {
+            .type        = is_twice ? CMD_SEND_TWICE : CMD_QUERY,
+            .dali_addr   = (uint8_t)(val >> 8),
+            .dali_cmd    = (uint8_t)val,
+            .ballast_idx = 0xFF,
+            .reg_target  = REG_NONE,
+            .repeat      = is_twice ? 2 : 1,
+            .on_result   = is_twice ? raw_cmd_twice_done : raw_cmd_single_done,
+        };
+        if (cmdq_push(&entry) != SYS_OK) {
+            g_regs.raw_cmd_result = RAW_RESULT_IDLE;
+            return MB_ERR_DEVICE_BUSY;
+        }
         cmdq_kick();
-        return;
+        return 0;
     }
-    if (mb_reg == 0x1001) {
-        // DAPC: [15:8]=DALI addr byte, [7:0]=level
-        uint8_t da  = (uint8_t)(val >> 8);
-        uint8_t lvl = (uint8_t)val;
-        uint8_t idx = (da >> 1) & 0x3F;
-        cmdq_push_arc(da, lvl, (da & 0x80) ? 0xFF : idx);
-        // Mark fading so the fade poller tracks it
-        if (idx < DALI_MAX_DEVICES)
-            g_regs.fading[idx >> 4] |= (uint16_t)1u << (idx & 0x0F);
+    if (mb_reg == 0x1002) {
+        // DAPC: [15:8]=DALI addr byte, [7:0]=arc level
+        uint8_t dali_addr_byte = (uint8_t)(val >> 8);
+        uint8_t arc_level      = (uint8_t)val;
+        uint8_t ballast_idx    = (dali_addr_byte >> 1) & 0x3F;
+        cmdq_push_arc(dali_addr_byte, arc_level, (dali_addr_byte & 0x80) ? 0xFF : ballast_idx);
+        if (ballast_idx < DALI_MAX_DEVICES)
+            g_regs.fading[ballast_idx >> 4] |= (uint16_t)1u << (ballast_idx & 0x0F);
         cmdq_kick();
-        return;
+        return 0;
     }
     if (mb_reg == 0x1010) {
         if (val == 0x0001) bgtasks_trigger_scan();
-        return;
+        return 0;
+    }
+    if (mb_reg == 0x100B || mb_reg == 0x100C || mb_reg == 0x100D) {
+        // Set DTR0/DTR1/DTR2: low byte of val is the DTR data byte.
+        uint8_t dtr_addr = (mb_reg == 0x100B) ? DALI_ADDR_SET_DTR0 :
+                           (mb_reg == 0x100C) ? DALI_ADDR_SET_DTR1 : DALI_ADDR_SET_DTR2;
+        cmdq_push_cmd(dtr_addr, (uint8_t)val, 0xFF);
+        cmdq_kick();
+        return 0;
     }
     for (uint8_t i = 0; i < NUM_ACTION_REGS; i++) {
         uint16_t reg = pgm_read_word(&action_regs[i].mb_reg);
         if (reg == mb_reg) {
-            uint8_t dc    = pgm_read_byte(&action_regs[i].dali_cmd);
-            uint8_t da    = (uint8_t)val;  // addr byte in low byte for these regs
-            uint8_t idx   = (da >> 1) & 0x3F;
-            bool    fade  = pgm_read_byte(&action_regs[i].marks_fading);
-            cmdq_push_cmd(da, dc, idx);
-            if (fade && idx < DALI_MAX_DEVICES)
-                g_regs.fading[idx >> 4] |= (uint16_t)1u << (idx & 0x0F);
+            uint8_t dali_cmd_byte  = pgm_read_byte(&action_regs[i].dali_cmd);
+            uint8_t dali_addr_byte = (uint8_t)val;  // low byte = DALI addr byte
+            uint8_t ballast_idx    = (dali_addr_byte >> 1) & 0x3F;
+            bool    marks_fading   = pgm_read_byte(&action_regs[i].marks_fading);
+            cmdq_push_cmd(dali_addr_byte, dali_cmd_byte, ballast_idx);
+            if (marks_fading && ballast_idx < DALI_MAX_DEVICES)
+                g_regs.fading[ballast_idx >> 4] |= (uint16_t)1u << (ballast_idx & 0x0F);
             cmdq_kick();
-            return;
+            return 0;
         }
     }
+    return 0;
 }
 
 static void process_fc06(void) {
@@ -256,7 +307,8 @@ static void process_fc06(void) {
         send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
-    dispatch_action_reg(addr, val);
+    mb_err_t err = dispatch_action_reg(addr, val);
+    if (err) { send_error(err); return; }
     // Echo the request back (standard FC06 response)
     start_tx(6);
 }
@@ -271,15 +323,16 @@ static void process_fc10(void) {
         return;
     }
 
-    uint8_t *src = buf + 7;
+    uint8_t *payload_ptr = buf + 7;
     for (uint16_t i = 0; i < count; i++) {
-        uint16_t val = ((uint16_t)src[0] << 8) | src[1];
-        src += 2;
-        if (!regs_write_holding(addr + i, val)) {
+        uint16_t reg_value = ((uint16_t)payload_ptr[0] << 8) | payload_ptr[1];
+        payload_ptr += 2;
+        if (!regs_write_holding(addr + i, reg_value)) {
             send_error(MB_ERR_ILLEGAL_ADDRESS);
             return;
         }
-        dispatch_action_reg(addr + i, val);
+        mb_err_t err = dispatch_action_reg(addr + i, reg_value);
+        if (err) { send_error(err); return; }
     }
     // Standard FC10 response: slave addr, FC, start addr (2), count (2)
     buf[4] = buf[4]; buf[5] = buf[5];  // already in place
@@ -346,23 +399,23 @@ static bool frame_is_valid(void) {
     if (rx_crc != 0 || rx_sz < 5) return false;
     if (buf[0] != slave_addr && buf[0] != 0) return false;
 
-    uint8_t fc  = buf[1];
-    uint8_t exp = 255;
-    switch (fc) {
+    uint8_t func_code     = buf[1];
+    uint8_t expected_size = 255;
+    switch (func_code) {
         case FC_READ_COILS:
         case FC_READ_HOLDING:
         case FC_READ_INPUT:
         case FC_WRITE_SINGLE_COIL:
         case FC_WRITE_SINGLE_REG:
-            exp = 8; break;
+            expected_size = 8; break;
         case FC_WRITE_COILS:
         case FC_WRITE_MULTI_REG:
-            exp = (uint8_t)(9u + buf[6]); break;
+            expected_size = (uint8_t)(9u + buf[6]); break;
         case FC_CUSTOM_DALI:
-            exp = 7; break;
+            expected_size = 7; break;
         default: break;
     }
-    return rx_sz == exp;
+    return rx_sz == expected_size;
 }
 
 // ---- RX ring-buffer reset -----------------------------------------------

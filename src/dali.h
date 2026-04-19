@@ -42,8 +42,10 @@
 #define DALI_CMD_QUERY_GROUP_0_7      0xC0u
 #define DALI_CMD_QUERY_GROUP_8_15     0xC1u
 
-// DTR0 command: addr byte = 0xA3, data byte = value
+// DTR set commands: addr byte = opcode, cmd byte = value to load
 #define DALI_ADDR_SET_DTR0  0xA3u
+#define DALI_ADDR_SET_DTR1  0xC3u
+#define DALI_ADDR_SET_DTR2  0xC5u
 
 // ---- Hardware pins -----------------------------------------------------
 

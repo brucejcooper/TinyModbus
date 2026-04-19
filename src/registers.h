@@ -13,7 +13,7 @@ typedef struct { uint8_t power_on;  uint8_t sys_fail;   } ballast_pf_t;
 typedef struct { uint8_t fade_rate; uint8_t fade_time;  } ballast_fade_t;
 typedef struct { uint8_t status;    uint8_t brightness; } group_status_t;
 
-// FC04 input register layout (total 350 registers = 0x015C max):
+// FC04 input register layout (total 351 registers = 0x015D max):
 //   0x0000-0x003F  block0[64]       status | brightness
 //   0x0040-0x007F  block1[64]       min    | max
 //   0x0080-0x00BF  block2[64]       power_on | sys_fail
@@ -24,6 +24,8 @@ typedef struct { uint8_t status;    uint8_t brightness; } group_status_t;
 //   0x0151-0x0154  present[4]       64-bit ballast-present bitmask
 //   0x0155-0x0158  fading[4]        64-bit active-fade bitmask
 //   0x0159-0x015C  dirty[4]         set on block0 change, cleared on FC04 read
+//   0x015D         raw_cmd_result   high=0x00 idle, 0xFF pending, 0x01 nak, 0x02 ok, 0x03 err
+//                                   low byte: DALI response (when ok) or error subtype (when err)
 typedef struct {
     ballast_bs_t   block0[64];
     ballast_mm_t   block1[64];
@@ -35,6 +37,7 @@ typedef struct {
     uint16_t       present[4];
     uint16_t       fading[4];
     uint16_t       dirty[4];
+    uint16_t       raw_cmd_result;   // FC04 0x015D, see RAW_RESULT_* below
     // Config (mirrored in holding regs 0x1011-0x1013)
     uint16_t       poll_interval;   // units: 100ms, default 5
     uint8_t        mb_slave_addr;   // 1-247
@@ -48,12 +51,19 @@ extern register_map_t g_regs;
 extern volatile dali_response_type_t g_raw_resp_type;
 extern volatile uint8_t              g_raw_resp_byte;
 
-#define FC04_MAX_ADDR   0x015C
+#define FC04_MAX_ADDR   0x015D
 #define SCAN_IDLE       0
 #define SCAN_SCANNING   1
 #define SCAN_COMPLETE   2
 
 #define DALI_STATUS_FADE_RUNNING 0x10
+
+// raw_cmd_result high-byte status codes (FC04 0x015D)
+#define RAW_RESULT_IDLE    0x0000u  // no command in progress
+#define RAW_RESULT_PENDING 0xFF00u  // command sent, awaiting response
+#define RAW_RESULT_NAK     0x0100u  // completed, no response (normal for send-twice)
+#define RAW_RESULT_OK(b)   (0x0200u | (uint8_t)(b))  // response received
+#define RAW_RESULT_ERR(e)  (0x0300u | (uint8_t)(e))  // bus/timing error
 
 void     regs_init(void);
 

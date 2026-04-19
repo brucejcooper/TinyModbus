@@ -63,7 +63,8 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         // Action registers read as 0 (write-only by convention)
         case 0x1000: case 0x1001: case 0x1002: case 0x1003:
         case 0x1004: case 0x1005: case 0x1006: case 0x1007:
-        case 0x1008: case 0x1009: case 0x1010:
+        case 0x1008: case 0x1009: case 0x100A:
+        case 0x100B: case 0x100C: case 0x100D: case 0x1010:
             *val = 0;
             return true;
         case 0x1011: *val = g_regs.poll_interval;   return true;
@@ -93,7 +94,8 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
         // Action registers: caller handles DALI dispatch
         case 0x1000: case 0x1001: case 0x1002: case 0x1003:
         case 0x1004: case 0x1005: case 0x1006: case 0x1007:
-        case 0x1008: case 0x1009: case 0x1010:
+        case 0x1008: case 0x1009: case 0x100A:
+        case 0x100B: case 0x100C: case 0x100D: case 0x1010:
             return true;
         default:
             return false;

@@ -179,6 +179,7 @@ void bgtasks_run(void) {
 
 ISR(RTC_PIT_vect) {
     uint16_t interval = regs_get_rescan_interval();
+    if (rescan_counter > interval) rescan_counter = interval;
     if (interval > 0 && --rescan_counter == 0) {
         rescan_counter = interval;
         scan_trigger   = true;

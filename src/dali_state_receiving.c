@@ -53,13 +53,11 @@ static void timer_overflow(void) {
         cmdq_result_received(DALI_RESPONSE_OK, (uint8_t)shift_reg);
     else
         cmdq_result_received(DALI_RESPONSE_MALFORMED, 0);
-    dali_wait_for_idle_state_enter();
 }
 
 static void send_rx_error(dali_response_type_t err) {
     rx_cleanup();
     cmdq_result_received(err, 0);
-    dali_wait_for_idle_state_enter();
 }
 
 void dali_state_receiving_prepare(void) {

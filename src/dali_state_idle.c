@@ -63,7 +63,13 @@ void cmdq_result_received(dali_response_type_t type, uint8_t value) {
         cmd.on_result(type, cmd.ballast_idx, value);
 
     cmdq_pop();
-    dali_idle_state_enter();
+    // After any completed command, wait for the bus to settle (22 TE) before
+    // dispatching the next one.  When the queue is now empty, enter idle
+    // immediately so we can listen for external traffic without the extra wait.
+    if (cmdq_empty())
+        dali_idle_state_enter();
+    else
+        dali_wait_for_idle_state_enter();
 }
 
 // ---- dali_idle_state_enter ---------------------------------------------

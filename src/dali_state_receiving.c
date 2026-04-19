@@ -12,7 +12,7 @@
 #define FULLBIT_MIN_TICKS  USEC_TO_TICKS(DALI_BIT_USECS       - DALI_READ_TOLERANCE_USECS)
 #define FULLBIT_MAX_TICKS  USEC_TO_TICKS(DALI_BIT_USECS       + DALI_READ_TOLERANCE_USECS)
 
-static volatile uint32_t shift_reg = 0;
+static volatile uint8_t  shift_reg = 0;
 static volatile uint8_t  num_bits  = 0;
 
 #define STATE_STARTBIT  0
@@ -53,7 +53,7 @@ static void rx_cleanup(void) {
 static void timer_overflow(void) {
     rx_cleanup();
     if ((rx_state == STATE_START_0 || rx_state == STATE_MIDDLE_1) && num_bits == 8)
-        cmdq_result_received(DALI_RESPONSE_OK, (uint8_t)shift_reg);
+        cmdq_result_received(DALI_RESPONSE_OK, shift_reg);
     else
         cmdq_result_received(DALI_RESPONSE_MALFORMED, 0);
 }

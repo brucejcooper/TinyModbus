@@ -38,8 +38,7 @@ typedef struct {
     uint16_t       fading[4];
     uint16_t       dirty[4];
     uint16_t       raw_cmd_result;   // FC04 0x015D, see RAW_RESULT_* below
-    // Config (mirrored in holding regs 0x1011-0x1013)
-    uint16_t       poll_interval;   // units: 100ms, default 5 (retained for register-map compatibility; no longer drives polling)
+    // Config (mirrored in holding regs 0x1012-0x1013; beyond FC04 window)
     uint8_t        mb_slave_addr;   // 1-247
     uint8_t        baud_index;      // 0=9600 1=19200 2=38400
 } register_map_t;
@@ -60,7 +59,7 @@ extern volatile uint8_t              g_raw_resp_byte;
 
 // ---- FC04 / FC03 special block addresses ----------------------------------
 
-#define FC04_VERSION_BLOCK  0x0200u  // version string, 32 registers, read-only
+#define FC04_VERSION_BLOCK  0x0200u  // version string, 16 registers, read-only
 
 // ---- Modbus holding register (FC03/FC06) addresses ------------------------
 
@@ -150,7 +149,5 @@ void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_gro
 // Recompute group_status[group_idx].status by ORing the status of all member ballasts.
 void     regs_rebuild_group_status(uint8_t group_idx);
 
-// Update poll_interval, clamping 0 to 1 (minimum 100 ms polling period).
-void     regs_set_poll_interval(uint16_t val);
 
 #endif

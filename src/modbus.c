@@ -49,8 +49,8 @@ typedef enum {
 
 // ---- Buffers and state ----------------------------------------------
 
-#define MAX_PKT_SZ  (32 * 2 + 8)   // max 32 registers per read request
-#define MAX_REG_RD  32u
+#define MAX_PKT_SZ  (16 * 2 + 8)   // max 16 registers per read request
+#define MAX_REG_RD  16u
 
 static uint8_t  slave_addr = 1;
 static uint8_t  buf[MAX_PKT_SZ];
@@ -179,17 +179,18 @@ static void process_fc04(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-    // Legacy: version string block at FC04_VERSION_BLOCK (full 32-register read only)
-    if (addr == FC04_VERSION_BLOCK && count == 0x20u) {
-        buf[2] = 64u;
-        memset(buf + 3, 0, 64u);
-        snprintf((char *)(buf + 3), 64u,
-                 "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+    // Version string block at FC04_VERSION_BLOCK (16-register read, 32 bytes payload).
+    // Format: "DALI v<maj>.<min> <10-byte-serial-as-20-hex-chars>" = 30 chars + null.
+    if (addr == FC04_VERSION_BLOCK && count == 0x10u) {
+        buf[2] = 32u;
+        memset(buf + 3, 0, 32u);
+        snprintf((char *)(buf + 3), 32u,
+                 "DALI v%d.%d %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
                  FW_VER_MAJOR, FW_VER_MINOR,
                  SIGROW_SERNUM0, SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3,
                  SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7,
                  SIGROW_SERNUM8, SIGROW_SERNUM9);
-        start_tx(67u);
+        start_tx(35u);
         return;
     }
 

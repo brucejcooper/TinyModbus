@@ -320,8 +320,8 @@ The slave address (1–247) is stored in EEPROM (holding register 0x1012, persis
 
 | Code | Name | Description |
 |------|------|-------------|
-| 0x03 | Read Holding Registers | Read configuration registers |
-| 0x04 | Read Input Registers | Read ballast data and device info |
+| 0x03 | Read Holding Registers | Read configuration registers (max 16 registers per request) |
+| 0x04 | Read Input Registers | Read ballast data and device info (max 16 registers per request) |
 | 0x06 | Write Single Holding Register | Send a DALI command or update config |
 | 0x10 | Write Multiple Holding Registers | Write a block of holding registers |
 | 0x44 | Custom: Execute DALI Command | Synchronous raw DALI command (legacy) |
@@ -343,7 +343,7 @@ All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-
 | 0x0155–0x0158 | 4 regs | Fading bitmask — set when DALI status fade-running bit is active |
 | 0x0159–0x015C | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
 | 0x015D | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
-| 0x0200–0x021F | 32 regs | Version string: `Mechination DALI v<maj>.<min> ID:<10-byte-hex-serial>` |
+| 0x0200–0x020F | 16 regs | Version string: `DALI v<maj>.<min> <10-byte-serial-as-20-hex-chars>` — read exactly 16 registers |
 
 ### FC03/FC06/FC10 — Holding Register Map
 

@@ -135,14 +135,14 @@ typedef struct {
 } action_reg_t;
 
 static const action_reg_t action_regs[] PROGMEM = {
-    { 0x1003, DALI_CMD_GOTO_LAST_ACTIVE, true },
-    { 0x1004, DALI_CMD_OFF,              true },
-    { 0x1005, DALI_CMD_UP,               true },
-    { 0x1006, DALI_CMD_DOWN,             true },
-    { 0x1007, DALI_CMD_STEP_UP,          true },
-    { 0x1008, DALI_CMD_STEP_DOWN,        true },
-    { 0x1009, DALI_CMD_RECALL_MAX,       true },
-    { 0x100A, DALI_CMD_RECALL_MIN,       true },
+    { MBREG_GOTO_LAST_ACTIVE, DALI_CMD_GOTO_LAST_ACTIVE, true },
+    { MBREG_OFF,              DALI_CMD_OFF,              true },
+    { MBREG_UP,               DALI_CMD_UP,               true },
+    { MBREG_DOWN,             DALI_CMD_DOWN,             true },
+    { MBREG_STEP_UP,          DALI_CMD_STEP_UP,          true },
+    { MBREG_STEP_DOWN,        DALI_CMD_STEP_DOWN,        true },
+    { MBREG_RECALL_MAX,       DALI_CMD_RECALL_MAX,       true },
+    { MBREG_RECALL_MIN,       DALI_CMD_RECALL_MIN,       true },
 };
 #define NUM_ACTION_REGS (sizeof(action_regs) / sizeof(action_regs[0]))
 
@@ -173,8 +173,8 @@ static void process_fc04(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-    // Legacy: version string block at 0x0200 (full 32-register read only)
-    if (addr == 0x0200 && count == 0x20u) {
+    // Legacy: version string block at FC04_VERSION_BLOCK (full 32-register read only)
+    if (addr == FC04_VERSION_BLOCK && count == 0x20u) {
         buf[2] = 64u;
         memset(buf + 3, 0, 64u);
         snprintf((char *)(buf + 3), 64u,
@@ -193,11 +193,11 @@ static void process_fc04(void) {
     }
 
     // Atomically read-and-clear dirty flags if the read spans the dirty range
-    if (addr + count > 0x0159u && addr <= 0x015Cu) {
-        uint16_t d_start = (addr    < 0x0159u) ? 0x0159u : addr;
-        uint16_t d_end   = (addr + count - 1u > 0x015Cu) ? 0x015Cu : (addr + count - 1u);
+    if (addr + count > FC04_DIRTY_BASE && addr <= FC04_DIRTY_END) {
+        uint16_t d_start = (addr < FC04_DIRTY_BASE) ? FC04_DIRTY_BASE : addr;
+        uint16_t d_end   = (addr + count - 1u > FC04_DIRTY_END) ? FC04_DIRTY_END : (addr + count - 1u);
         for (uint16_t a = d_start; a <= d_end; a++)
-            regs_read_clear_dirty((uint8_t)(a - 0x0159u));
+            regs_read_clear_dirty((uint8_t)(a - FC04_DIRTY_BASE));
     }
 
     buf[2] = (uint8_t)(count * 2u);
@@ -231,11 +231,12 @@ static void process_fc03(void) {
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
-    if (mb_reg == 0x1000 || mb_reg == 0x1001) {
+    if (mb_reg == MBREG_RAW_CMD || mb_reg == MBREG_RAW_CMD_TWICE) {
         // Raw DALI: [15:8]=first frame byte, [7:0]=second frame byte.
         // The two bytes are sent as-is; they can encode any valid DALI forward frame
         // (addressed, group, broadcast, or special command).
-        // 0x1000 = single send (waits for response); 0x1001 = send twice (no response expected).
+        // MBREG_RAW_CMD = single send (waits for response);
+        // MBREG_RAW_CMD_TWICE = send twice (no response expected).
         // Reject if a previous raw command is still pending.
         bool pending;
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
@@ -244,7 +245,7 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         }
         if (pending) return MB_ERR_DEVICE_BUSY;
 
-        bool is_twice = (mb_reg == 0x1001);
+        bool is_twice = (mb_reg == MBREG_RAW_CMD_TWICE);
         cmd_entry_t entry = {
             .type        = is_twice ? CMD_SEND_TWICE : CMD_QUERY,
             .dali_addr   = (uint8_t)(val >> 8),
@@ -261,7 +262,7 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         cmdq_kick();
         return 0;
     }
-    if (mb_reg == 0x1002) {
+    if (mb_reg == MBREG_DAPC) {
         // DAPC: [15:8]=DALI addr byte, [7:0]=arc level
         uint8_t dali_addr_byte = (uint8_t)(val >> 8);
         uint8_t arc_level      = (uint8_t)val;
@@ -272,14 +273,14 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         cmdq_kick();
         return 0;
     }
-    if (mb_reg == 0x1010) {
+    if (mb_reg == MBREG_SCAN_TRIGGER) {
         if (val == 0x0001) bgtasks_trigger_scan();
         return 0;
     }
-    if (mb_reg == 0x100B || mb_reg == 0x100C || mb_reg == 0x100D) {
+    if (mb_reg == MBREG_SET_DTR0 || mb_reg == MBREG_SET_DTR1 || mb_reg == MBREG_SET_DTR2) {
         // Set DTR0/DTR1/DTR2: low byte of val is the DTR data byte.
-        uint8_t dtr_addr = (mb_reg == 0x100B) ? DALI_ADDR_SET_DTR0 :
-                           (mb_reg == 0x100C) ? DALI_ADDR_SET_DTR1 : DALI_ADDR_SET_DTR2;
+        uint8_t dtr_addr = (mb_reg == MBREG_SET_DTR0) ? DALI_ADDR_SET_DTR0 :
+                           (mb_reg == MBREG_SET_DTR1) ? DALI_ADDR_SET_DTR1 : DALI_ADDR_SET_DTR2;
         cmdq_push_cmd(dtr_addr, (uint8_t)val, 0xFF);
         cmdq_kick();
         return 0;

@@ -51,7 +51,49 @@ extern register_map_t g_regs;
 extern volatile dali_response_type_t g_raw_resp_type;
 extern volatile uint8_t              g_raw_resp_byte;
 
-#define FC04_MAX_ADDR   0x015D
+// ---- FC04 input register addresses ----------------------------------------
+
+#define FC04_DIRTY_BASE     0x0159u  // first dirty word register (4 words: 0x0159-0x015C)
+#define FC04_DIRTY_END      0x015Cu  // last dirty word register
+#define FC04_RAW_RESULT     0x015Du  // async raw DALI command result (see RAW_RESULT_*)
+#define FC04_MAX_ADDR       FC04_RAW_RESULT
+
+// ---- FC04 / FC03 special block addresses ----------------------------------
+
+#define FC04_VERSION_BLOCK  0x0200u  // version string, 32 registers, read-only
+
+// ---- Modbus holding register (FC03/FC06) addresses ------------------------
+
+// Raw DALI forward frame — [15:8]=frame byte 0, [7:0]=frame byte 1
+#define MBREG_RAW_CMD           0x1000u  // single send, waits for response
+#define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
+
+// Direct arc power control — [15:8]=DALI address byte, [7:0]=arc level
+#define MBREG_DAPC              0x1002u
+
+// Per-ballast action commands — write low byte = DALI address byte
+#define MBREG_GOTO_LAST_ACTIVE  0x1003u
+#define MBREG_OFF               0x1004u
+#define MBREG_UP                0x1005u
+#define MBREG_DOWN              0x1006u
+#define MBREG_STEP_UP           0x1007u
+#define MBREG_STEP_DOWN         0x1008u
+#define MBREG_RECALL_MAX        0x1009u
+#define MBREG_RECALL_MIN        0x100Au
+
+// DTR set commands — write low byte = value to load into DTR
+#define MBREG_SET_DTR0          0x100Bu
+#define MBREG_SET_DTR1          0x100Cu
+#define MBREG_SET_DTR2          0x100Du
+
+// Bus scan — write 0x0001 to trigger a full bus scan
+#define MBREG_SCAN_TRIGGER      0x1010u
+
+// Configuration registers (persisted to EEPROM)
+#define MBREG_POLL_INTERVAL     0x1011u  // units: 100ms, range 1-65535
+#define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
+#define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400
+
 #define SCAN_IDLE       0
 #define SCAN_SCANNING   1
 #define SCAN_COMPLETE   2

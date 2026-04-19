@@ -61,15 +61,18 @@ void regs_read_input_bulk(uint16_t addr, uint8_t count, uint8_t *buf) {
 bool regs_read_holding(uint16_t addr, uint16_t *val) {
     switch (addr) {
         // Action registers read as 0 (write-only by convention)
-        case 0x1000: case 0x1001: case 0x1002: case 0x1003:
-        case 0x1004: case 0x1005: case 0x1006: case 0x1007:
-        case 0x1008: case 0x1009: case 0x100A:
-        case 0x100B: case 0x100C: case 0x100D: case 0x1010:
+        case MBREG_RAW_CMD:       case MBREG_RAW_CMD_TWICE:
+        case MBREG_DAPC:
+        case MBREG_GOTO_LAST_ACTIVE: case MBREG_OFF:          case MBREG_UP:
+        case MBREG_DOWN:          case MBREG_STEP_UP:         case MBREG_STEP_DOWN:
+        case MBREG_RECALL_MAX:    case MBREG_RECALL_MIN:
+        case MBREG_SET_DTR0:      case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
+        case MBREG_SCAN_TRIGGER:
             *val = 0;
             return true;
-        case 0x1011: *val = g_regs.poll_interval;   return true;
-        case 0x1012: *val = g_regs.mb_slave_addr;   return true;
-        case 0x1013: *val = g_regs.baud_index;      return true;
+        case MBREG_POLL_INTERVAL: *val = g_regs.poll_interval;  return true;
+        case MBREG_SLAVE_ADDR:    *val = g_regs.mb_slave_addr;  return true;
+        case MBREG_BAUD_INDEX:    *val = g_regs.baud_index;     return true;
         default:     return false;
     }
 }
@@ -78,24 +81,27 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
 
 bool regs_write_holding(uint16_t addr, uint16_t val) {
     switch (addr) {
-        case 0x1011:
+        case MBREG_POLL_INTERVAL:
             g_regs.poll_interval = (val == 0) ? 1 : val;
             return true;
-        case 0x1012:
+        case MBREG_SLAVE_ADDR:
             if (val < 1 || val > 247) return false;
             g_regs.mb_slave_addr = (uint8_t)val;
             eeprom_update_byte(&ee_slave_addr, g_regs.mb_slave_addr);
             return true;
-        case 0x1013:
+        case MBREG_BAUD_INDEX:
             if (val > 2) return false;
             g_regs.baud_index = (uint8_t)val;
             eeprom_update_byte(&ee_baud_index, g_regs.baud_index);
             return true;
         // Action registers: caller handles DALI dispatch
-        case 0x1000: case 0x1001: case 0x1002: case 0x1003:
-        case 0x1004: case 0x1005: case 0x1006: case 0x1007:
-        case 0x1008: case 0x1009: case 0x100A:
-        case 0x100B: case 0x100C: case 0x100D: case 0x1010:
+        case MBREG_RAW_CMD:       case MBREG_RAW_CMD_TWICE:
+        case MBREG_DAPC:
+        case MBREG_GOTO_LAST_ACTIVE: case MBREG_OFF:          case MBREG_UP:
+        case MBREG_DOWN:          case MBREG_STEP_UP:         case MBREG_STEP_DOWN:
+        case MBREG_RECALL_MAX:    case MBREG_RECALL_MIN:
+        case MBREG_SET_DTR0:      case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
+        case MBREG_SCAN_TRIGGER:
             return true;
         default:
             return false;

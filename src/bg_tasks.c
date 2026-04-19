@@ -1,5 +1,6 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <avr/pgmspace.h>
 #include <util/atomic.h>
 #include "bg_tasks.h"
 #include "registers.h"
@@ -24,11 +25,31 @@ static volatile bool     fade_poll_due   = false;
 
 // ---- Bus scan state ------------------------------------------------
 
-static volatile bool    scan_active     = false;
-static volatile uint8_t scan_addr       = 0;
-static volatile uint8_t scan_err_count  = 0;
+static volatile bool    scan_active      = false;
+static volatile uint8_t scan_addr        = 0;
+static volatile uint8_t scan_err_count   = 0;
+static volatile uint8_t scan_query_step  = 0;  // index into scan_queries[] during data reads
 
 static void enqueue_scan_for_addr(uint8_t addr);  // forward decl
+
+// ---- Per-ballast data query sequence (PROGMEM) ---------------------
+// After confirming a ballast is present, these queries are issued one
+// at a time via scan_next_query, allowing the fade poller to interleave.
+
+typedef struct { uint8_t dali_cmd; reg_target_t reg_target; } scan_query_t;
+
+static const scan_query_t scan_queries[] PROGMEM = {
+    { DALI_CMD_QUERY_ACTUAL_LEVEL,   REG_BRIGHTNESS },
+    { DALI_CMD_QUERY_MIN_LEVEL,      REG_MIN        },
+    { DALI_CMD_QUERY_MAX_LEVEL,      REG_MAX        },
+    { DALI_CMD_QUERY_POWER_ON_LEVEL, REG_POWER_ON   },
+    { DALI_CMD_QUERY_FAIL_LEVEL,     REG_SYS_FAIL   },
+    { DALI_CMD_QUERY_FADE_RATE,      REG_FADE_RATE  },
+    { DALI_CMD_QUERY_FADE_TIME,      REG_FADE_TIME  },
+    { DALI_CMD_QUERY_GROUP_0_7,      REG_GROUP_0_7  },
+    { DALI_CMD_QUERY_GROUP_8_15,     REG_GROUP_8_15 },
+};
+#define NUM_SCAN_QUERIES (sizeof(scan_queries) / sizeof(scan_queries[0]))
 
 // ---- Scan callbacks (run in ISR context) ---------------------------
 
@@ -44,28 +65,34 @@ static void scan_advance(dali_response_type_t type, uint8_t ballast_idx, uint8_t
     }
 }
 
+// ISR callback: push the next query in the per-ballast data sequence, one per invocation.
+// When all queries are done, calls scan_advance to move to the next ballast address.
+// Queuing one command at a time keeps the queue from overflowing and lets the fade
+// poller interleave between scan commands.
+static void scan_next_query(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
+    (void)type; (void)response;
+    uint8_t step = scan_query_step;
+    if (step >= NUM_SCAN_QUERIES) {
+        scan_advance(DALI_RESPONSE_OK, ballast_idx, 0);
+        return;
+    }
+    scan_query_step = step + 1u;
+    uint8_t      dali_cmd  = pgm_read_byte(&scan_queries[step].dali_cmd);
+    reg_target_t reg_tgt   = (reg_target_t)pgm_read_byte(&scan_queries[step].reg_target);
+    uint8_t      dali_addr = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
+    cmdq_push_query_cb(dali_addr, dali_cmd, ballast_idx, reg_tgt, scan_next_query);
+}
+
 // ISR callback: handle the QUERY_STATUS result for one ballast during a bus scan.
-// OK  → mark present and queue data reads (brightness, min/max, fade, groups).
-// NAK → mark absent and advance.
+// OK  → mark present, reset query step, kick off sequential data reads.
+// NAK → mark absent and advance to next ballast.
 // Other → retry up to 3 times, then treat as absent.
 static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
     if (type == DALI_RESPONSE_OK) {
-        scan_err_count = 0;
+        scan_err_count  = 0;
+        scan_query_step = 0;
         regs_set_present(ballast_idx, true);
-
-        // Queue remaining data queries for this ballast.
-        // scan_advance callback fires on the last one.
-        uint8_t dali_addr_byte = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_ACTUAL_LEVEL,   ballast_idx, REG_BRIGHTNESS);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_MIN_LEVEL,      ballast_idx, REG_MIN);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_MAX_LEVEL,      ballast_idx, REG_MAX);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_POWER_ON_LEVEL, ballast_idx, REG_POWER_ON);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_FAIL_LEVEL,     ballast_idx, REG_SYS_FAIL);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_FADE_RATE,      ballast_idx, REG_FADE_RATE);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_FADE_TIME,      ballast_idx, REG_FADE_TIME);
-        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_GROUP_0_7,      ballast_idx, REG_GROUP_0_7);
-        cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_GROUP_8_15,  ballast_idx, REG_GROUP_8_15,
-                           scan_advance);
+        scan_next_query(type, ballast_idx, response);
     } else if (type == DALI_RESPONSE_NAK) {
         scan_err_count = 0;
         regs_clear_ballast(ballast_idx);

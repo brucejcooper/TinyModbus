@@ -89,7 +89,7 @@ extern volatile uint8_t              g_raw_resp_byte;
 #define MBREG_SCAN_TRIGGER      0x1010u
 
 // Configuration registers (persisted to EEPROM)
-#define MBREG_POLL_INTERVAL     0x1011u  // units: 100ms, range 1-65535
+#define MBREG_RESCAN_INTERVAL   0x1011u  // seconds between periodic bus rescans; 0 = disabled
 #define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
 #define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400
 
@@ -149,5 +149,7 @@ void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_gro
 // Recompute group_status[group_idx].status by ORing the status of all member ballasts.
 void     regs_rebuild_group_status(uint8_t group_idx);
 
+// Return the current periodic rescan interval in seconds (0 = disabled).
+uint16_t regs_get_rescan_interval(void);
 
 #endif

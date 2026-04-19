@@ -9,11 +9,10 @@
 #include "tick.h"
 
 // ---- RTC / periodic rescan ----------------------------------------
+// Period is set by holding register MBREG_RESCAN_INTERVAL (default 64 s, 0 = disabled).
+// RTC PIT fires at 1 Hz (CYC1024 on 1 kHz internal osc).
 
-#define RESCAN_PERIOD_S    64u
-#define RTC_PIT_HZ         1u    // CYC1024 on 1 kHz internal osc
-
-static volatile uint8_t  rescan_counter  = RESCAN_PERIOD_S;
+static volatile uint16_t rescan_counter  = 64u;  // matches default MBREG_RESCAN_INTERVAL
 static volatile bool     scan_trigger    = false;
 
 // ---- Fade chain state ---------------------------------------------
@@ -179,8 +178,9 @@ void bgtasks_run(void) {
 // ---- RTC PIT — periodic rescan (same cadence as original) ----------
 
 ISR(RTC_PIT_vect) {
-    if (--rescan_counter == 0) {
-        rescan_counter = RESCAN_PERIOD_S;
+    uint16_t interval = regs_get_rescan_interval();
+    if (interval > 0 && --rescan_counter == 0) {
+        rescan_counter = interval;
         scan_trigger   = true;
     }
     RTC.PITINTFLAGS = RTC_PI_bm;

@@ -300,7 +300,7 @@ When a command completes (or NAKs), `cmdq_result_received()` (in `dali_state_idl
 
 ### Periodic Rescan
 
-The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator). A software counter counts down from 64, triggering `bgtasks_trigger_scan()` every ~64 seconds. The scan walks all 64 DALI addresses in order using a chained callback pattern — one query command at a time — issuing 9 queries per responding device (status, brightness, min, max, power-on, sys-fail, fade rate, fade time, groups 0–7, groups 8–15). The chain approach keeps the 8-entry queue from overflowing and allows the fade tracker to interleave between scan commands.
+The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator). A software counter counts down from the value of holding register `RESCAN_INTERVAL` (0x1011, default 64), triggering `bgtasks_trigger_scan()` on expiry. Writing 0 to the register disables periodic rescans; a manual scan can still be triggered at any time via `SCAN_TRIGGER` (0x1010). The scan walks all 64 DALI addresses in order using a chained callback pattern — one query command at a time — issuing 9 queries per responding device (status, brightness, min, max, power-on, sys-fail, fade rate, fade time, groups 0–7, groups 8–15). The chain approach keeps the 8-entry queue from overflowing and allows the fade tracker to interleave between scan commands.
 
 ### Multi-Master Behaviour
 
@@ -363,8 +363,8 @@ All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-
 | 0x100B | SET_DTR0 | 0 | Low byte = value to load into DALI DTR0. |
 | 0x100C | SET_DTR1 | 0 | Low byte = value to load into DALI DTR1. |
 | 0x100D | SET_DTR2 | 0 | Low byte = value to load into DALI DTR2. |
-| 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to start a full bus scan. |
-| 0x1011 | POLL_INTERVAL | R/W | Retained for register-map compatibility; no longer drives behaviour. |
+| 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to start a full bus scan immediately. |
+| 0x1011 | RESCAN_INTERVAL | R/W | Seconds between automatic periodic bus rescans. Default 64. Write 0 to disable. |
 | 0x1012 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to EEPROM on write. |
 | 0x1013 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to EEPROM on write. |
 

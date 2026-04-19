@@ -6,7 +6,7 @@
 
 register_map_t g_regs;
 
-static uint16_t s_poll_interval = 5;
+static uint16_t s_rescan_interval = 64u;
 
 volatile dali_response_type_t g_raw_resp_type = DALI_RESPONSE_PENDING;
 volatile uint8_t              g_raw_resp_byte  = 0;
@@ -23,7 +23,7 @@ void regs_init(void) {
         g_regs.block0[i].brightness = 0xFF;
     }
 
-    s_poll_interval = 5;
+    s_rescan_interval = 64u;
 
     // Slave address: EEPROM first, fall back to USERROW formula
     uint8_t ee_addr = eeprom_read_byte(&ee_slave_addr);
@@ -72,7 +72,7 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         case MBREG_SCAN_TRIGGER:
             *val = 0;
             return true;
-        case MBREG_POLL_INTERVAL: *val = s_poll_interval;  return true;
+        case MBREG_RESCAN_INTERVAL: *val = s_rescan_interval; return true;
         case MBREG_SLAVE_ADDR:    *val = g_regs.mb_slave_addr;  return true;
         case MBREG_BAUD_INDEX:    *val = g_regs.baud_index;     return true;
         default:     return false;
@@ -83,8 +83,8 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
 
 bool regs_write_holding(uint16_t addr, uint16_t val) {
     switch (addr) {
-        case MBREG_POLL_INTERVAL:
-            s_poll_interval = (val == 0) ? 1 : val;
+        case MBREG_RESCAN_INTERVAL:
+            s_rescan_interval = val;  // 0 = disable periodic rescans
             return true;
         case MBREG_SLAVE_ADDR:
             if (val < 1 || val > 247) return false;
@@ -206,4 +206,8 @@ void regs_rebuild_group_status(uint8_t group_idx) {
             merged_status |= g_regs.block0[ballast_idx].status;
     }
     g_regs.group_status[group_idx].status = merged_status;
+}
+
+uint16_t regs_get_rescan_interval(void) {
+    return s_rescan_interval;
 }

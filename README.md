@@ -82,7 +82,7 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 | 1  | group (0–15) | 1 | Command to group |
 | 1  | 1111111 | 1 | Broadcast command |
 
-This implementation uses **short addresses only** (individual device addresses 0–63).
+The per-ballast query registers in this firmware use short addresses (0–63). The DAPC, action, and raw command registers accept any valid DALI address byte, so group and broadcast commands are also supported.
 
 ### Command Types
 
@@ -183,7 +183,7 @@ The firmware implements a five-state machine that drives all DALI bus activity. 
 
 Two hardware timers underpin the state machine:
 
-- **TCA0** — the half-bit clock. Runs continuously at 10 MHz with a period of exactly one DALI half-bit (416.67 µs). On each overflow it decrements a countdown (`daliTimer`) and fires a registered callback (`daliTimerCallback`) when the countdown reaches zero. This drives both transmission timing and state-machine timeouts. It is configured as the highest-priority interrupt so bit-level timing is not displaced by other ISRs.
+- **TCA0** — the half-bit clock. Runs continuously at 10 MHz with a period of exactly one DALI half-bit (416.67 µs). On each overflow it decrements a countdown (`dali_timer`) and fires a registered callback (`dali_timer_cb`) when the countdown reaches zero. This drives both transmission timing and state-machine timeouts. It is configured as the highest-priority interrupt (CPU interrupt level 1) so bit-level timing is not displaced by other ISRs.
 - **TCB0** — the pulse-width capture timer. Active only during the RECEIVING state. Configured in Frequency Measurement mode and fed by the DALI RX pin via the AVR event system. It captures the time between consecutive edges, giving the width of each Manchester pulse without CPU polling.
 
 ### States
@@ -233,11 +233,11 @@ The bus is quiet and we own it. Two things can happen:
 
 Sends the 16-bit forward frame using Manchester encoding driven entirely by TCA0 callbacks:
 
-1. Load the 16-bit command word into `shiftReg`, set `bitsLeft = 17`.
-2. Schedule `sendOne()` via `daliTimer = 1` (one half-bit tick).
-3. `sendOne()` drives TX high and schedules `halfBitToggle()`.
-4. `halfBitToggle()` toggles TX (completing the mid-bit transition), schedules the next bit's first-half function (`sendOne` or `sendZero` from the MSB of `shiftReg`), shifts `shiftReg` left, decrements `bitsLeft`.
-5. When `bitsLeft == 0`, schedules `startStopBits()`, which drives TX low for 4 Te (two full stop bits).
+1. Load the 16-bit command word into `shift_reg`, set `bits_left = 17`.
+2. Schedule `send_one()` via `dali_timer = 1` (one half-bit tick).
+3. `send_one()` drives TX high and schedules `half_bit_toggle()`.
+4. `half_bit_toggle()` toggles TX (completing the mid-bit transition), schedules the next bit's first-half function (`send_one` or `send_zero` from the MSB of `shift_reg`), shifts `shift_reg` left, decrements `bits_left`.
+5. When `bits_left == 0`, schedules `start_stop_bits()`, which drives TX low for 4 Te (two full stop bits).
 6. After stop bits: calls `dali_wait_for_response_state_enter()`.
 
 Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
@@ -247,7 +247,7 @@ Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
 After the forward frame the master must listen for a backward frame within 7–22 Te. This state:
 - Pre-configures TCB0 for pulse capture (`dali_state_receiving_prepare()`).
 - Arms a one-shot rising-edge interrupt on RX. A rising edge means a backward frame start bit is arriving; we call `dali_state_receiving_enter()`.
-- Sets a TCA0 timeout of 22 Te. If it fires before any edge, the device did not respond: call `process_command_response(DALI_RESPONSE_NAK, 0)` and return to IDLE.
+- Sets a TCA0 timeout of 22 Te. If it fires before any edge, the device did not respond: call `cmdq_result_received(DALI_RESPONSE_NAK, 0)` and return to IDLE.
 
 Commands that do not expect a response (e.g. DAPC, Off) still pass through this state; the NAK timeout simply confirms silence and the state machine moves on.
 
@@ -269,9 +269,9 @@ MIDDLE_1    START_1,   no shift               MIDDLE_0, shift 0
 
 The *short* pulse is a half-bit transition (mid-bit); the *long* pulse spans a full bit and carries the same bit value as the previous bit (a "stretched" transition at the bit boundary).
 
-TCA0 is re-armed to 5 Te on every edge. When TCA0 fires with no new edge — i.e. the bus has been idle for more than two full bits — `timerOverflow()` is called:
-- If the final state is `START_0` or `MIDDLE_1` **and** exactly 8 bits were received: `process_command_response(DALI_RESPONSE_OK, shiftreg)`.
-- Otherwise: `process_command_response(DALI_RESPONSE_MALFORMED, 0)`.
+TCA0 is re-armed to 5 Te on every edge. When TCA0 fires with no new edge — i.e. the bus has been idle for more than two full bits — `timer_overflow()` is called:
+- If the final state is `START_0` or `MIDDLE_1` **and** exactly 8 bits were received: `cmdq_result_received(DALI_RESPONSE_OK, shift_reg)`.
+- Otherwise: `cmdq_result_received(DALI_RESPONSE_MALFORMED, 0)`.
 
 Either way, transitions to WAIT_FOR_IDLE to enforce the minimum inter-frame gap.
 
@@ -285,19 +285,22 @@ Enforces the DALI requirement that the bus be idle for at least 22 Te before the
 
 ### Command Queue
 
-`dali_queue_command()` (in `dali_state_idle.c`) appends to a 20-entry ring buffer. Each entry holds:
-- `cmd` — the 16-bit DALI command word
-- `callback` — function to call when the command completes (receives response type, original command, response byte)
-- `repeat` — how many times to send before dequeuing (1 for normal commands, 2 for set commands that require the double-send)
+`cmdq_push*()` (in `cmd_queue.c`) appends to an 8-entry ring buffer (`CMD_QUEUE_SIZE = 8`). Each entry (`cmd_entry_t`) holds:
+- `type` — `CMD_DIRECT_ARC`, `CMD_SEND`, `CMD_SEND_TWICE`, or `CMD_QUERY`
+- `dali_addr` / `dali_cmd` — the two bytes of the DALI forward frame
+- `ballast_idx` — short address (0–63) used to index into the register map; 0xFF for group/broadcast
+- `reg_target` — which register field to update with the response (`REG_BRIGHTNESS`, `REG_STATUS`, etc.)
+- `repeat` — remaining send count (2 for `CMD_SEND_TWICE`, 1 otherwise)
+- `on_result` — optional callback fired from ISR context when the command completes
 
-When a command completes (or NAKs), `process_command_response()` is called. It:
-1. Automatically mirrors the response byte into the appropriate holding register bank based on the command type (e.g. `QUERY_STATUS` → status byte of that device's register, `GET_LEVEL` → low byte of the status bank register).
-2. Decrements the repeat counter; if > 0, re-queues the same command for a second send without calling the callback.
-3. Once repeat reaches 0, calls the callback and removes the entry from the queue.
+When a command completes (or NAKs), `cmdq_result_received()` (in `dali_state_idle.c`) is called. It:
+1. Stores the response byte into the register field named by `reg_target` (via `regs_apply_result()`).
+2. For `CMD_SEND_TWICE`: decrements `repeat` and re-dispatches without popping or calling the callback.
+3. Fires `on_result` if set, then pops the queue and enters the next state.
 
 ### Periodic Rescan
 
-The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator). A software counter (`rescan_counter`) counts down from 64, triggering `dali_start_background_scan(0)` approximately every 65 seconds. The scan walks all 64 DALI addresses in order, issuing 10 query commands per device and caching the results in the holding register banks.
+The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator). A software counter counts down from 64, triggering `bgtasks_trigger_scan()` every ~64 seconds. The scan walks all 64 DALI addresses in order using a chained callback pattern — one query command at a time — issuing 9 queries per responding device (status, brightness, min, max, power-on, sys-fail, fade rate, fade time, groups 0–7, groups 8–15). The chain approach keeps the 8-entry queue from overflowing and allows the fade tracker to interleave between scan commands.
 
 ### Multi-Master Behaviour
 
@@ -311,76 +314,89 @@ The firmware detects transmissions from other DALI masters on the bus: if a risi
 
 Modbus RTU, RS-485, **9600 baud, 8N1**.
 
-Device address is stored in byte 0 of the `USERROW` EEPROM. The value stored has 2 added to it, so the factory default (`0xFF`) yields device address 1. Write `0x00` for address 2, etc.
-
-```sh
-pymcuprog -t uart -u ${PORT} -d ${DEVICE} -m user_row write -l 0x01
-```
+The slave address (1–247) is stored in EEPROM (holding register 0x1012, persisted on write). On first boot (EEPROM blank), it falls back to `USERROW[0] + 2` — so the factory default (`0xFF`) gives address 1. The baud rate (holding register 0x1013, default 0 = 9600) is also persisted to EEPROM.
 
 ### Function Codes
 
 | Code | Name | Description |
 |------|------|-------------|
-| 0x01 | Read Coils | Read DALI device presence (1=present, 0=absent) |
-| 0x03 | Read Holding Registers | Read cached DALI device parameters |
-| 0x04 | Read Input Registers | Read device info string |
-| 0x05 | Write Single Coil | Toggle/on/off a single DALI device |
-| 0x06 | Write Single Holding Register | Write a DALI device parameter |
-| 0x0F | Write Multiple Coils | (stub — not yet implemented) |
-| 0x44 | Custom: Execute DALI Command | Send a raw 16-bit DALI command and get the response |
+| 0x03 | Read Holding Registers | Read configuration registers |
+| 0x04 | Read Input Registers | Read ballast data and device info |
+| 0x06 | Write Single Holding Register | Send a DALI command or update config |
+| 0x10 | Write Multiple Holding Registers | Write a block of holding registers |
+| 0x44 | Custom: Execute DALI Command | Synchronous raw DALI command (legacy) |
 
-### Holding Register Map
+### FC04 — Input Register Map
 
-Holding registers are arranged in five **banks** of 64 registers, one register per DALI device address.
+All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-bit, addressed from 0x0000.
 
-```
-Register address = (bank × 64) + DALI_short_address
-```
+| Address range | Width | Content |
+|---------------|-------|---------|
+| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness (high byte = DALI status bits, low byte = arc level; 0xFF = absent) |
+| 0x0040–0x007F | 64 regs | Per-ballast min \| max level |
+| 0x0080–0x00BF | 64 regs | Per-ballast power-on \| sys-fail level |
+| 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time |
+| 0x0100–0x010F | 16 regs | Group status — OR of all member ballast status bytes |
+| 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group) |
+| 0x0150 | 1 reg | Scan status: 0 = idle, 1 = scanning, 2 = complete |
+| 0x0151–0x0154 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
+| 0x0155–0x0158 | 4 regs | Fading bitmask — set when DALI status fade-running bit is active |
+| 0x0159–0x015C | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
+| 0x015D | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
+| 0x0200–0x021F | 32 regs | Version string: `Mechination DALI v<maj>.<min> ID:<10-byte-hex-serial>` |
 
-| Bank | Address range | Register content | Write behaviour |
-|------|--------------|------------------|-----------------|
-| 0 — Status | 0–63 | High byte: status bits; Low byte: current arc level | Write low byte only (0–254) → sends DAPC |
-| 1 — Min/Max | 64–127 | High byte: max level; Low byte: min level | Writes both min and max via DTR0 |
-| 2 — Fade | 128–191 | High byte: fade time; Low byte: fade rate | Writes fade rate then fade time via DTR0 |
-| 3 — Power | 192–255 | High byte: power-fail level; Low byte: power-on level | Writes both via DTR0 |
-| 4 — Groups | 256–319 | 16-bit bitmask of group membership (bit N = group N) | Diffs against cached value and issues Add/Remove per changed bit |
+### FC03/FC06/FC10 — Holding Register Map
 
-All values are cached in RAM and refreshed by the background scan. A write immediately sends the corresponding DALI command(s) and updates the cache.
+| Address | Name | Read | Write |
+|---------|------|------|-------|
+| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x015D. Returns DEVICE_BUSY if previous result not yet read. |
+| 0x1001 | RAW_CMD_TWICE | 0 | Same frame format as 0x1000 but sent twice (for DALI set commands). No backward frame expected. |
+| 0x1002 | DAPC | 0 | `[15:8]` = DALI address byte, `[7:0]` = arc level. Sends Direct Arc Power Control. |
+| 0x1003 | GOTO_LAST_ACTIVE | 0 | Low byte = DALI address byte. Sends Go To Last Active. |
+| 0x1004 | OFF | 0 | Low byte = DALI address byte. Sends Off. |
+| 0x1005 | UP | 0 | Low byte = DALI address byte. Sends Up. |
+| 0x1006 | DOWN | 0 | Low byte = DALI address byte. Sends Down. |
+| 0x1007 | STEP_UP | 0 | Low byte = DALI address byte. Sends Step Up. |
+| 0x1008 | STEP_DOWN | 0 | Low byte = DALI address byte. Sends Step Down. |
+| 0x1009 | RECALL_MAX | 0 | Low byte = DALI address byte. Sends Recall Max Level. |
+| 0x100A | RECALL_MIN | 0 | Low byte = DALI address byte. Sends Recall Min Level. |
+| 0x100B | SET_DTR0 | 0 | Low byte = value to load into DALI DTR0. |
+| 0x100C | SET_DTR1 | 0 | Low byte = value to load into DALI DTR1. |
+| 0x100D | SET_DTR2 | 0 | Low byte = value to load into DALI DTR2. |
+| 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to start a full bus scan. |
+| 0x1011 | POLL_INTERVAL | R/W | Retained for register-map compatibility; no longer drives behaviour. |
+| 0x1012 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to EEPROM on write. |
+| 0x1013 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to EEPROM on write. |
 
-### Write Single Coil (0x05) — Simple On/Off/Toggle
+The DALI address byte for action registers (0x1003–0x100A) can be any valid DALI address byte — short address, group address, or broadcast (0xFE) — encoded in the standard DALI format. The same applies to DAPC (0x1002) and the raw command registers (0x1000, 0x1001).
 
-Address = DALI short address (0–63).
+### Async Raw Command Result (FC04 0x015D)
 
-| Value | DALI action |
-|-------|-------------|
-| 0x55xx | Toggle (query level, then Off or GoToLastActive) |
-| 0xFFxx | Go To Last Active level |
-| 0x00xx | Off |
+After writing to 0x1000 (RAW_CMD), poll FC04 register 0x015D for the result:
 
-### Custom DALI Command (0x44)
+| Value | Meaning |
+|-------|---------|
+| 0x0000 | Idle — no command in progress |
+| 0xFF00 | Pending — command sent, awaiting response |
+| 0x0100 | NAK — no backward frame received |
+| 0x02xx | OK — backward frame received; low byte = response |
+| 0x03xx | Error — bus/timing fault; low byte = error subtype |
 
-Sends a raw 16-bit DALI forward frame and returns the backward frame response (if any).
+### Legacy Synchronous Raw Command (FC44)
 
-Request: `[device_id] [0x44] [cmd_hi] [cmd_lo] [repeat] [crc_lo] [crc_hi]`
+FC44 sends a raw DALI forward frame and blocks until the response arrives (up to 300 ms).
 
-- `cmd`: the 16-bit DALI command word (address byte in high byte, data byte in low byte)
-- `repeat`: 1 or 2 (set commands must be sent twice)
+Request: `[slave] [0x44] [frame_byte_0] [frame_byte_1] [repeat] [crc_lo] [crc_hi]`
 
-Response: `[device_id] [0x44] [response_byte] [crc_lo] [crc_hi]`
+- `repeat`: 1 = single send (query), 2 = send twice (set command, no response)
 
-On error (no response, collision, malformed), a Modbus exception is returned.
+Response: `[slave] [0x44] [response_byte] [crc_lo] [crc_hi]`
 
-### Input Registers (0x04)
+On error a Modbus exception is returned. Prefer FC06 0x1000 / 0x1001 for new integrations — FC44 blocks the Modbus loop for the full DALI transaction time.
 
-Reading input registers at address 0 returns a 64-byte ASCII device info string packed two bytes per register:
+### Fade Tracking
 
-```
-Mechination DALI v<major>.<minor> ID:<10-byte-hex-serial>
-```
-
-### Background Scan
-
-On startup the firmware scans all 64 DALI addresses in order, issuing the full query sequence (status, level, max, min, fade, power-on, power-fail, groups 0–7, groups 8–15) per device and caching the results in the holding register banks. Devices that do not respond get their registers zeroed (level bank set to `0xFF` as an absent marker). The scan repeats continuously to keep the cache fresh and to track fading.
+After any DAPC or arc command sent to a short address, the firmware starts a reactive STATUS → BRIGHTNESS → STATUS polling chain for that ballast. The chain continues until the DALI status fade-running bit (bit 4) clears, then stops. At most two DALI commands are queued per chain, so many concurrent fades do not overflow the command queue. The FC04 fading bitmask (0x0155–0x0158) reflects the current state from real DALI responses.
 
 ---
 
@@ -404,13 +420,17 @@ The device runs at 3.3 V, 10 MHz. It spends the majority of its time in Standby 
 
 ## Building
 
-Install `avr-gcc` with ATtiny1604 support and `pymcuprog`. The Homebrew version of avr-gcc does not include this CPU; use the Makefile target to download the Arduino-bundled toolchain instead.
+The project uses a bundled AVR-GCC toolchain in `avr/bin/` — do not use the system or Homebrew avr-gcc, as they lack ATtiny1604 support and produce incorrect results. Download the bundled toolchain once with:
 
 ```sh
 make download_gcc
-
-# Build and flash
-make
 ```
 
-Programming is via UPDI on the test point. Use a serial adapter wired as described in the [jtag2updi guide](https://github.com/SpenceKonde/AVR-Guidance/blob/master/UPDI/jtag2updi.md) with a USB-FTDI adapter.
+Then build and flash:
+
+```sh
+make build   # compile only
+make         # build, erase device, and flash
+```
+
+`pymcuprog` is required for flashing. Programming is via UPDI on the test point using a USB-UART adapter.

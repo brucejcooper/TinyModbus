@@ -11,14 +11,15 @@ volatile bool dali_idle = false;
 
 // ---- Internal helpers ---------------------------------------------------
 
+// Clear dali_idle and disarm bus-monitor edge detection before transmitting.
 static void cleanup(void) {
     dali_idle = false;
     dali_cancel_edge_detect();
 }
 
+// Rising edge detected while idle: another master has started a frame.
+// Yield, wait for the bus to settle, then re-enter to dispatch queued commands.
 static void external_message_started(void) {
-    // Another master is transmitting — wait for the bus to go idle, then
-    // re-enter to dispatch any queued commands.
     cleanup();
     dali_wait_for_idle_state_enter();
 }

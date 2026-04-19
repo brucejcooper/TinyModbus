@@ -56,31 +56,57 @@
 
 // ---- Public interface --------------------------------------------------
 
+// True while the state machine is idle and able to accept new commands.
 extern volatile bool dali_idle;
 
+// Initialise TX/RX pins, TCB0 edge-capture, RTC PIT for periodic rescan,
+// and enter wait-for-idle to let the bus settle after reset.
 void    dali_init(void);
+
+// Returns non-zero when the RX pin reads HIGH (bus held low by a ballast or collision).
+// The optocoupler on the RX path inverts the signal, so HIGH = bus shorted/active.
 uint8_t dali_is_bus_shorted(void);
 
-// Edge-detect one-shots (used by state files)
+// Arm a one-shot PORTB rising-edge interrupt; fires callback once then self-disarms.
 void dali_call_on_rising_once(void (*callback)(void));
+
+// Arm a one-shot PORTB low-level interrupt; fires callback once then self-disarms.
 void dali_call_on_low_once(void (*callback)(void));
+
+// Disarm the PORTB edge/level interrupt and clear the pending callback pointer.
 void dali_cancel_edge_detect(void);
 
-// State machine entry points (each lives in its own .c file)
+// If the queue is non-empty, begin transmitting the head command immediately.
+// Otherwise arm the bus-monitor to detect external traffic.
 void dali_idle_state_enter(void);
+
+// Begin transmitting cmd as a DALI forward frame (Manchester-encoded, 1200 baud).
+// Returns immediately; the timer ISR drives the rest of the transmission.
 void dali_transmitting_state_enter(const cmd_entry_t *cmd);
+
+// Enforce the mandatory 22 TE (~9 ms) inter-frame gap before the next TX.
+// Handles bus-shorted (another master active) by waiting for it to release first.
+// Has a 200 TE safety escape in case the bus never becomes idle.
 void dali_wait_for_idle_state_enter(void);
+
+// Arm TCB0 and a no-response timeout for the backward frame window that follows TX.
+// Must be called immediately after the last stop bit is sent.
 void dali_wait_for_response_state_enter(void);
 
-// RX state setup (called before the rising edge that starts a frame)
+// Configure TCB0 and the Manchester decoder without enabling the timer.
+// Call this before the rising edge that starts the backward frame.
 void dali_state_receiving_prepare(void);
+
+// Enable TCB0 and begin decoding the backward frame that has already started.
+// Assumes dali_state_receiving_prepare() was called first.
 void dali_state_receiving_enter(void);
 
-// Called by the receive state when a backward frame completes or times out.
-// Runs in ISR context — updates register, decrements repeat, pops queue.
+// Single authority for post-command state transitions — called from ISR context.
+// Updates the target register (if any), fires the optional callback, decrements
+// repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
 void cmdq_result_received(dali_response_type_t type, uint8_t value);
 
-// LED diagnostic (kept from original)
+// Diagnostic: bit-bang a byte at ~9600 baud on PB3 for oscilloscope/analyser.
 void pulse_led(uint8_t times);
 
 #endif

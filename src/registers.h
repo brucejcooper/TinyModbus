@@ -107,35 +107,50 @@ extern volatile uint8_t              g_raw_resp_byte;
 #define RAW_RESULT_OK(b)   (0x0200u | (uint8_t)(b))  // response received
 #define RAW_RESULT_ERR(e)  (0x0300u | (uint8_t)(e))  // bus/timing error
 
+// Initialise the register map to defaults and load persisted config from EEPROM.
+// Slave address preference: EEPROM > USERROW formula > 1.
 void     regs_init(void);
 
-// FC04 bulk read — memcpy-safe for aligned block reads
+// Copy count FC04 input registers starting at addr into buf (big-endian, 2 bytes each).
+// The register_map_t layout mirrors the FC04 address space, so this is a direct memcpy.
+// Caller must validate addr and count before calling.
 void     regs_read_input_bulk(uint16_t addr, uint8_t count, uint8_t *buf);
 
-// FC03 single-register read; false if address unknown
+// Read one FC03 holding register at addr into *val.
+// Returns false for any address not in the holding register map.
 bool     regs_read_holding(uint16_t addr, uint16_t *val);
 
-// FC06/FC10 write; false if address or value invalid.
-// Does NOT enqueue DALI commands — caller does that.
+// Write one FC06/FC10 holding register; validates value range for config registers.
+// Returns false if addr is unknown or val is out of range.
+// Does NOT enqueue DALI commands — dispatch_action_reg in modbus.c does that.
 bool     regs_write_holding(uint16_t addr, uint16_t val);
 
-// Update one field from a DALI query response
+// Store one field from a DALI query response into the appropriate register block.
+// Called from ISR context via cmdq_result_received; must be short.
 void     regs_apply_result(uint8_t ballast_idx, reg_target_t target, uint8_t value);
 
-// Apply a full DALI status byte: updates block0.status, fading bitmask, dirty bit
+// Apply a DALI status byte: updates block0.status, the fading bitmask, and the dirty bit.
 void     regs_apply_status(uint8_t ballast_idx, uint8_t dali_status);
 
+// Set or clear the present bit for ballast_idx in the present bitmask.
 void     regs_set_present(uint8_t ballast_idx, bool present);
+
+// Reset all register fields for ballast_idx to absent/default and clear its present bit.
 void     regs_clear_ballast(uint8_t ballast_idx);
 
-// Returns dirty word for ballasts [word_idx*16 .. word_idx*16+15] and clears it atomically
+// Atomically snapshot and clear dirty[word_idx] (covers ballasts word_idx*16 to word_idx*16+15).
+// Called by modbus FC04 handler to detect changed ballasts since the last read.
 uint16_t regs_read_clear_dirty(uint8_t word_idx);
 
-// Update group membership from QUERY_GROUP_0_7 or QUERY_GROUP_8_15 response byte
+// Recompute group membership for ballast_idx from a QUERY_GROUP response byte.
+// high_groups=false → groups 0–7; high_groups=true → groups 8–15.
+// Rebuilds all 16 group_status entries after updating the mask.
 void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups);
+
+// Recompute group_status[group_idx].status by ORing the status of all member ballasts.
 void     regs_rebuild_group_status(uint8_t group_idx);
 
-// Called by bg_tasks when poll_interval holding reg changes
+// Update poll_interval, clamping 0 to 1 (minimum 100 ms polling period).
 void     regs_set_poll_interval(uint16_t val);
 
 #endif

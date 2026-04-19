@@ -40,6 +40,7 @@ static const rx_state_t state_machine[STATE_ERROR + 1] = {
 
 static volatile uint8_t rx_state;
 
+// Stop TCB0 and cancel the DALI timer; called before handing results to cmdq.
 static void rx_cleanup(void) {
     TCB0.CTRLA   = 0;
     dali_timer   = 0;
@@ -47,6 +48,8 @@ static void rx_cleanup(void) {
     TCB0.INTCTRL = 0;
 }
 
+// No more edges within the timeout window; treat as end-of-frame.
+// A complete 8-bit backward frame is signalled OK; anything else is malformed.
 static void timer_overflow(void) {
     rx_cleanup();
     if ((rx_state == STATE_START_0 || rx_state == STATE_MIDDLE_1) && num_bits == 8)
@@ -55,6 +58,7 @@ static void timer_overflow(void) {
         cmdq_result_received(DALI_RESPONSE_MALFORMED, 0);
 }
 
+// A pulse fell outside valid half-bit or full-bit windows; report the specific error.
 static void send_rx_error(dali_response_type_t err) {
     rx_cleanup();
     cmdq_result_received(err, 0);

@@ -94,6 +94,7 @@ static const uint16_t crc_table[256] PROGMEM = {
 
 // ---- CRC helpers -------------------------------------------------------
 
+// CRC-16/IBM over len bytes; initial value 0xFFFF.  Uses PROGMEM lookup table.
 static uint16_t crc16(const uint8_t *data, uint8_t len) {
     uint16_t crc = 0xFFFF;
     while (len--) {
@@ -103,6 +104,7 @@ static uint16_t crc16(const uint8_t *data, uint8_t len) {
     return crc;
 }
 
+// Append the CRC-16 of the first len bytes of buf and set tx_sz = len + 2.
 static void append_crc(uint8_t len) {
     uint16_t crc = crc16(buf, len);
     buf[len]     = (uint8_t)crc;
@@ -112,6 +114,7 @@ static void append_crc(uint8_t len) {
 
 // ---- TX helpers --------------------------------------------------------
 
+// Finalise a response frame in buf (appends CRC) and begin DRE-driven transmission.
 static void start_tx(uint8_t payload_len) {
     append_crc(payload_len);
     rx_ptr = buf;    // reuse buf pointer for TX
@@ -119,6 +122,7 @@ static void start_tx(uint8_t payload_len) {
     USART0.CTRLA  = USART_RS485_EXT_gc | USART_DREIE_bm | USART_TXCIE_bm;
 }
 
+// Set the exception flag in buf[1], write the error code, and transmit.
 static void send_error(mb_err_t err) {
     buf[1] |= 0x80;
     buf[2]  = (uint8_t)err;
@@ -169,6 +173,8 @@ static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, u
 
 // ---- FC04 — read input registers ----------------------------------------
 
+// Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
+// at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.
 static void process_fc04(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
@@ -207,6 +213,8 @@ static void process_fc04(void) {
 
 // ---- FC03 — read holding registers --------------------------------------
 
+// Handle FC03 (Read Holding Registers).  Returns an exception if any address in
+// the requested range is not in the holding register map.
 static void process_fc03(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
@@ -302,6 +310,7 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
     return 0;
 }
 
+// Handle FC06 (Write Single Register): validate, update register map, dispatch DALI action.
 static void process_fc06(void) {
     uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t val  = ((uint16_t)buf[4] << 8) | buf[5];
@@ -316,6 +325,7 @@ static void process_fc06(void) {
     start_tx(6);
 }
 
+// Handle FC10 (Write Multiple Registers): validate, update register map, dispatch DALI actions.
 static void process_fc10(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
@@ -344,6 +354,7 @@ static void process_fc10(void) {
 
 // ---- FC44 — synchronous raw DALI command (legacy, blocking) ------------
 
+// Map a DALI response error to the nearest Modbus exception code.
 static mb_err_t dali_err_to_mb(dali_response_type_t t) {
     switch (t) {
         case DALI_RESPONSE_NAK:             return MB_ERR_TARGET_FAILED;
@@ -357,6 +368,9 @@ static mb_err_t dali_err_to_mb(dali_response_type_t t) {
     }
 }
 
+// Handle FC44 (legacy synchronous raw DALI command).
+// Blocks the Modbus loop for up to 300 ms while the DALI response arrives.
+// Prefer MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE for new integrations.
 static void process_fc44(void) {
     uint16_t dali_cmd = ((uint16_t)buf[2] << 8) | buf[3];
     uint8_t  repeat   = buf[4];
@@ -398,6 +412,8 @@ static void process_fc44(void) {
 
 // ---- Frame validation --------------------------------------------------
 
+// Return true if the frame in buf has a correct CRC, valid length for its function code,
+// and is addressed to this slave (or broadcast address 0).
 static bool frame_is_valid(void) {
     if (rx_crc != 0 || rx_sz < 5) return false;
     if (buf[0] != slave_addr && buf[0] != 0) return false;
@@ -423,6 +439,7 @@ static bool frame_is_valid(void) {
 
 // ---- RX ring-buffer reset -----------------------------------------------
 
+// Reset receive state for the next frame: rewind buf pointer, clear CRC accumulator.
 static void rx_reset(void) {
     rx_ptr  = buf;
     rx_crc  = 0xFFFF;

@@ -8,30 +8,35 @@
 static volatile uint16_t shift_reg;
 static volatile uint8_t  bits_left;
 
+// Last stop bit has been sent; arm the backward frame window.
 static void finished_transmission(void) {
     dali_wait_for_response_state_enter();
 }
 
 static void half_bit_toggle(void);
 
+// First half of a Manchester '1': drive TX high, schedule the midpoint toggle.
 static void send_one(void) {
     DALI_PORT.OUTSET     = DALI_TX_bm;
     dali_timer_cb = half_bit_toggle;
     dali_timer    = 1;
 }
 
+// First half of a Manchester '0': drive TX low, schedule the midpoint toggle.
 static void send_zero(void) {
     DALI_PORT.OUTCLR     = DALI_TX_bm;
     dali_timer_cb = half_bit_toggle;
     dali_timer    = 1;
 }
 
+// Drive TX low and hold for 2 TE (the DALI stop period), then signal completion.
 static void start_stop_bits(void) {
     DALI_PORT.OUTCLR     = DALI_TX_bm;
     dali_timer_cb = finished_transmission;
     dali_timer    = 4;
 }
 
+// Midpoint of a Manchester bit: toggle TX, then load the next bit or begin stop period.
 static void half_bit_toggle(void) {
     DALI_PORT.OUTTGL = DALI_TX_bm;
     if (--bits_left == 0) {

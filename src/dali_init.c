@@ -5,6 +5,8 @@
 #include "dali.h"
 #include "tick.h"
 
+// One-shot callback pointer armed by dali_call_on_rising_once / dali_call_on_low_once.
+// Cleared by the ISR immediately before firing so it cannot fire twice.
 void (*dali_rx_rising_callback)(void) = NULL;
 
 void dali_init(void) {

@@ -8,6 +8,8 @@
 volatile uint8_t   dali_timer    = 0;
 volatile tick_cb_t dali_timer_cb = NULL;
 
+// Configure TCA0 as the system timebase: overflow period = one DALI half-bit (~416 µs).
+// Assigns TCA0_OVF to CPU interrupt level 1 (highest) so it pre-empts other ISRs.
 void tick_init(void) {
     TCA0.SINGLE.CTRLA    = 0;
     TCA0.SINGLE.INTCTRL  = TCA_SINGLE_OVF_bm;
@@ -18,6 +20,8 @@ void tick_init(void) {
     TCA0.SINGLE.CTRLA    = TCA_SINGLE_CLKSEL_DIV1_gc | TCA_SINGLE_ENABLE_bm;
 }
 
+// Decrement dali_timer and fire dali_timer_cb when it reaches zero.
+// Called from the TCA0_OVF ISR every ~416 µs.
 void dali_tick(void) {
     if (dali_timer && (--dali_timer == 0))
         dali_timer_cb();

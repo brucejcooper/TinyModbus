@@ -32,6 +32,7 @@ static void enqueue_scan_for_addr(uint8_t addr);  // forward decl
 
 // ---- Scan callbacks (run in ISR context) ---------------------------
 
+// ISR callback: advance the bus scan to ballast_idx+1, or mark scan complete at addr 63.
 static void scan_advance(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
     (void)type; (void)response;
     uint8_t next = ballast_idx + 1u;
@@ -43,6 +44,10 @@ static void scan_advance(dali_response_type_t type, uint8_t ballast_idx, uint8_t
     }
 }
 
+// ISR callback: handle the QUERY_STATUS result for one ballast during a bus scan.
+// OK  → mark present and queue data reads (brightness, min/max, fade, groups).
+// NAK → mark absent and advance.
+// Other → retry up to 3 times, then treat as absent.
 static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
     if (type == DALI_RESPONSE_OK) {
         scan_err_count = 0;
@@ -50,16 +55,16 @@ static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx,
 
         // Queue remaining data queries for this ballast.
         // scan_advance callback fires on the last one.
-        uint8_t a = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-        cmdq_push_query(a, DALI_CMD_QUERY_ACTUAL_LEVEL,   ballast_idx, REG_BRIGHTNESS);
-        cmdq_push_query(a, DALI_CMD_QUERY_MIN_LEVEL,      ballast_idx, REG_MIN);
-        cmdq_push_query(a, DALI_CMD_QUERY_MAX_LEVEL,      ballast_idx, REG_MAX);
-        cmdq_push_query(a, DALI_CMD_QUERY_POWER_ON_LEVEL, ballast_idx, REG_POWER_ON);
-        cmdq_push_query(a, DALI_CMD_QUERY_FAIL_LEVEL,     ballast_idx, REG_SYS_FAIL);
-        cmdq_push_query(a, DALI_CMD_QUERY_FADE_RATE,      ballast_idx, REG_FADE_RATE);
-        cmdq_push_query(a, DALI_CMD_QUERY_FADE_TIME,      ballast_idx, REG_FADE_TIME);
-        cmdq_push_query(a, DALI_CMD_QUERY_GROUP_0_7,      ballast_idx, REG_GROUP_0_7);
-        cmdq_push_query_cb(a, DALI_CMD_QUERY_GROUP_8_15,  ballast_idx, REG_GROUP_8_15,
+        uint8_t dali_addr_byte = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_ACTUAL_LEVEL,   ballast_idx, REG_BRIGHTNESS);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_MIN_LEVEL,      ballast_idx, REG_MIN);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_MAX_LEVEL,      ballast_idx, REG_MAX);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_POWER_ON_LEVEL, ballast_idx, REG_POWER_ON);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_FAIL_LEVEL,     ballast_idx, REG_SYS_FAIL);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_FADE_RATE,      ballast_idx, REG_FADE_RATE);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_FADE_TIME,      ballast_idx, REG_FADE_TIME);
+        cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_GROUP_0_7,      ballast_idx, REG_GROUP_0_7);
+        cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_GROUP_8_15,  ballast_idx, REG_GROUP_8_15,
                            scan_advance);
     } else if (type == DALI_RESPONSE_NAK) {
         scan_err_count = 0;
@@ -68,8 +73,8 @@ static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx,
     } else {
         // Transient error: retry up to 3 times, then treat as absent
         if (++scan_err_count < 3) {
-            uint8_t a = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-            cmdq_push_query_cb(a, DALI_CMD_QUERY_STATUS, ballast_idx,
+            uint8_t dali_addr_byte = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
+            cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, ballast_idx,
                                REG_STATUS, scan_status_received);
         } else {
             scan_err_count = 0;
@@ -79,10 +84,11 @@ static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx,
     }
 }
 
+// Push QUERY_STATUS for one ballast address and kick the DALI state machine.
 static void enqueue_scan_for_addr(uint8_t addr) {
     scan_addr = addr;
-    uint8_t a = DALI_SHORT_ADDR(addr) | DALI_CMD_FLAG;
-    cmdq_push_query_cb(a, DALI_CMD_QUERY_STATUS, addr, REG_STATUS,
+    uint8_t dali_addr_byte = DALI_SHORT_ADDR(addr) | DALI_CMD_FLAG;
+    cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, addr, REG_STATUS,
                        scan_status_received);
     cmdq_kick();
 }
@@ -107,19 +113,19 @@ void bgtasks_run(void) {
         fade_poll_timer = (uint16_t)g_regs.poll_interval * (uint16_t)TICKS_PER_100MS;
         if (fade_poll_timer == 0) fade_poll_timer = 1;
 
-        for (uint8_t wi = 0; wi < 4; wi++) {
-            uint16_t mask;
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { mask = g_regs.fading[wi]; }
-            uint16_t m = mask;
-            while (m) {
-                uint8_t bit = 0;
-                uint16_t tmp = m;
-                while (!(tmp & 1u)) { bit++; tmp >>= 1u; }
-                uint8_t idx = (uint8_t)(wi * 16u + bit);
-                uint8_t a   = DALI_SHORT_ADDR(idx) | DALI_CMD_FLAG;
-                cmdq_push_query(a, DALI_CMD_QUERY_STATUS,       idx, REG_STATUS);
-                cmdq_push_query(a, DALI_CMD_QUERY_ACTUAL_LEVEL, idx, REG_BRIGHTNESS);
-                m &= m - 1u;
+        for (uint8_t word_idx = 0; word_idx < 4; word_idx++) {
+            uint16_t fading_mask;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { fading_mask = g_regs.fading[word_idx]; }
+            uint16_t pending_bits = fading_mask;
+            while (pending_bits) {
+                uint8_t  bit_pos    = 0;
+                uint16_t scan_word  = pending_bits;
+                while (!(scan_word & 1u)) { bit_pos++; scan_word >>= 1u; }
+                uint8_t ballast_idx    = (uint8_t)(word_idx * 16u + bit_pos);
+                uint8_t dali_addr_byte = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
+                cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_STATUS,       ballast_idx, REG_STATUS);
+                cmdq_push_query(dali_addr_byte, DALI_CMD_QUERY_ACTUAL_LEVEL, ballast_idx, REG_BRIGHTNESS);
+                pending_bits &= pending_bits - 1u;
             }
         }
         cmdq_kick();

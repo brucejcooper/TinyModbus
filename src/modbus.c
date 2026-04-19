@@ -232,8 +232,10 @@ static void process_fc03(void) {
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
     if (mb_reg == 0x1000 || mb_reg == 0x1001) {
-        // Raw DALI: [15:8]=addr byte, [7:0]=cmd byte.
-        // 0x1000 = single send (queries for response); 0x1001 = send twice (no response expected).
+        // Raw DALI: [15:8]=first frame byte, [7:0]=second frame byte.
+        // The two bytes are sent as-is; they can encode any valid DALI forward frame
+        // (addressed, group, broadcast, or special command).
+        // 0x1000 = single send (waits for response); 0x1001 = send twice (no response expected).
         // Reject if a previous raw command is still pending.
         bool pending;
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {

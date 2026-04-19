@@ -390,12 +390,11 @@ On startup the firmware scans all 64 DALI addresses in order, issuing the full q
 
 | Pin | Signal |
 |-----|--------|
-| PA1 | RS-485 TX |
-| PA2 | RS-485 RX |
-| PA4 | RS-485 DE (driver enable) |
-| PB0 | DALI TX |
-| PB1 | DALI RX |
-| PB3 | Status LED |
+| PA1 | RS-485 TX (USART0 alternate TXD) |
+| PA2 | RS-485 RX (USART0 alternate RXD) |
+| PA4 | RS-485 DE — driver enable, driven by hardware RS-485 mode (USART_RS485_EXT_gc), no firmware management needed |
+| PB0 | DALI TX — open-drain output, driven low to pull bus down |
+| PB1 | DALI RX — input via optocoupler (signal is inverted: HIGH = bus active/low) |
 
 ### Power
 

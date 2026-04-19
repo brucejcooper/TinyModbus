@@ -28,7 +28,7 @@ prepare:
 	mkdir -p build
 	
 build: prepare $(OBJECTS)
-	$(COMPILE) -Wl,--defsym=__DATA_REGION_LENGTH__=0x800,--defsym=__stack=0x43ff -o build/$(FILENAME).elf $(OBJECTS)
+	$(COMPILE) -o build/$(FILENAME).elf $(OBJECTS)
 	avr-objcopy -R .eeprom -R .fuse -R .lock -R .signature -O ihex build/$(FILENAME).elf build/$(FILENAME).hex
 	avr-size --format=avr --mcu=$(DEVICE) build/$(FILENAME).elf
 

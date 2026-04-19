@@ -6,15 +6,15 @@ Always use the project-local AVR toolchain in `avr/bin/` (e.g. `avr/bin/avr-gcc`
 
 The Makefile already sets `PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)` so `make build` uses the correct tools automatically. For manual invocations, prefix with `avr/bin/` or set PATH accordingly.
 
-## Linker script fix
+## RAM budget
 
-The bundled avr-gcc 7.3.0 has an incorrect device spec for ATtiny1604: `crtattiny1604.o` defines `__DATA_REGION_LENGTH__ = 0x400` (1KB) and `__stack = 0x3FFF`, but the chip has 2KB of SRAM (0x3C00–0x43FF). The Makefile overrides these weak symbols at link time:
+ATtiny1604 has 1KB SRAM. Static data (BSS + data + COMMON) must stay well under 1KB to leave room for the stack (~150 bytes minimum). Key consumers:
 
-```
--Wl,--defsym=__DATA_REGION_LENGTH__=0x800,--defsym=__stack=0x43ff
-```
+- `g_regs` (registers.c): 702 bytes — the register map for 64 ballasts
+- `g_cmd_queue` (cmd_queue.c): ~82 bytes — 8-entry ring buffer with packed enums
+- `buf` (modbus.c): 72 bytes — Modbus frame buffer, limits max FC03/FC04 read to 32 registers
 
-Without this, the linker reports `.bss not within region data` even though the firmware fits comfortably within the actual 2KB SRAM.
+Enum fields in `cmd_entry_t` use `__attribute__((packed))` to force 1-byte storage (instead of default 2-byte int-sized enums on AVR). The Modbus version string (FC04 at 0x0200) is built on demand directly into `buf` rather than kept in a static buffer.
 
 ## Diagnostics
 

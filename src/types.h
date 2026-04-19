@@ -16,7 +16,7 @@ typedef enum {
     DALI_RESPONSE_PENDING = 0xFF,
 } dali_response_type_t;
 
-typedef enum {
+typedef enum __attribute__((packed)) {
     CMD_DIRECT_ARC,   // DAPC — no backward frame expected
     CMD_SEND,         // single send, no backward frame expected
     CMD_SEND_TWICE,   // two sends within ~50ms (DALI config commands)
@@ -24,7 +24,7 @@ typedef enum {
 } cmd_type_t;
 
 // Which register field a query response should update
-typedef enum {
+typedef enum __attribute__((packed)) {
     REG_NONE,
     REG_BRIGHTNESS,
     REG_STATUS,

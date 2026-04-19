@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include "types.h"
 
-#define CMD_QUEUE_SIZE 16  // must be a power of 2
+#define CMD_QUEUE_SIZE 8   // must be a power of 2
 
 typedef struct {
     cmd_entry_t entries[CMD_QUEUE_SIZE];

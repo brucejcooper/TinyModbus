@@ -49,7 +49,8 @@ typedef enum {
 
 // ---- Buffers and state ----------------------------------------------
 
-#define MAX_PKT_SZ  (64 * 2 + 8)
+#define MAX_PKT_SZ  (32 * 2 + 8)   // max 32 registers per read request
+#define MAX_REG_RD  32u
 
 static uint8_t  slave_addr = 1;
 static uint8_t  buf[MAX_PKT_SZ];
@@ -61,8 +62,6 @@ static volatile bool     frame_ready   = false;
 static          uint8_t  tx_sz    = 0;
 volatile bool            modbus_idle   = true;
 
-// Version string for FC04 reads at addr 0 (legacy behaviour)
-static char ver_str[64];
 
 // ---- CRC-16 table ---------------------------------------------------
 
@@ -152,15 +151,21 @@ static void process_fc04(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-    // Legacy: version string at 0x0200-0x021F (32 registers = 64 bytes)
-    if (addr >= 0x0200 && addr + count <= 0x0220u) {
-        buf[2] = (uint8_t)(count * 2u);
-        memcpy(buf + 3, ver_str + (addr - 0x0200u) * 2u, count * 2u);
-        start_tx(3 + buf[2]);
+    // Legacy: version string block at 0x0200 (full 32-register read only)
+    if (addr == 0x0200 && count == 0x20u) {
+        buf[2] = 64u;
+        memset(buf + 3, 0, 64u);
+        snprintf((char *)(buf + 3), 64u,
+                 "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                 FW_VER_MAJOR, FW_VER_MINOR,
+                 SIGROW_SERNUM0, SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3,
+                 SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7,
+                 SIGROW_SERNUM8, SIGROW_SERNUM9);
+        start_tx(67u);
         return;
     }
 
-    if (count == 0 || addr + count > FC04_MAX_ADDR + 1u) {
+    if (count == 0 || count > MAX_REG_RD || addr + count > FC04_MAX_ADDR + 1u) {
         send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
@@ -184,7 +189,7 @@ static void process_fc03(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-    if (count == 0 || count > 64) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
+    if (count == 0 || count > MAX_REG_RD) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
 
     buf[2] = (uint8_t)(count * 2u);
     uint8_t *dst = buf + 3;
@@ -375,14 +380,6 @@ void modbus_init(uint8_t addr) {
     slave_addr = addr;
     rx_reset();
     modbus_idle = true;
-
-    memset(ver_str, 0, sizeof(ver_str));
-    snprintf(ver_str, sizeof(ver_str),
-             "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-             FW_VER_MAJOR, FW_VER_MINOR,
-             SIGROW_SERNUM0, SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3,
-             SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7,
-             SIGROW_SERNUM8, SIGROW_SERNUM9);
 
     PORTMUX.CTRLB          = PORTMUX_USART0_ALTERNATE_gc;
     RS485_PORT.PIN7CTRL    = PORT_PULLUPEN_bm;

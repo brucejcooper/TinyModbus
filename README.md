@@ -336,7 +336,10 @@ Coil N maps to ballast N (0–63).
 | FC01 read coil N | Returns 1 if ballast N is present and brightness > 0, else 0 |
 | FC05 write coil N ON (0xFF00) | Sends GOTO_LAST_ACTIVE to ballast N; starts fade tracking |
 | FC05 write coil N OFF (0x0000) | Sends OFF to ballast N; starts fade tracking |
-| FC0F write multiple coils | Applies ON/OFF to each named coil in the bitmask |
+| FC05 write coil N TOGGLE (0x5500) | Non-standard extension: reads current brightness and inverts state |
+| FC0F write multiple coils | Applies ON/OFF to each coil in the bitmask; returns DEVICE_BUSY if the command queue has fewer free slots than the coil count |
+
+**Broadcast / group operations**: FC01/FC05/FC0F only address individual ballasts (coil N = short address N). To send a DALI broadcast or group command (e.g. turn all lights off), write to the appropriate holding register action command (e.g. `MBREG_OFF` at 0x1004 with the DALI broadcast address byte 0xFF).
 
 ### FC04 — Input Register Map
 
@@ -397,6 +400,10 @@ After writing to 0x1000 (RAW_CMD), poll FC04 register 0x015D for the result:
 ### Fade Tracking
 
 After any DAPC or arc command sent to a short address, the firmware starts a reactive STATUS → BRIGHTNESS → STATUS polling chain for that ballast. The chain continues until the DALI status fade-running bit (bit 4) clears, then stops. At most two DALI commands are queued per chain, so many concurrent fades do not overflow the command queue. The FC04 fading bitmask (0x0155–0x0158) reflects the current state from real DALI responses.
+
+### Multi-Master Operation
+
+The firmware is designed to operate as the sole DALI master on its bus. It can detect when another master is transmitting (rising edge on the RX pin) and will yield rather than collide — but it does not decode traffic it did not initiate. If another DALI master changes ballast levels, the FC04 register data will remain stale until the next scheduled rescan (default: 64 seconds) or a manual scan trigger. For reliable register state, use this device as the exclusive DALI master or reduce the rescan interval (`MBREG_RESCAN_INTERVAL`, 0x1011) to suit the expected update rate.
 
 ---
 

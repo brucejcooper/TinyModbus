@@ -69,7 +69,7 @@ void dali_state_receiving_prepare(void) {
     shift_reg = 0;
     num_bits  = 0;
     TCB0.CTRLA   = 0;
-    TCB0.CNT     = 73;
+    TCB0.CNT     = 73;  // pre-bias absorbs ISR entry latency (~2–4 µs at 10 MHz)
     TCB0.EVCTRL  = TCB_CAPTEI_bm | TCB_EDGE_bm;
     TCB0.INTCTRL = TCB_CAPT_bm;
 }

@@ -73,7 +73,7 @@ void cmdq_result_received(dali_response_type_t type, uint8_t value) {
 void dali_idle_state_enter(void) {
     if (!cmdq_empty()) {
         cleanup();
-        if (dali_is_bus_shorted()) {
+        if (dali_is_bus_active()) {
             // Bus became active between the idle check and now — wait for it to clear.
             dali_wait_for_idle_state_enter();
         } else {

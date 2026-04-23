@@ -40,7 +40,7 @@ static void on_bus_shorted(void) {
 }
 
 void dali_wait_for_idle_state_enter(void) {
-    if (dali_is_bus_shorted())
+    if (dali_is_bus_active())
         on_bus_shorted();
     else
         on_idle_bus();

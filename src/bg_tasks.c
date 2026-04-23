@@ -20,7 +20,7 @@ static volatile bool     scan_trigger    = false;
 // Set while a self-sustaining STATUS → BRIGHTNESS → STATUS chain
 // is active for that ballast.  Prevents duplicate chains.
 
-static uint16_t fade_chain_active[4];
+static volatile uint16_t fade_chain_active[4];
 
 // ---- Bus scan state ------------------------------------------------
 

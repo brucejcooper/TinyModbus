@@ -138,7 +138,7 @@ uint16_t regs_read_clear_dirty(uint8_t word_idx);
 
 // Recompute group membership for ballast_idx from a QUERY_GROUP response byte.
 // high_groups=false → groups 0–7; high_groups=true → groups 8–15.
-// Rebuilds all 16 group_status entries after updating the mask.
+// Rebuilds the 8 group_status entries for the affected half only.
 void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups);
 
 // Recompute group_status[group_idx].status by ORing the status of all member ballasts.

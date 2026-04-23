@@ -71,9 +71,8 @@ extern volatile bool dali_idle;
 // and enter wait-for-idle to let the bus settle after reset.
 void    dali_init(void);
 
-// Returns non-zero when the RX pin reads HIGH (bus held low by a ballast or collision).
-// The optocoupler on the RX path inverts the signal, so HIGH = bus shorted/active.
-uint8_t dali_is_bus_shorted(void);
+// Returns non-zero when another master is driving the bus (RX pin HIGH after optocoupler inversion).
+uint8_t dali_is_bus_active(void);
 
 // Arm a one-shot PORTB rising-edge interrupt; fires callback once then self-disarms.
 void dali_call_on_rising_once(void (*callback)(void));

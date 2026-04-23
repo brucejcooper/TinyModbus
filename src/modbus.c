@@ -1,8 +1,6 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <avr/pgmspace.h>
-#include <avr/sleep.h>
-#include <avr/wdt.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,8 +16,20 @@
 
 // ---- Modbus constants -----------------------------------------------
 
-#define MODBUS_BAUD  9600
 #define USART0_BAUD_RATE(B) ((float)(F_CPU * 64 / (16 * (float)(B))) + 0.5f)
+
+// Precomputed USART BAUD register values for each supported baud rate.
+// Indexed by g_regs.baud_index: 0=9600, 1=19200, 2=38400.
+static const uint16_t s_baud_reg[] = {
+    (uint16_t)USART0_BAUD_RATE(9600),
+    (uint16_t)USART0_BAUD_RATE(19200),
+    (uint16_t)USART0_BAUD_RATE(38400),
+};
+
+// 3.5-character silence threshold in TCA0 ticks (~416 µs each), per baud rate.
+// 9600: 3.5×10/9600 = 3.65 ms → 9 ticks; 19200 → 5; 38400 → 3.
+static const uint8_t  s_silence_threshold[] = { 9, 5, 3 };
+static          uint8_t  s_silence_ticks;
 
 #define FC_READ_COILS        0x01
 #define FC_READ_HOLDING      0x03
@@ -496,6 +506,16 @@ static void process_fc0f(void) {
         return;
     }
 
+    // Verify the queue has room for all commands before pushing any.
+    // ISRs can only consume queue entries (not produce), so available space
+    // can only increase from this point — checking once is sufficient.
+    uint8_t avail;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { avail = (CMD_QUEUE_SIZE - 1u) - cmdq_count(); }
+    if (count > avail) {
+        send_error(MB_ERR_DEVICE_BUSY);
+        return;
+    }
+
     // Push all action commands first so fade-poll STATUS queries trail behind them.
     uint8_t *data = buf + 7;
     for (uint16_t i = 0; i < count; i++) {
@@ -573,6 +593,9 @@ void modbus_init(uint8_t addr) {
     frame_ready = false;
     modbus_idle = true;
 
+    uint8_t bidx = (g_regs.baud_index <= 2) ? g_regs.baud_index : 0;
+    s_silence_ticks = s_silence_threshold[bidx];
+
     PORTMUX.CTRLB          = PORTMUX_USART0_ALTERNATE_gc;
     RS485_PORT.PIN1CTRL    = PORT_PULLUPEN_bm;
     RS485_PORT.OUTSET      = RS485_TX_bm;
@@ -580,7 +603,7 @@ void modbus_init(uint8_t addr) {
     RS485_PORT.DIRSET      = RS485_TX_bm | RS485_DE_bm;
     RS485_PORT.DIRCLR      = RS485_RX_bm;
 
-    USART0.BAUD  = (uint16_t)USART0_BAUD_RATE(MODBUS_BAUD);
+    USART0.BAUD  = s_baud_reg[bidx];
     USART0.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc |
                    USART_CHSIZE_8BIT_gc         | USART_SBMODE_1BIT_gc;
     USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
@@ -643,7 +666,7 @@ ISR(USART0_TXC_vect) {
 
 ISR(USART0_RXC_vect) {
     modbus_idle    = false;
-    silence_ticks  = 4;  // ≈1.6 ms inter-character silence threshold
+    silence_ticks  = s_silence_ticks;
     USART0.STATUS  = USART_RXSIF_bm;
 
     if (USART0.STATUS & USART_RXCIF_bm) {

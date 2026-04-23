@@ -33,7 +33,7 @@ void dali_init(void) {
     dali_wait_for_idle_state_enter();
 }
 
-uint8_t dali_is_bus_shorted(void) {
+uint8_t dali_is_bus_active(void) {
     return (DALI_PORT.IN & DALI_RX_bm) ? 1u : 0u;
 }
 

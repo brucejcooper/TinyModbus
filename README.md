@@ -183,8 +183,8 @@ The firmware implements a five-state machine that drives all DALI bus activity. 
 
 Two hardware timers underpin the state machine:
 
-- **TCA0** — the half-bit clock. Runs continuously at 10 MHz with a period of exactly one DALI half-bit (416.67 µs). On each overflow it decrements a countdown (`dali_timer`) and fires a registered callback (`dali_timer_cb`) when the countdown reaches zero. This drives both transmission timing and state-machine timeouts. It is configured as the highest-priority interrupt (CPU interrupt level 1) so bit-level timing is not displaced by other ISRs.
-- **TCB0** — the pulse-width capture timer. Active only during the RECEIVING state. Configured in Frequency Measurement mode and fed by the DALI RX pin via the AVR event system. It captures the time between consecutive edges, giving the width of each Manchester pulse without CPU polling.
+- **TCA0** — the half-bit clock. Runs continuously at 10 MHz with a period of exactly one DALI half-bit (416.67 µs). On each overflow it decrements a countdown (`dali_timer`) and fires a registered callback (`dali_timer_cb`) when the countdown reaches zero. This drives both transmission timing and state-machine timeouts. Runs at CPU interrupt level 0.
+- **TCB0** — the pulse-width capture timer. Active only during the RECEIVING state. Configured in Frequency Measurement mode and fed by the DALI RX pin via the AVR event system. It captures the time between consecutive edges, giving the width of each Manchester pulse without CPU polling. Configured as CPU interrupt level 1 so it can preempt TCA0 mid-bit for accurate edge timestamping.
 
 ### States
 
@@ -238,7 +238,7 @@ Sends the 16-bit forward frame using Manchester encoding driven entirely by TCA0
 3. `send_one()` drives TX high and schedules `half_bit_toggle()`.
 4. `half_bit_toggle()` toggles TX (completing the mid-bit transition), schedules the next bit's first-half function (`send_one` or `send_zero` from the MSB of `shift_reg`), shifts `shift_reg` left, decrements `bits_left`.
 5. When `bits_left == 0`, schedules `start_stop_bits()`, which drives TX low for 4 Te (two full stop bits).
-6. After stop bits: calls `dali_wait_for_response_state_enter()`.
+6. After stop bits: CMD_QUERY and CMD_SEND_TWICE call `dali_wait_for_response_state_enter()`. CMD_SEND and CMD_DIRECT_ARC call `cmdq_result_received(DALI_RESPONSE_NAK, 0)` directly (no response expected; skips the 22 Te response window to halve inter-command latency).
 
 Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
 
@@ -322,9 +322,21 @@ The slave address (1–247) is stored in EEPROM (holding register 0x1012, persis
 |------|------|-------------|
 | 0x03 | Read Holding Registers | Read configuration registers (max 16 registers per request) |
 | 0x04 | Read Input Registers | Read ballast data and device info (max 16 registers per request) |
+| 0x05 | Write Single Coil | Write a single coil output |
 | 0x06 | Write Single Holding Register | Send a DALI command or update config |
+| 0x0F | Write Multiple Coils | Write multiple coil outputs |
 | 0x10 | Write Multiple Holding Registers | Write a block of holding registers |
-| 0x44 | Custom: Execute DALI Command | Synchronous raw DALI command (legacy) |
+
+### FC01/FC05/FC0F — Coil Map
+
+Coil N maps to ballast N (0–63).
+
+| Operation | Behaviour |
+|-----------|-----------|
+| FC01 read coil N | Returns 1 if ballast N is present and brightness > 0, else 0 |
+| FC05 write coil N ON (0xFF00) | Sends GOTO_LAST_ACTIVE to ballast N; starts fade tracking |
+| FC05 write coil N OFF (0x0000) | Sends OFF to ballast N; starts fade tracking |
+| FC0F write multiple coils | Applies ON/OFF to each named coil in the bitmask |
 
 ### FC04 — Input Register Map
 
@@ -381,18 +393,6 @@ After writing to 0x1000 (RAW_CMD), poll FC04 register 0x015D for the result:
 | 0x0100 | NAK — no backward frame received |
 | 0x02xx | OK — backward frame received; low byte = response |
 | 0x03xx | Error — bus/timing fault; low byte = error subtype |
-
-### Legacy Synchronous Raw Command (FC44)
-
-FC44 sends a raw DALI forward frame and blocks until the response arrives (up to 300 ms).
-
-Request: `[slave] [0x44] [frame_byte_0] [frame_byte_1] [repeat] [crc_lo] [crc_hi]`
-
-- `repeat`: 1 = single send (query), 2 = send twice (set command, no response)
-
-Response: `[slave] [0x44] [response_byte] [crc_lo] [crc_hi]`
-
-On error a Modbus exception is returned. Prefer FC06 0x1000 / 0x1001 for new integrations — FC44 blocks the Modbus loop for the full DALI transaction time.
 
 ### Fade Tracking
 

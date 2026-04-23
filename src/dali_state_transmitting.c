@@ -2,15 +2,24 @@
 #include <avr/io.h>
 #include <stdbool.h>
 
+#include "cmd_queue.h"
 #include "dali.h"
 #include "tick.h"
 
 static volatile uint16_t shift_reg;
 static volatile uint8_t  bits_left;
 
-// Last stop bit has been sent; arm the backward frame window.
+// Last stop bit has been sent.
+// CMD_QUERY: arm the backward frame window (response or 22 TE timeout).
+// CMD_SEND_TWICE: must hold the 22 TE inter-send gap, so also goes through the response window.
+// CMD_SEND / CMD_DIRECT_ARC: no response expected; call cmdq_result_received directly so the
+// entry is popped before the mandatory 22 TE idle gap (saves one full response-window wait).
 static void finished_transmission(void) {
-    dali_wait_for_response_state_enter();
+    cmd_entry_t cmd;
+    if (cmdq_peek(&cmd) && (cmd.type == CMD_QUERY || cmd.type == CMD_SEND_TWICE))
+        dali_wait_for_response_state_enter();
+    else
+        cmdq_result_received(DALI_RESPONSE_NAK, 0);
 }
 
 static void half_bit_toggle(void);

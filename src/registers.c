@@ -78,7 +78,7 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
 bool regs_write_holding(uint16_t addr, uint16_t val) {
     switch (addr) {
         case MBREG_RESCAN_INTERVAL:
-            s_rescan_interval = val;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { s_rescan_interval = val; }
             eeprom_update_word(&ee_rescan_interval, val);
             return true;
         case MBREG_SLAVE_ADDR:
@@ -163,6 +163,12 @@ void regs_clear_ballast(uint8_t idx) {
     memset(&g_regs.block3[idx], 0, sizeof(ballast_fade_t));
     regs_set_present(idx, false);
     bm_set(g_regs.fading, idx, false);
+    uint8_t byte_idx = idx >> 3;
+    uint8_t bit_mask = (uint8_t)(1u << (idx & 7u));
+    for (uint8_t g = 0; g < 16; g++) {
+        if (g_regs.group_mask[g][byte_idx] & bit_mask)
+            regs_rebuild_group_status(g);
+    }
 }
 
 uint16_t regs_read_clear_dirty(uint8_t word_idx) {
@@ -186,8 +192,8 @@ void regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups)
             g_regs.group_mask[base + group_idx][byte_idx] &= ~bit_mask;
     }
 
-    for (uint8_t group_idx = 0; group_idx < 16; group_idx++)
-        regs_rebuild_group_status(group_idx);
+    for (uint8_t group_idx = 0; group_idx < 8; group_idx++)
+        regs_rebuild_group_status(base + group_idx);
 }
 
 void regs_rebuild_group_status(uint8_t group_idx) {

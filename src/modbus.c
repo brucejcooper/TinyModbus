@@ -59,6 +59,7 @@ static volatile uint16_t rx_crc   = 0xFFFF;
 static volatile uint8_t  silence_ticks = 0;
 static volatile bool     frame_ready   = false;
 static          uint8_t  tx_sz    = 0;
+static          bool     no_response   = false;
 volatile bool            modbus_idle   = true;
 
 
@@ -114,7 +115,9 @@ static void append_crc(uint8_t len) {
 // ---- TX helpers --------------------------------------------------------
 
 // Finalise a response frame in buf (appends CRC) and begin DRE-driven transmission.
+// No-op for broadcast frames (no_response set by modbus_process).
 static void start_tx(uint8_t payload_len) {
+    if (no_response) return;
     append_crc(payload_len);
     rx_ptr = buf;    // reuse buf pointer for TX
     USART0.STATUS = USART_TXCIF_bm;
@@ -273,7 +276,10 @@ static void process_fc04(void) {
         return;
     }
 
-    // Atomically read-and-clear dirty flags if the read spans the dirty range
+    buf[2] = (uint8_t)(count * 2u);
+    regs_read_input_bulk(addr, (uint8_t)count, buf + 3);
+
+    // Clear dirty flags after copying so the master sees the actual bits, not zeros
     if (addr + count > FC04_DIRTY_BASE && addr <= FC04_DIRTY_END) {
         uint16_t d_start = (addr < FC04_DIRTY_BASE) ? FC04_DIRTY_BASE : addr;
         uint16_t d_end   = (addr + count - 1u > FC04_DIRTY_END) ? FC04_DIRTY_END : (addr + count - 1u);
@@ -281,8 +287,6 @@ static void process_fc04(void) {
             regs_read_clear_dirty((uint8_t)(a - FC04_DIRTY_BASE));
     }
 
-    buf[2] = (uint8_t)(count * 2u);
-    regs_read_input_bulk(addr, (uint8_t)count, buf + 3);
     start_tx(3 + buf[2]);
 }
 
@@ -407,7 +411,7 @@ static void process_fc10(void) {
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
     uint8_t  nbytes = buf[6];
 
-    if (count == 0 || nbytes != count * 2u) {
+    if (count == 0 || count > 15u || nbytes != count * 2u) {
         send_error(MB_ERR_ILLEGAL_VALUE);
         return;
     }
@@ -424,7 +428,6 @@ static void process_fc10(void) {
         if (err) { send_error(err); return; }
     }
     // Standard FC10 response: slave addr, FC, start addr (2), count (2)
-    buf[4] = buf[4]; buf[5] = buf[5];  // already in place
     start_tx(6);
 }
 
@@ -477,6 +480,7 @@ static void process_fc05(void) {
 
     uint8_t dali_addr = DALI_SHORT_ADDR((uint8_t)addr) | DALI_CMD_FLAG;
     cmdq_push_cmd(dali_addr, on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, (uint8_t)addr);
+    cmdq_kick();
     bgtasks_start_fade_poll((uint8_t)addr);
     start_tx(6);  // echo request
 }
@@ -500,6 +504,7 @@ static void process_fc0f(void) {
         cmdq_push_cmd(DALI_SHORT_ADDR(bidx) | DALI_CMD_FLAG,
                       on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, bidx);
     }
+    cmdq_kick();
     for (uint16_t i = 0; i < count; i++)
         bgtasks_start_fade_poll((uint8_t)(addr + i));
 
@@ -512,7 +517,19 @@ static void process_fc0f(void) {
 // and is addressed to this slave (or broadcast address 0).
 static bool frame_is_valid(void) {
     if (rx_crc != 0 || rx_sz < 5) return false;
-    if (buf[0] != slave_addr && buf[0] != 0) return false;
+    if (buf[0] != slave_addr) {
+        if (buf[0] != 0) return false;
+        // Broadcast (address 0): only write functions are valid; no response will be sent
+        switch (buf[1]) {
+            case FC_WRITE_SINGLE_COIL:
+            case FC_WRITE_SINGLE_REG:
+            case FC_WRITE_COILS:
+            case FC_WRITE_MULTI_REG:
+                break;
+            default:
+                return false;
+        }
+    }
 
     uint8_t func_code     = buf[1];
     uint8_t expected_size = 255;
@@ -531,21 +548,29 @@ static bool frame_is_valid(void) {
     return rx_sz == expected_size;
 }
 
-// ---- RX ring-buffer reset -----------------------------------------------
+// ---- Return to receive mode ---------------------------------------------
 
-// Reset receive state for the next frame: rewind buf pointer, clear CRC accumulator.
-static void rx_reset(void) {
-    rx_ptr  = buf;
-    rx_crc  = 0xFFFF;
-    rx_sz   = 0;
+// Reset frame state and re-enable the USART receiver.
+// Called after every completed transaction: normal response (TXC ISR),
+// broadcast (no response sent), and invalid frames (silence timeout).
+static void return_to_rx(void) {
+    rx_ptr      = buf;
+    rx_crc      = 0xFFFF;
+    rx_sz       = 0;
     frame_ready = false;
+    modbus_idle = true;
+    USART0.STATUS = USART_RXSIF_bm | USART_TXCIF_bm;
+    USART0.CTRLA  = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
 }
 
 // ---- Public API ---------------------------------------------------------
 
 void modbus_init(uint8_t addr) {
-    slave_addr = addr;
-    rx_reset();
+    slave_addr  = addr;
+    rx_ptr      = buf;
+    rx_crc      = 0xFFFF;
+    rx_sz       = 0;
+    frame_ready = false;
     modbus_idle = true;
 
     PORTMUX.CTRLB          = PORTMUX_USART0_ALTERNATE_gc;
@@ -570,8 +595,7 @@ void modbus_tick(void) {
             frame_ready = true;
             USART0.CTRLA = USART_RS485_EXT_gc;  // Disable RX ISRs during processing
         } else {
-            rx_reset();
-            modbus_idle = true;
+            return_to_rx();
         }
     }
 }
@@ -580,6 +604,8 @@ void modbus_process(void) {
     if (!frame_ready) return;
 
     _delay_us(1500);  // Modbus turnaround guard
+
+    no_response = (buf[0] == 0);
 
     switch (buf[1]) {
         case FC_READ_COILS:        process_fc01(); break;
@@ -590,6 +616,11 @@ void modbus_process(void) {
         case FC_WRITE_COILS:       process_fc0f(); break;
         case FC_WRITE_MULTI_REG:   process_fc10(); break;
         default:                   send_error(MB_ERR_ILLEGAL_FUNCTION); break;
+    }
+
+    if (no_response) {
+        no_response = false;
+        return_to_rx();
     }
 
     frame_ready = false;
@@ -607,10 +638,7 @@ ISR(USART0_DRE_vect) {
 }
 
 ISR(USART0_TXC_vect) {
-    rx_reset();
-    modbus_idle = true;
-    USART0.STATUS = USART_RXSIF_bm | USART_TXCIF_bm;
-    USART0.CTRLA  = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
+    return_to_rx();
 }
 
 ISR(USART0_RXC_vect) {

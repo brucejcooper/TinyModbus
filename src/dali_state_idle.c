@@ -73,9 +73,14 @@ void cmdq_result_received(dali_response_type_t type, uint8_t value) {
 void dali_idle_state_enter(void) {
     if (!cmdq_empty()) {
         cleanup();
-        cmd_entry_t cmd;
-        cmdq_peek(&cmd);
-        dali_transmitting_state_enter(&cmd);
+        if (dali_is_bus_shorted()) {
+            // Bus became active between the idle check and now — wait for it to clear.
+            dali_wait_for_idle_state_enter();
+        } else {
+            cmd_entry_t cmd;
+            cmdq_peek(&cmd);
+            dali_transmitting_state_enter(&cmd);
+        }
     } else {
         dali_idle = true;
         dali_state_receiving_prepare();

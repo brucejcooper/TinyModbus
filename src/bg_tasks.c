@@ -100,7 +100,10 @@ static void scan_next_query(dali_response_type_t type, uint8_t ballast_idx, uint
     uint8_t      dali_cmd  = pgm_read_byte(&scan_queries[step].dali_cmd);
     reg_target_t reg_tgt   = (reg_target_t)pgm_read_byte(&scan_queries[step].reg_target);
     uint8_t      dali_addr = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-    cmdq_push_query_cb(dali_addr, dali_cmd, ballast_idx, reg_tgt, scan_next_query);
+    if (cmdq_push_query_cb(dali_addr, dali_cmd, ballast_idx, reg_tgt, scan_next_query) != SYS_OK) {
+        scan_active = false;
+        g_regs.scan_status = SCAN_COMPLETE;
+    }
 }
 
 // ISR callback: handle the QUERY_STATUS result for one ballast during a bus scan.
@@ -121,8 +124,12 @@ static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx,
         // Transient error: retry up to 3 times, then treat as absent
         if (++scan_err_count < 3) {
             uint8_t dali_addr_byte = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-            cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, ballast_idx,
-                               REG_STATUS, scan_status_received);
+            if (cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, ballast_idx,
+                                   REG_STATUS, scan_status_received) != SYS_OK) {
+                scan_err_count = 0;
+                regs_clear_ballast(ballast_idx);
+                scan_advance(type, ballast_idx, 0);
+            }
         } else {
             scan_err_count = 0;
             regs_clear_ballast(ballast_idx);
@@ -135,8 +142,12 @@ static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx,
 static void enqueue_scan_for_addr(uint8_t addr) {
     scan_addr = addr;
     uint8_t dali_addr_byte = DALI_SHORT_ADDR(addr) | DALI_CMD_FLAG;
-    cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, addr, REG_STATUS,
-                       scan_status_received);
+    if (cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, addr, REG_STATUS,
+                           scan_status_received) != SYS_OK) {
+        scan_active        = false;
+        g_regs.scan_status = SCAN_COMPLETE;
+        return;
+    }
     cmdq_kick();
 }
 

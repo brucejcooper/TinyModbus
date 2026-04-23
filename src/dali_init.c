@@ -57,8 +57,8 @@ void dali_cancel_edge_detect(void) {
 ISR(PORTB_PORT_vect) {
     if (DALI_PORT.INTFLAGS & DALI_RX_bm) {
         DALI_PORT.DALI_RX_PINCTRL = 0;
+        DALI_PORT.INTFLAGS = DALI_RX_bm;
         if (dali_rx_rising_callback)
             dali_rx_rising_callback();
-        DALI_PORT.INTFLAGS = DALI_RX_bm;
     }
 }

@@ -1,3 +1,5 @@
+#include <avr/io.h>
+#include <util/atomic.h>
 #include "cmd_queue.h"
 #include "dali.h"
 
@@ -21,10 +23,24 @@ uint8_t cmdq_count(void) {
 }
 
 sys_result_t cmdq_push(const cmd_entry_t *entry) {
-    if (cmdq_full()) return SYS_ERR_QUEUE_FULL;
-    g_cmd_queue.entries[g_cmd_queue.tail] = *entry;
-    g_cmd_queue.tail = (g_cmd_queue.tail + 1u) & (CMD_QUEUE_SIZE - 1u);
-    return SYS_OK;
+    // Protect tail update from concurrent pushes from any interrupt level.
+    // Saving/clearing TCB0.INTCTRL blocks level-1 preemption; ATOMIC_BLOCK blocks level-0.
+    // Both are safe from ISR context: TCB0.INTCTRL restore is a no-op if already 0,
+    // and ATOMIC_BLOCK restores I-flag to whatever it was on entry.
+    uint8_t old_tcb_intctrl = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    sys_result_t result;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if (cmdq_full()) {
+            result = SYS_ERR_QUEUE_FULL;
+        } else {
+            g_cmd_queue.entries[g_cmd_queue.tail] = *entry;
+            g_cmd_queue.tail = (g_cmd_queue.tail + 1u) & (CMD_QUEUE_SIZE - 1u);
+            result = SYS_OK;
+        }
+    }
+    TCB0.INTCTRL = old_tcb_intctrl;
+    return result;
 }
 
 bool cmdq_peek(cmd_entry_t *entry) {

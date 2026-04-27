@@ -248,14 +248,15 @@ static void raw_cmd_single_done(dali_response_type_t type, uint8_t ballast_idx, 
 
 static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, uint8_t response) {
     (void)ballast_idx; (void)response;
-    // Send-twice commands don't return a response; NAK on completion is normal
-    if (type == DALI_RESPONSE_NAK)
+    // Send-twice commands don't generate a backward frame; NAK is the normal
+    // completion.  OK (unexpected response from device) is treated as NAK.
+    if (type == DALI_RESPONSE_NAK || type == DALI_RESPONSE_OK) {
         g_regs.raw_cmd_result = RAW_RESULT_NAK;
-    else
-        g_regs.raw_cmd_result = RAW_RESULT_ERR((uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u);
-
-    if (type == DALI_RESPONSE_NAK)
         raw_do_post_action();
+    } else {
+        // type >= DALI_RESPONSE_MALFORMED; subtraction is safe.
+        g_regs.raw_cmd_result = RAW_RESULT_ERR((uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u);
+    }
 }
 
 // ---- FC04 — read input registers ----------------------------------------
@@ -475,8 +476,8 @@ static void process_fc10(void) {
 
 // ---- FC01 / FC05 / FC0F — coils (ballast on/off state) ------------------
 //
-// Coil N maps to ballast N (0-63).  A coil reads as 1 when brightness > 0 and
-// the ballast is present (brightness != 0xFF absent sentinel).
+// Coil N maps to ballast N (0-63).  A coil reads as 1 when the ballast is
+// present (per present bitmask) and brightness > 0.
 // Write ON  → GOTO_LAST_ACTIVE; Write OFF → OFF; both start fade polling.
 // Write 0x5500 (non-normative toggle) checks the current brightness and
 // inverts the state.
@@ -542,24 +543,29 @@ static void process_fc0f(void) {
         return;
     }
 
-    // Verify the queue has room for all commands before pushing any.
-    // ISRs can only consume queue entries (not produce), so available space
-    // can only increase from this point — checking once is sufficient.
-    uint8_t avail;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { avail = (CMD_QUEUE_SIZE - 1u) - cmdq_count(); }
-    if (count > avail) {
-        send_error(MB_ERR_DEVICE_BUSY);
-        return;
-    }
-
-    // Push all action commands first so fade-poll STATUS queries trail behind them.
+    // Atomically check capacity and push all commands in one critical section.
+    // ISR callbacks (fade poll, scan) can push queue entries, so a two-step
+    // pre-flight + push would allow ISRs to fill the queue between the check
+    // and the loop.  Holding off both level-0 (ATOMIC_BLOCK) and level-1
+    // (TCB0.INTCTRL=0) for the duration keeps the slot count stable.
     uint8_t *data = buf + 7;
-    for (uint16_t i = 0; i < count; i++) {
-        uint8_t bidx = (uint8_t)(addr + i);
-        bool    on   = (data[i >> 3] >> (i & 7u)) & 1u;
-        cmdq_push_cmd(DALI_SHORT_ADDR(bidx) | DALI_CMD_FLAG,
-                      on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, bidx);
+    bool ok;
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        ok = (cmdq_count() + count <= CMD_QUEUE_SIZE - 1u);
+        if (ok) {
+            for (uint16_t i = 0; i < count; i++) {
+                uint8_t bidx = (uint8_t)(addr + i);
+                bool    on   = (data[i >> 3] >> (i & 7u)) & 1u;
+                cmdq_push_cmd(DALI_SHORT_ADDR(bidx) | DALI_CMD_FLAG,
+                              on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, bidx);
+            }
+        }
     }
+    TCB0.INTCTRL = old_tcb;
+    if (!ok) { send_error(MB_ERR_DEVICE_BUSY); return; }
+
     cmdq_kick();
     for (uint16_t i = 0; i < count; i++)
         bgtasks_start_fade_poll((uint8_t)(addr + i));

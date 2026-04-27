@@ -123,6 +123,22 @@ sys_result_t cmdq_push_query_cb(uint8_t dali_addr, uint8_t dali_cmd,
 }
 
 void cmdq_kick(void) {
-    if (dali_idle && !cmdq_empty())
+    // Atomically check dali_idle, claim it, and cancel the edge-detect callback.
+    // Without the critical section the PORTB ISR can fire between the dali_idle
+    // check and dali_idle_state_enter(), calling dali_wait_for_idle_state_enter()
+    // concurrently and producing a double state transition.
+    // TCB0 disable blocks level-1; ATOMIC_BLOCK blocks level-0.
+    bool launch;
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        launch = dali_idle && !cmdq_empty();
+        if (launch) {
+            dali_idle = false;
+            dali_cancel_edge_detect();
+        }
+    }
+    TCB0.INTCTRL = old_tcb;
+    if (launch)
         dali_idle_state_enter();
 }

@@ -64,8 +64,10 @@ static void fade_poll_status_cb(dali_response_type_t type, uint8_t ballast_idx, 
     }
 
     uint8_t dali_addr = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
-    cmdq_push_query(dali_addr, DALI_CMD_QUERY_ACTUAL_LEVEL, ballast_idx, REG_BRIGHTNESS);
-    if (cmdq_push_query_cb(dali_addr, DALI_CMD_QUERY_STATUS, ballast_idx, REG_STATUS,
+    // Both pushes must succeed: if the brightness query fails, skip the status push
+    // too (no orphan commands) and let the chain expire.
+    if (cmdq_push_query(dali_addr, DALI_CMD_QUERY_ACTUAL_LEVEL, ballast_idx, REG_BRIGHTNESS) != SYS_OK ||
+        cmdq_push_query_cb(dali_addr, DALI_CMD_QUERY_STATUS, ballast_idx, REG_STATUS,
                            fade_poll_status_cb) != SYS_OK)
         fade_chain_active[word] &= ~bit;  // queue full; chain expires gracefully
 }

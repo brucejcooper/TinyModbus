@@ -347,7 +347,7 @@ All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-
 
 | Address range | Width | Content |
 |---------------|-------|---------|
-| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness (high byte = DALI status bits, low byte = arc level; 0xFF = absent) |
+| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness (high byte = DALI status bits, low byte = arc level) |
 | 0x0040–0x007F | 64 regs | Per-ballast min \| max level |
 | 0x0080–0x00BF | 64 regs | Per-ballast power-on \| sys-fail level |
 | 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time |

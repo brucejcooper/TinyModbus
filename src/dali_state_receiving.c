@@ -41,11 +41,15 @@ static const rx_state_t state_machine[STATE_ERROR + 1] = {
 static volatile uint8_t rx_state;
 
 // Stop TCB0 and cancel the DALI timer; called before handing results to cmdq.
+// INTFLAGS must be cleared after INTCTRL so that a capture that arrived
+// between the TCA0 decrement and this cleanup does not fire spuriously when
+// dali_state_receiving_prepare() re-enables INTCTRL for the next response window.
 static void rx_cleanup(void) {
-    TCB0.CTRLA   = 0;
-    dali_timer   = 0;
-    TCB0.EVCTRL  = 0;
-    TCB0.INTCTRL = 0;
+    TCB0.CTRLA    = 0;
+    dali_timer    = 0;
+    TCB0.EVCTRL   = 0;
+    TCB0.INTCTRL  = 0;
+    TCB0.INTFLAGS = TCB_CAPT_bm;
 }
 
 // No more edges within the timeout window; treat as end-of-frame.

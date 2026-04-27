@@ -29,7 +29,7 @@ static const uint16_t s_baud_reg[] = {
 // 3.5-character silence threshold in TCA0 ticks (~416 µs each), per baud rate.
 // 9600: 3.5×10/9600 = 3.65 ms → 9 ticks; 19200 → 5; 38400 → 3.
 static const uint8_t  s_silence_threshold[] = { 9, 5, 3 };
-static          uint8_t  s_silence_ticks;
+static volatile uint8_t  s_silence_ticks;
 
 #define FC_READ_COILS        0x01
 #define FC_READ_HOLDING      0x03
@@ -365,7 +365,9 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         uint8_t dali_addr_byte = (uint8_t)(val >> 8);
         uint8_t arc_level      = (uint8_t)val;
         uint8_t ballast_idx    = (dali_addr_byte >> 1) & 0x3F;
-        cmdq_push_arc(dali_addr_byte, arc_level, (dali_addr_byte & 0x80) ? 0xFF : ballast_idx);
+        if (cmdq_push_arc(dali_addr_byte, arc_level,
+                          (dali_addr_byte & 0x80) ? 0xFF : ballast_idx) != SYS_OK)
+            return MB_ERR_DEVICE_BUSY;
         if (!(dali_addr_byte & 0x80))
             bgtasks_start_fade_poll(ballast_idx);
         cmdq_kick();
@@ -379,7 +381,8 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         // Set DTR0/DTR1/DTR2: low byte of val is the DTR data byte.
         uint8_t dtr_addr = (mb_reg == MBREG_SET_DTR0) ? DALI_ADDR_SET_DTR0 :
                            (mb_reg == MBREG_SET_DTR1) ? DALI_ADDR_SET_DTR1 : DALI_ADDR_SET_DTR2;
-        cmdq_push_cmd(dtr_addr, (uint8_t)val, 0xFF);
+        if (cmdq_push_cmd(dtr_addr, (uint8_t)val, 0xFF) != SYS_OK)
+            return MB_ERR_DEVICE_BUSY;
         cmdq_kick();
         return 0;
     }
@@ -390,7 +393,8 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
             uint8_t dali_addr_byte = (uint8_t)val;  // low byte = DALI addr byte
             uint8_t ballast_idx    = (dali_addr_byte >> 1) & 0x3F;
             bool    marks_fading   = pgm_read_byte(&action_regs[i].marks_fading);
-            cmdq_push_cmd(dali_addr_byte, dali_cmd_byte, ballast_idx);
+            if (cmdq_push_cmd(dali_addr_byte, dali_cmd_byte, ballast_idx) != SYS_OK)
+                return MB_ERR_DEVICE_BUSY;
             if (marks_fading && !(dali_addr_byte & 0x80))
                 bgtasks_start_fade_poll(ballast_idx);
             cmdq_kick();
@@ -424,6 +428,34 @@ static void process_fc10(void) {
     if (count == 0 || count > 15u || nbytes != count * 2u) {
         send_error(MB_ERR_ILLEGAL_VALUE);
         return;
+    }
+
+    // Pre-flight: count DALI dispatches needed and check queue capacity + raw-cmd state.
+    // Avoids partial execution where early registers succeed but a later one returns DEVICE_BUSY.
+    {
+        uint8_t need_slots  = 0;
+        bool    has_raw_cmd = false;
+        for (uint16_t i = 0; i < count; i++) {
+            uint16_t r = addr + i;
+            if (r >= MBREG_RAW_CMD && r <= MBREG_SET_DTR2) {
+                need_slots++;
+                if (r == MBREG_RAW_CMD || r == MBREG_RAW_CMD_TWICE) has_raw_cmd = true;
+            }
+        }
+        if (has_raw_cmd) {
+            bool pending;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                pending = (g_regs.raw_cmd_result == RAW_RESULT_PENDING);
+            }
+            if (pending) { send_error(MB_ERR_DEVICE_BUSY); return; }
+        }
+        if (need_slots > 0) {
+            uint8_t avail;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                avail = (CMD_QUEUE_SIZE - 1u) - cmdq_count();
+            }
+            if (need_slots > avail) { send_error(MB_ERR_DEVICE_BUSY); return; }
+        }
     }
 
     uint8_t *payload_ptr = buf + 7;
@@ -489,7 +521,11 @@ static void process_fc05(void) {
     }
 
     uint8_t dali_addr = DALI_SHORT_ADDR((uint8_t)addr) | DALI_CMD_FLAG;
-    cmdq_push_cmd(dali_addr, on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF, (uint8_t)addr);
+    if (cmdq_push_cmd(dali_addr, on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF,
+                      (uint8_t)addr) != SYS_OK) {
+        send_error(MB_ERR_DEVICE_BUSY);
+        return;
+    }
     cmdq_kick();
     bgtasks_start_fade_poll((uint8_t)addr);
     start_tx(6);  // echo request
@@ -561,8 +597,11 @@ static bool frame_is_valid(void) {
         case FC_WRITE_SINGLE_REG:
             expected_size = 8; break;
         case FC_WRITE_COILS:
-        case FC_WRITE_MULTI_REG:
-            expected_size = (uint8_t)(9u + buf[6]); break;
+        case FC_WRITE_MULTI_REG: {
+            uint16_t es = 9u + buf[6];
+            expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
+            break;
+        }
         default: break;
     }
     return rx_sz == expected_size;
@@ -613,12 +652,15 @@ void modbus_init(uint8_t addr) {
 void modbus_tick(void) {
     // Silence counter: decremented here, frame_ready set when it hits 0.
     // The silence threshold is set (reset to non-zero) by the RXC ISR.
-    if (silence_ticks && (--silence_ticks == 0)) {
-        if (frame_is_valid()) {
-            frame_ready = true;
-            USART0.CTRLA = USART_RS485_EXT_gc;  // Disable RX ISRs during processing
-        } else {
-            return_to_rx();
+    if (silence_ticks) {
+        silence_ticks--;
+        if (!silence_ticks) {
+            if (frame_is_valid()) {
+                frame_ready = true;
+                USART0.CTRLA = USART_RS485_EXT_gc;  // Disable RX ISRs during processing
+            } else {
+                return_to_rx();
+            }
         }
     }
 }

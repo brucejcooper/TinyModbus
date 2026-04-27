@@ -25,7 +25,6 @@ static volatile uint16_t fade_chain_active[4];
 // ---- Bus scan state ------------------------------------------------
 
 static volatile bool    scan_active      = false;
-static volatile uint8_t scan_addr        = 0;
 static volatile uint8_t scan_err_count   = 0;
 static volatile uint8_t scan_query_step  = 0;  // index into scan_queries[] during data reads
 
@@ -140,7 +139,6 @@ static void scan_status_received(dali_response_type_t type, uint8_t ballast_idx,
 
 // Push QUERY_STATUS for one ballast address and kick the DALI state machine.
 static void enqueue_scan_for_addr(uint8_t addr) {
-    scan_addr = addr;
     uint8_t dali_addr_byte = DALI_SHORT_ADDR(addr) | DALI_CMD_FLAG;
     if (cmdq_push_query_cb(dali_addr_byte, DALI_CMD_QUERY_STATUS, addr, REG_STATUS,
                            scan_status_received) != SYS_OK) {
@@ -160,12 +158,19 @@ void bgtasks_trigger_scan(void) {
 void bgtasks_start_fade_poll(uint8_t ballast_idx) {
     uint8_t  word = ballast_idx >> 4;
     uint16_t bit  = (uint16_t)1u << (ballast_idx & 0x0Fu);
-    if (fade_chain_active[word] & bit) return;  // chain already active for this ballast
-    fade_chain_active[word] |= bit;
+    // Atomic check-and-set: prevents a concurrent ISR clearing the bit between
+    // our check and our set, which would leave a dead chain marked active.
+    bool was_active;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        was_active = (fade_chain_active[word] & bit) != 0;
+        if (!was_active) fade_chain_active[word] |= bit;
+    }
+    if (was_active) return;
     uint8_t dali_addr = DALI_SHORT_ADDR(ballast_idx) | DALI_CMD_FLAG;
     if (cmdq_push_query_cb(dali_addr, DALI_CMD_QUERY_STATUS, ballast_idx, REG_STATUS,
-                           fade_poll_status_cb) != SYS_OK)
-        fade_chain_active[word] &= ~bit;
+                           fade_poll_status_cb) != SYS_OK) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { fade_chain_active[word] &= ~bit; }
+    }
     cmdq_kick();
 }
 

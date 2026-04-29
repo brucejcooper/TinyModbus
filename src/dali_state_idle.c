@@ -57,10 +57,13 @@ void process_command_response(dali_response_type_t err, uint8_t res) {
             if (commandQ->callback) {
                 commandQ->callback(err, commandQ->cmd, res);
             }
-            // Delete the entry from the queue.
+            // Delete the entry from the queue. The source and destination overlap, so use
+            // memmove rather than memcpy — avr-libc's memcpy happens to do a forward copy
+            // (which is safe in this direction) but the C standard treats overlapping memcpy
+            // as undefined.
             q_size--;
             if (q_size > 0) {
-                memcpy(commandQ, commandQ + 1, q_size * sizeof(dali_command_t));
+                memmove(commandQ, commandQ + 1, q_size * sizeof(dali_command_t));
             }
         }
     }

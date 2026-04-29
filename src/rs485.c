@@ -234,7 +234,6 @@ void got_dali_lowreg(dali_response_type_t err, uint16_t cmd, uint8_t res) {
 static void processGetCoilsCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
-    uint16_t *sptr = (uint16_t *)dali_holding_regs.banks[DALI_STATUS_BANK] + addr;
 
     // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t when the
     // master sends a large addr (e.g. 65535) — without this, a wrap to a small value would pass
@@ -244,6 +243,9 @@ static void processGetCoilsCommand() {
         return;
     }
 
+    // Pointer arithmetic must come after the bound check — forming a pointer more than one past
+    // an array's end is UB even if it's never dereferenced.
+    uint16_t *sptr = (uint16_t *)dali_holding_regs.banks[DALI_STATUS_BANK] + addr;
     uint8_t numBytes = (count + 7) / 8;
     buf[2] = numBytes;
     // Modbus 0x01 packs coils LSB-first: bit 0 of byte N holds the lowest-numbered coil in that byte.

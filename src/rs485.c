@@ -83,6 +83,12 @@ static bool modbus_cmd_available = false;
 // sendError check this flag and skip the actual transmission — Modbus spec forbids slaves from
 // responding to broadcasts; multiple slaves replying would collide on the bus.
 static bool was_broadcast = false;
+// Modbus §2.5.1.1: at startup the slave must observe 3.5 character times of silence on the bus
+// before accepting bytes as the start of a frame — otherwise we'd start latching mid-frame if
+// the master happened to be transmitting at reset time. While !initial_silence_observed the RXC
+// ISR drains incoming bytes (resetting the silence countdown each time); when rs485Timer_timeout
+// fires before any new byte, the flag is set and normal frame-accumulation begins.
+static volatile bool initial_silence_observed = false;
 
 static inline char hexDigit(uint8_t n) {
     return n < 10 ? '0' + n : 'A' + (n - 10);
@@ -612,10 +618,16 @@ static void modbus_reset_buffer() {
 }
 
 void rs485Timer_timeout() {
-    // cli();
+    if (!initial_silence_observed) {
+        // 3.5 char of bus silence have elapsed since reset (or since the last residue byte the
+        // master was sending mid-frame at reset time). The slave is now in Modbus's "Idle" state
+        // and may treat the next byte as the start of a new frame.
+        initial_silence_observed = true;
+        modbus_idle = true;
+        return;
+    }
     modbus_reset_buffer();
     modbus_idle = true;
-    // sei();
 }
 
 extern void rs485_init(uint8_t rs485_device_id) {
@@ -641,7 +653,11 @@ extern void rs485_init(uint8_t rs485_device_id) {
     USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;  // ISR for Start of Frmae or reception of data.
     USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_SFDEN_bm;        // enable reception, transmission, and wake from sleep
 
-    rs485Timer = 0;
+    // Arm the 3.5-character initial-silence countdown. 3.5 char @ 9600 baud = 3.65 ms; with
+    // TCA0 PER = 416.67 µs and an asynchronous decrement, rs485Timer = 10 yields a 9-10 tick
+    // window (3.75-4.17 ms) — both bounds comfortably above the spec minimum.
+    initial_silence_observed = false;
+    rs485Timer = 10;
 }
 
 void rs485_process_command() {
@@ -749,15 +765,25 @@ ISR(USART0_TXC_vect) {
 }
 
 ISR(USART0_RXC_vect) {
-    // Reset the countdown Timer.
     modbus_idle = false;
+    USART0.STATUS = USART_RXSIF_bm;  // clear the start-of-frame flag.
+
+    if (!initial_silence_observed) {
+        // Modbus §2.5.1.1: ignore bytes (likely residue of a frame already in progress at reset
+        // time) until rs485Timer_timeout has observed 3.5 char of silence. Reset the countdown
+        // on every byte/SFD so the silence period starts after the master finishes its frame.
+        rs485Timer = 10;
+        if (USART0.STATUS & USART_RXCIF_bm) {
+            (void)USART0.RXDATAL;  // drain to clear RXCIF; byte intentionally discarded
+        }
+        return;
+    }
+
     // Modbus RTU inter-character timeout is 1.5 char times (≈ 1.56 ms at 9600 baud). The TCA0
     // OVF tick is 416.67 µs and rs485Timer decrement is asynchronous to byte arrival, so a value
     // of N gives an effective timeout window of (N-1) to N ticks. rs485Timer = 5 → 4 to 5 ticks
     // = 1.667 to 2.083 ms, which keeps the lower bound at or above the 1.5-char minimum.
     rs485Timer = 5;
-    USART0.STATUS = USART_RXSIF_bm;  // clear the interrupt flag.
-    // }
 
     if (USART0.STATUS & USART_RXCIF_bm) {
         uint8_t val = USART0.RXDATAL;  // this will clear the CIF flag.

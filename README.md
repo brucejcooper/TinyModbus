@@ -490,6 +490,7 @@ Where shared state is touched from both main context and ISR context, the follow
 - **Streaming TX register reads** — the DRE ISR reads each `dali_holding_regs` word inside `ATOMIC_BLOCK` (TCA0 LVL1 can preempt the DRE ISR; the 16-bit load needs to be uninterruptible to avoid a torn high/low pair).
 - **Modbus error reporting** — `processSetSingleHoldingRegisterCommand` and `processSetSingleCoilCommand` branch on `daliResponseType` after `waitForDaliResponse()` and emit a Modbus exception when the DALI batch did not complete OK. Group-bank writes that change zero bits are reported as a no-op success.
 - **Broadcasts** — `inputIsValidModbusCommand()` only accepts deviceId 0 for write-style functions (`0x05`, `0x06`, `0x0F`); broadcast reads are dropped to avoid bus-collision responses. Once accepted, `was_broadcast` is set and `sendResponse` / `sendError` skip the actual transmission so the slave never replies on a broadcast — required by Modbus §2.4.1.
+- **Initial silence gate** — at startup the slave is in a "draining" state: the RXC ISR throws away every byte until `rs485Timer_timeout` reports 3.5 char of silence (≥ 4 ms at 9600 baud). This handles the case where the master was mid-frame at reset time — without the gate we would start latching from a random byte position, fail CRC, and waste bus time on retries. The gate is one-shot; once silence is observed the slave behaves normally for the rest of its uptime.
 
 ---
 
@@ -501,7 +502,6 @@ Issues uncovered by the multi-agent protocol-compliance review that have been kn
 
 - **0x0F (Write Multiple Coils) worst-case time can exceed master timeout.** The handler iterates per coil, waiting up to 600 ms per `waitForDaliResponse()`. With `MAX_MULTI_COIL_COUNT = 8`, a fully-NAKing batch takes ~4.8 s. Most masters time out at ~1 s. The WDT (8.2 s) protects the chip from a hang, but the master will declare a timeout, retransmit, and may interpret our late response as part of a new frame. **Mitigation when this matters:** keep individual 0x0F writes small (1–2 coils), or use 0x05 per coil in sequence.
 - **0x04 (Read Input Registers) returns an ASCII info string, not a register address space.** `MechDALI v0.1:` followed by 20 hex characters of the chip's unique serial number, packed two bytes per register. Generic Modbus discovery tools that expect a register file will see ASCII bytes — the master needs to know how to interpret the response.
-- **No initial 3.5-char silence gate on RX.** After power-on or WDT reset, the RX ISR latches whatever bytes arrive first. If the master is mid-frame at reset time, the partial frame fails CRC, the inter-byte timeout fires, and the buffer is reset cleanly — but Modbus §2.5.1.1 strictly requires the slave to wait for 3.5 char of silence before accepting frames. Self-recovering, ~1 frame of bus time wasted.
 - **DALI exception sub-codes 0x20–0x33** (used by `dali_response_to_err` for collision / pulse / short-response failures) are outside Modbus's reserved 0x01–0x0B range. Strict masters may log them as unknown; lenient masters surface them verbatim.
 
 ### DALI

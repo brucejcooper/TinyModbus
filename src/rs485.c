@@ -78,7 +78,6 @@ static volatile uint8_t streamLowByte;   // pending low byte of the current word
 static volatile uint16_t streamCrc;      // running CRC over header + already-streamed data bytes
 
 volatile bool modbus_idle = true;
-volatile uint8_t readCountDown;
 static bool modbus_cmd_available = false;
 
 static inline char hexDigit(uint8_t n) {

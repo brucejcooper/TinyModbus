@@ -240,7 +240,7 @@ Sends the 16-bit forward frame using Manchester encoding driven entirely by TCA0
 5. When `bitsLeft == 0`, schedules `startStopBits()`, which drives TX low for 4 Te (two full stop bits).
 6. After stop bits: calls `dali_wait_for_response_state_enter()`.
 
-Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
+Each bit takes exactly 2 TCA0 ticks (2 x 416.67 µs = 833.33 µs = 1200 bps).
 
 **WAIT_FOR_RESPONSE** (`dali_state_wait_for_response.c`)
 
@@ -334,7 +334,7 @@ pymcuprog -t uart -u ${PORT} -d ${DEVICE} -m user_row write -l 0x01
 Holding registers are arranged in five **banks** of 64 registers, one register per DALI device address.
 
 ```
-Register address = (bank × 64) + DALI_short_address
+Register address = (bank x 64) + DALI_short_address
 ```
 
 | Bank | Address range | Register content | Write behaviour |
@@ -462,7 +462,7 @@ A single read can return up to the Modbus RTU limit of 125 registers without eve
 |------|-------|
 | ATtiny1604 SRAM | 1024 |
 | `dali_holding_regs` | 640 |
-| `commandQ` (20 × 5 B) | 100 |
+| `commandQ` (20 x 5 B) | 100 |
 | `buf` | 70 |
 | Streaming TX state | 7 |
 | Misc state | ~32 |

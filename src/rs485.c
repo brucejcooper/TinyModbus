@@ -535,7 +535,7 @@ extern dali_result_t dali_queue_command(uint16_t cmd, uint8_t repeat, dali_callb
 // are refreshed by the next background scan rather than being kept in lockstep here.
 //
 // MAX_MULTI_COIL_COUNT is bounded so the worst-case batch (every device NAKing) completes well
-// within the WDT window: count × waitForDaliResponse ≤ MAX_MULTI_COIL_COUNT × 600 ms.
+// within the WDT window: count x waitForDaliResponse ≤ MAX_MULTI_COIL_COUNT x 600 ms.
 #define MAX_MULTI_COIL_COUNT 8
 static void processSetCoilsCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];

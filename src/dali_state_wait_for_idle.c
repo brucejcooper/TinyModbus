@@ -13,7 +13,7 @@
 
 // If the bus stays active longer than this, something is wrong (ballast fault, wiring short, etc.).
 // Force the state machine out of WAIT_FOR_IDLE rather than hanging forever.
-// 200 Te × 416.67 µs ≈ 83 ms - well beyond any legitimate DALI frame.
+// 200 Te x 416.67 µs ≈ 83 ms - well beyond any legitimate DALI frame.
 #define BUS_STUCK_TIMEOUT_TE 200
 
 static void onBusShorted();

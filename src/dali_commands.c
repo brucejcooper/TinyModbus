@@ -6,7 +6,7 @@
 #define ENCODE_CMD(cmd, addr) ((cmd) | ((addr) << 9))
 
 
-// Singleton "fade completed" callback — written from main-thread Modbus handlers and
+// Singleton "fade completed" callback - written from main-thread Modbus handlers and
 // read+cleared by check_fade_completed running in ISR context. The 16-bit pointer assignment
 // is two non-atomic STS instructions; if an ISR fires between them, check_fade_completed
 // would call a torn (partly-old / partly-new) pointer. set_post_cmd_callback wraps the write
@@ -167,7 +167,7 @@ void dali_set_fade_time(uint8_t addr, uint8_t val, dali_callback_t callback) {
     dali_queue_command(ENCODE_CMD(DALI_CMD_SET_FADE_TIME, addr), 2, NULL);
     // Read back via GET_FADE (the basic-fade-time/rate combined query) since SET_FADE_TIME
     // writes the basic fade-time register. The previous code queried GET_EXT_FADE, which reads
-    // the extended-fade-time register that nothing in this firmware ever sets — so the readback
+    // the extended-fade-time register that nothing in this firmware ever sets - so the readback
     // never reflected what we just wrote.
     dali_queue_command(ENCODE_CMD(DALI_CMD_GET_FADE, addr), 1, callback);
 }

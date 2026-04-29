@@ -37,7 +37,7 @@ int main(void) {
 
 
     // Device ID is stored in the first byte of the USERROW EEPROM, offset by 2 (so the factory
-    // default 0xFF maps to ID 1; write 0x00 for ID 2, etc.). Modbus reserves IDs 0 and 248–255,
+    // default 0xFF maps to ID 1; write 0x00 for ID 2, etc.). Modbus reserves IDs 0 and 248-255,
     // so we clamp anything that would map there back to the default ID 1:
     //   userrow ≤ 0xF5 → IDs 2..247  (valid)
     //   userrow 0xF6..0xFD → would map to reserved IDs 248..255 → clamp to 1
@@ -51,7 +51,7 @@ int main(void) {
     set_sleep_mode(SLEEP_MODE_STANDBY);
 
     // Set up a WDT, with a timeout of 8.2 seconds. This is ooodles more than needed.
-    // WDT.CTRLA is Configuration Change Protected — _PROTECTED_WRITE emits the CCP unlock
+    // WDT.CTRLA is Configuration Change Protected - _PROTECTED_WRITE emits the CCP unlock
     // followed by the register write, and must complete uninterrupted within 4 cycles.
     // We do this before sei() so an ISR can't slip in between the OUT and STS instructions.
     _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);

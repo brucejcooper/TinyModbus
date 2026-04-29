@@ -13,7 +13,7 @@
 
 // If the bus stays active longer than this, something is wrong (ballast fault, wiring short, etc.).
 // Force the state machine out of WAIT_FOR_IDLE rather than hanging forever.
-// 200 Te × 416.67 µs ≈ 83 ms — well beyond any legitimate DALI frame.
+// 200 Te × 416.67 µs ≈ 83 ms - well beyond any legitimate DALI frame.
 #define BUS_STUCK_TIMEOUT_TE 200
 
 static void onBusShorted();
@@ -30,7 +30,7 @@ static void idlePeriodExprired() {
 
 static void onIdleBus() {
     // When entered from PORT_vect (LVL0) the previous state's daliTimer is still mid-countdown.
-    // Zero it BEFORE the callback rewrites — we have two non-atomic 16-bit pointer writes coming
+    // Zero it BEFORE the callback rewrites - we have two non-atomic 16-bit pointer writes coming
     // (dali_rx_callback inside dali_call_on_rising_once, then daliTimerCallback below). If the
     // old daliTimerCallback fires from TCA0 LVL1 mid-write, both pointers can end up torn.
     // Suppressing the dispatch up front closes both windows.
@@ -41,7 +41,7 @@ static void onIdleBus() {
 }
 
 /**
- * @brief Bus has been stuck active (low) for too long — escape the wait.
+ * @brief Bus has been stuck active (low) for too long - escape the wait.
  * Releases our TX pin defensively, cancels edge detection, and returns to the
  * idle state. The state machine will attempt to transmit or wait for a new
  * command. If the external fault persists it will re-enter this path and keep

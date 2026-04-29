@@ -12,7 +12,7 @@
 // Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
 
 /**
- * @brief Current handler for the DALI RX pin interrupt — used for both rising-edge (start of
+ * @brief Current handler for the DALI RX pin interrupt - used for both rising-edge (start of
  * external transmission) and level-low (bus released) one-shot waits. May be NULL to do nothing.
  */
 void (*dali_rx_callback)() = NULL;

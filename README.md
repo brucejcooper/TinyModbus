@@ -21,12 +21,12 @@ DALI runs over a simple two-wire bus. Key characteristics:
 | Parameter | Value |
 |-----------|-------|
 | Nominal bus voltage | 16 V DC |
-| Operating range | 9.5 – 22.5 V |
+| Operating range | 9.5 - 22.5 V |
 | Max bus current | 250 mA |
 | Max cable distance | 300 m |
 | Max cable voltage drop | 2 V |
-| Topology | Free-form (star, daisy-chain, mixed) — ring not allowed |
-| Polarity | Insensitive (either wire can be "+" or "−") |
+| Topology | Free-form (star, daisy-chain, mixed) - ring not allowed |
+| Polarity | Insensitive (either wire can be "+" or "-") |
 
 The bus is powered by a dedicated DALI power supply. Bus-powered devices (sensors, push-button interfaces) draw power directly from it.
 
@@ -63,7 +63,7 @@ Manchester encoding guarantees a transition in the middle of every bit, which pr
 
 S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 
-**Backward frame** (ballast → controller): 1 start bit + 8 data bits + 1 stop bit = **10 bits**. Duration ≈ 9.95 ms. The ballast must respond within 7–22 Te (≈ 2.9 – 9.2 ms) after the forward frame ends.
+**Backward frame** (ballast → controller): 1 start bit + 8 data bits + 1 stop bit = **10 bits**. Duration ≈ 9.95 ms. The ballast must respond within 7-22 Te (≈ 2.9 - 9.2 ms) after the forward frame ends.
 
 ### Address Byte Structure
 
@@ -74,22 +74,22 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
   └─────────────────────────────── Address type: 0=Short, 1=Group/Broadcast
 ```
 
-| A7 | A6–A1 | A0 | Meaning |
+| A7 | A6-A1 | A0 | Meaning |
 |----|-------|----|---------|
-| 0  | addr (0–63) | 0 | Direct Arc Power Control (DAPC) to short address |
-| 0  | addr (0–63) | 1 | Command to short address |
-| 1  | group (0–15) | 0 | DAPC to group |
-| 1  | group (0–15) | 1 | Command to group |
+| 0  | addr (0-63) | 0 | Direct Arc Power Control (DAPC) to short address |
+| 0  | addr (0-63) | 1 | Command to short address |
+| 1  | group (0-15) | 0 | DAPC to group |
+| 1  | group (0-15) | 1 | Command to group |
 | 1  | 1111111 | 1 | Broadcast command |
 
-This implementation uses **short addresses only** (individual device addresses 0–63).
+This implementation uses **short addresses only** (individual device addresses 0-63).
 
 ### Command Types
 
-**Direct Arc Power Control (DAPC)** — sets light output immediately:
-- Data byte: 0 = off, 1–254 = proportional level (logarithmic), 255 = no change
+**Direct Arc Power Control (DAPC)** - sets light output immediately:
+- Data byte: 0 = off, 1-254 = proportional level (logarithmic), 255 = no change
 
-**Standard commands** (address byte LSB = 1) — the data byte selects the command:
+**Standard commands** (address byte LSB = 1) - the data byte selects the command:
 
 | Command | Data byte | Description |
 |---------|-----------|-------------|
@@ -99,7 +99,7 @@ This implementation uses **short addresses only** (individual device addresses 0
 | Recall Max | 0x05 | Go to maximum level |
 | Recall Min | 0x06 | Go to minimum level |
 | Go To Last Active | 0x0A | Restore last non-zero level |
-| Go To Scene N | 0x10–0x1F | Recall scene 0–15 |
+| Go To Scene N | 0x10-0x1F | Recall scene 0-15 |
 | Reset | 0x20 | Reset to factory defaults |
 | Set DTR0 | (special) | Loads a value into the data transfer register before a set command |
 | Query Status | 0x90 | Returns 8-bit status byte (backward frame) |
@@ -109,8 +109,8 @@ This implementation uses **short addresses only** (individual device addresses 0
 | Query Power On Level | 0xA3 | Returns power-on default level |
 | Query System Failure Level | 0xA4 | Returns system failure default level |
 | Query Fade Time/Rate | 0xA5 | Returns fade settings |
-| Query Groups 0–7 | 0xC0 | Returns bitmask of group membership |
-| Query Groups 8–15 | 0xC1 | Returns bitmask of group membership |
+| Query Groups 0-7 | 0xC0 | Returns bitmask of group membership |
+| Query Groups 8-15 | 0xC1 | Returns bitmask of group membership |
 
 **Set commands** (require value pre-loaded into DTR0, and must be sent twice within 100 ms to take effect):
 
@@ -122,8 +122,8 @@ This implementation uses **short addresses only** (individual device addresses 0
 | Set Power On Level | 0x2D | Set level on power restore |
 | Set Fade Time | 0x2E | Set fade time from DTR0 |
 | Set Fade Rate | 0x2F | Set fade rate from DTR0 |
-| Add To Group N | 0x60–0x6F | Add device to group 0–15 |
-| Remove From Group N | 0x70–0x7F | Remove device from group 0–15 |
+| Add To Group N | 0x60-0x6F | Add device to group 0-15 |
+| Remove From Group N | 0x70-0x7F | Remove device from group 0-15 |
 
 ### Status Byte (Query Status Response)
 
@@ -142,49 +142,49 @@ This implementation uses **short addresses only** (individual device addresses 0
 
 DALI supports smooth transitions between light levels. Two parameters control fading:
 
-- **Fade time**: fixed-duration transition (0–15, where 0 = instant, 1 = 0.7 s, doubling each step up to ~90 s)
-- **Fade rate**: steps-per-second mode (0–15, where 0 = no fade, 1 = 358 steps/s down to 1 step/s)
+- **Fade time**: fixed-duration transition (0-15, where 0 = instant, 1 = 0.7 s, doubling each step up to ~90 s)
+- **Fade rate**: steps-per-second mode (0-15, where 0 = no fade, 1 = 358 steps/s down to 1 step/s)
 
 ### Groups and Scenes
 
-**Groups (0–15):** A device can belong to multiple groups simultaneously (stored as a 16-bit bitmask). A single group command updates all members simultaneously in one DALI transmission — much faster than addressing devices individually.
+**Groups (0-15):** A device can belong to multiple groups simultaneously (stored as a 16-bit bitmask). A single group command updates all members simultaneously in one DALI transmission - much faster than addressing devices individually.
 
-**Scenes (0–15):** Each device stores 16 preset arc power levels. A "Go To Scene N" broadcast takes the entire installation to a preset state in one frame.
+**Scenes (0-15):** Each device stores 16 preset arc power levels. A "Go To Scene N" broadcast takes the entire installation to a preset state in one frame.
 
 ### Bus Timing Constraints
 
 | Constraint | Value |
 |------------|-------|
 | Min inter-frame gap | ≥ 22 Te ≈ 9.2 ms |
-| Backward frame response window | 7–22 Te after forward frame |
+| Backward frame response window | 7-22 Te after forward frame |
 | Set command re-send window | ≤ 100 ms between the two required sends |
 | DALI frame duration (forward) | ≈ 15.8 ms |
 | DALI frame duration (backward) | ≈ 9.95 ms |
 
 ### Addressing and Commissioning
 
-New or reset devices generate a 24-bit random address. A controller discovers and assigns short addresses (0–63) using a binary search algorithm:
+New or reset devices generate a 24-bit random address. A controller discovers and assigns short addresses (0-63) using a binary search algorithm:
 
 1. Broadcast `RANDOMISE` to generate new random addresses
-2. Repeat: set a search high address, issue `COMPARE` — devices with random address ≤ search address pull the bus low
+2. Repeat: set a search high address, issue `COMPARE` - devices with random address ≤ search address pull the bus low
 3. Binary-search down to isolate one device
 4. Issue `PROGRAM SHORT ADDRESS` to assign the next free address
 5. Issue `YES` to confirm, then loop until no devices respond
 
-This firmware does **not** implement commissioning — it assumes devices are already addressed before connecting them to the bus.
+This firmware does **not** implement commissioning - it assumes devices are already addressed before connecting them to the bus.
 
 ---
 
 ## DALI State Machine
 
-The firmware implements a five-state machine that drives all DALI bus activity. Every state transition is interrupt-driven — the main loop simply sleeps until a Modbus command arrives or the background scan triggers a wakeup.
+The firmware implements a five-state machine that drives all DALI bus activity. Every state transition is interrupt-driven - the main loop simply sleeps until a Modbus command arrives or the background scan triggers a wakeup.
 
 ### Timer Architecture
 
 Two hardware timers underpin the state machine:
 
-- **TCA0** — the half-bit clock. Runs continuously at 10 MHz with a period of exactly one DALI half-bit (416.67 µs). On each overflow it decrements a countdown (`daliTimer`) and fires a registered callback (`daliTimerCallback`) when the countdown reaches zero. This drives both transmission timing and state-machine timeouts. It is configured as the highest-priority interrupt so bit-level timing is not displaced by other ISRs.
-- **TCB0** — the pulse-width capture timer. Active only during the RECEIVING state. Configured in Frequency Measurement mode and fed by the DALI RX pin via the AVR event system. It captures the time between consecutive edges, giving the width of each Manchester pulse without CPU polling.
+- **TCA0** - the half-bit clock. Runs continuously at 10 MHz with a period of exactly one DALI half-bit (416.67 µs). On each overflow it decrements a countdown (`daliTimer`) and fires a registered callback (`daliTimerCallback`) when the countdown reaches zero. This drives both transmission timing and state-machine timeouts. It is configured as the highest-priority interrupt so bit-level timing is not displaced by other ISRs.
+- **TCB0** - the pulse-width capture timer. Active only during the RECEIVING state. Configured in Frequency Measurement mode and fed by the DALI RX pin via the AVR event system. It captures the time between consecutive edges, giving the width of each Manchester pulse without CPU polling.
 
 ### States
 
@@ -244,7 +244,7 @@ Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
 
 **WAIT_FOR_RESPONSE** (`dali_state_wait_for_response.c`)
 
-After the forward frame the master must listen for a backward frame within 7–22 Te. This state:
+After the forward frame the master must listen for a backward frame within 7-22 Te. This state:
 - Pre-configures TCB0 for pulse capture (`dali_state_receiving_prepare()`).
 - Arms a one-shot rising-edge interrupt on RX. A rising edge means a backward frame start bit is arriving; we call `dali_state_receiving_enter()`.
 - Sets a TCA0 timeout of 22 Te. If it fires before any edge, the device did not respond: call `process_command_response(DALI_RESPONSE_NAK, 0)` and return to IDLE.
@@ -269,7 +269,7 @@ MIDDLE_1    START_1,   no shift               MIDDLE_0, shift 0
 
 The *short* pulse is a half-bit transition (mid-bit); the *long* pulse spans a full bit and carries the same bit value as the previous bit (a "stretched" transition at the bit boundary).
 
-TCA0 is re-armed to 5 Te on every edge. When TCA0 fires with no new edge — i.e. the bus has been idle for more than two full bits — `timerOverflow()` is called:
+TCA0 is re-armed to 5 Te on every edge. When TCA0 fires with no new edge - i.e. the bus has been idle for more than two full bits - `timerOverflow()` is called:
 - If the final state is `START_0` or `MIDDLE_1` **and** exactly 8 bits were received: `process_command_response(DALI_RESPONSE_OK, shiftreg)`.
 - Otherwise: `process_command_response(DALI_RESPONSE_MALFORMED, 0)`.
 
@@ -286,9 +286,9 @@ Enforces the DALI requirement that the bus be idle for at least 22 Te before the
 ### Command Queue
 
 `dali_queue_command()` (in `dali_state_idle.c`) appends to a 20-entry ring buffer. Each entry holds:
-- `cmd` — the 16-bit DALI command word
-- `callback` — function to call when the command completes (receives response type, original command, response byte)
-- `repeat` — how many times to send before dequeuing (1 for normal commands, 2 for set commands that require the double-send)
+- `cmd` - the 16-bit DALI command word
+- `callback` - function to call when the command completes (receives response type, original command, response byte)
+- `repeat` - how many times to send before dequeuing (1 for normal commands, 2 for set commands that require the double-send)
 
 When a command completes (or NAKs), `process_command_response()` is called. It:
 1. Automatically mirrors the response byte into the appropriate holding register bank based on the command type (e.g. `QUERY_STATUS` → status byte of that device's register, `GET_LEVEL` → low byte of the status bank register).
@@ -339,17 +339,17 @@ Register address = (bank × 64) + DALI_short_address
 
 | Bank | Address range | Register content | Write behaviour |
 |------|--------------|------------------|-----------------|
-| 0 — Status | 0–63 | High byte: status bits; Low byte: current arc level | Write low byte only (0–254) → sends DAPC |
-| 1 — Min/Max | 64–127 | High byte: max level; Low byte: min level | Writes both min and max via DTR0 |
-| 2 — Fade | 128–191 | High byte: extended fade time (8-bit, from `QUERY_EXTENDED_FADE_TIME`); Low byte: combined fade time / fade rate byte (high nibble = basic fade time, low nibble = fade rate, from `QUERY_FADE_TIME_FADE_RATE`) | Write low byte → fade rate via DTR0; write high byte → extended fade time via DTR0 |
-| 3 — Power | 192–255 | High byte: power-fail level; Low byte: power-on level | Writes both via DTR0 |
-| 4 — Groups | 256–319 | 16-bit bitmask of group membership (bit N = group N) | Diffs against cached value and issues Add/Remove per changed bit |
+| 0 - Status | 0-63 | High byte: status bits; Low byte: current arc level | Write low byte only (0-254) → sends DAPC |
+| 1 - Min/Max | 64-127 | High byte: max level; Low byte: min level | Writes both min and max via DTR0 |
+| 2 - Fade | 128-191 | High byte: extended fade time (8-bit, from `QUERY_EXTENDED_FADE_TIME`); Low byte: combined fade time / fade rate byte (high nibble = basic fade time, low nibble = fade rate, from `QUERY_FADE_TIME_FADE_RATE`) | Write low byte → fade rate via DTR0; write high byte → extended fade time via DTR0 |
+| 3 - Power | 192-255 | High byte: power-fail level; Low byte: power-on level | Writes both via DTR0 |
+| 4 - Groups | 256-319 | 16-bit bitmask of group membership (bit N = group N) | Diffs against cached value and issues Add/Remove per changed bit |
 
 All values are cached in RAM and refreshed by the background scan. A write immediately sends the corresponding DALI command(s) and updates the cache.
 
-### Write Single Coil (0x05) — Simple On/Off/Toggle
+### Write Single Coil (0x05) - Simple On/Off/Toggle
 
-Address = DALI short address (0–63).
+Address = DALI short address (0-63).
 
 | Value | DALI action |
 |-------|-------------|
@@ -383,7 +383,7 @@ The 10-byte serial is read from the SIGROW unique-ID registers, so each chip rep
 
 ### Background Scan
 
-On startup the firmware scans all 64 DALI addresses in order, issuing the full query sequence (status, level, max, min, fade, power-on, power-fail, groups 0–7, groups 8–15) per device and caching the results in the holding register banks. Devices that do not respond get their registers zeroed (level bank set to `0xFF` as an absent marker). The scan repeats continuously to keep the cache fresh and to track fading.
+On startup the firmware scans all 64 DALI addresses in order, issuing the full query sequence (status, level, max, min, fade, power-on, power-fail, groups 0-7, groups 8-15) per device and caching the results in the holding register banks. Devices that do not respond get their registers zeroed (level bank set to `0xFF` as an absent marker). The scan repeats continuously to keep the cache fresh and to track fading.
 
 ---
 
@@ -427,7 +427,7 @@ The firmware includes several layers of protection against bus faults and lockup
 
 ### Watchdog Timer
 
-The WDT runs at 8.2 s (`WDT_PERIOD_8KCLK_gc`) and is reset on every iteration of the main loop. If any blocking path runs longer than 8.2 s — or if the main loop stops for any reason — the MCU resets cleanly.
+The WDT runs at 8.2 s (`WDT_PERIOD_8KCLK_gc`) and is reset on every iteration of the main loop. If any blocking path runs longer than 8.2 s - or if the main loop stops for any reason - the MCU resets cleanly.
 
 ### `WAIT_FOR_IDLE` bus-stuck timeout (`dali_state_wait_for_idle.c`)
 
@@ -435,11 +435,11 @@ When the DALI bus is shorted (active low) longer than 200 Te ≈ 83 ms, `busStuc
 
 ### `waitForDaliResponse()` Modbus timeout (`rs485.c`)
 
-The Modbus handler bounds its wait for a DALI response at 600 ms. **Any Modbus command whose underlying DALI batch has not completed within ~500 ms will be reported to the master as a NAK** — well before the 8.2 s WDT fires. The DALI commands themselves remain queued and continue to execute on the bus; only the Modbus-visible status is affected. This caps how long an RS485 master can be blocked by a single command, regardless of DALI bus state.
+The Modbus handler bounds its wait for a DALI response at 600 ms. **Any Modbus command whose underlying DALI batch has not completed within ~500 ms will be reported to the master as a NAK** - well before the 8.2 s WDT fires. The DALI commands themselves remain queued and continue to execute on the bus; only the Modbus-visible status is affected. This caps how long an RS485 master can be blocked by a single command, regardless of DALI bus state.
 
 ### RS485 DE-pin startup safety (`main.c`)
 
-The very first thing `main()` does — before clock setup or any subsystem init — is drive PA4 (RS485 DE) low and configure it as an output. This eliminates the post-reset window during which the transceiver could otherwise assert the bus while DE floats.
+The very first thing `main()` does - before clock setup or any subsystem init - is drive PA4 (RS485 DE) low and configure it as an output. This eliminates the post-reset window during which the transceiver could otherwise assert the bus while DE floats.
 
 ### Modbus packet-size validation
 
@@ -447,11 +447,11 @@ The RX ISR drops bytes once `sz` reaches `MAX_PKT_SZ`, and `inputIsValidModbusCo
 
 ### Streaming TX for read-holding-registers
 
-A 64-register response is 133 bytes — too large for `buf` (70 bytes). Rather than grow `buf` to fit the worst case, `sendHoldingRegs()` streams data straight from `dali_holding_regs` in the DRE ISR:
+A 64-register response is 133 bytes - too large for `buf` (70 bytes). Rather than grow `buf` to fit the worst case, `sendHoldingRegs()` streams data straight from `dali_holding_regs` in the DRE ISR:
 
 1. The 3-byte header (device addr, func code, byte count) is placed at `buf[0..2]` and the running CRC is seeded over those bytes.
 2. The DRE ISR sends the 3 header bytes from `buf`, then enters streaming mode.
-3. While streaming, the ISR reads each register fresh (one atomic 16-bit load per word, used for both the high and low byte) and folds each transmitted byte into the running CRC. This means the CRC always matches the bytes actually sent — even if a TCA0 ISR (e.g. the periodic scan) updates a register mid-response.
+3. While streaming, the ISR reads each register fresh (one atomic 16-bit load per word, used for both the high and low byte) and folds each transmitted byte into the running CRC. This means the CRC always matches the bytes actually sent - even if a TCA0 ISR (e.g. the periodic scan) updates a register mid-response.
 4. After the final low byte is sent, the running CRC is parked at `buf[3..4]` and the ISR sends 2 trailing CRC bytes from there.
 
 A single read can return up to the Modbus RTU limit of 125 registers without ever buffering the data. Streaming state costs 7 bytes (`streamSrc`, `streamWords`, `streamHighByte`, `streamLowByte`, `streamCrc`).
@@ -479,44 +479,44 @@ The build sets `-fstack-usage`, emitting per-function `.su` files in `build/` af
 | Program (.text + .rodata + .data init) | 9492 |
 | **Free** | **6892** (~42 %) |
 
-The build uses no `printf`, `malloc`, or floating-point — `static const` tables (CRC, command sequences, state machine) live in flash via the avrxmega3 unified memory map and are accessed with plain LD instructions, no `PROGMEM` needed.
+The build uses no `printf`, `malloc`, or floating-point - `static const` tables (CRC, command sequences, state machine) live in flash via the avrxmega3 unified memory map and are accessed with plain LD instructions, no `PROGMEM` needed.
 
 ### Concurrency Model
 
 Where shared state is touched from both main context and ISR context, the following mechanisms keep it consistent:
 
-- **DALI command queue (`commandQ`, `q_size`)** — `dali_queue_command()` wraps the size-check / slot-write / post-increment in `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)`, and atomically claims the "start TX" role by clearing `dali_idle` in the same block. This prevents a TCA0/TCB0 ISR (running e.g. `scan_result_received`) from compacting the queue between main's read of `q_size` and its slot write.
-- **Background scan state (`scan_index`, `scan_err_count`)** — `dali_start_background_scan()` is called from both the RTC_PIT ISR and the TCA0 callback chain (`scan_result_received`); the reset + initial queue is wrapped in `ATOMIC_BLOCK` so the two callers can't interleave.
-- **Streaming TX register reads** — the DRE ISR reads each `dali_holding_regs` word inside `ATOMIC_BLOCK` (TCA0 LVL1 can preempt the DRE ISR; the 16-bit load needs to be uninterruptible to avoid a torn high/low pair).
-- **Modbus error reporting** — `processSetSingleHoldingRegisterCommand` and `processSetSingleCoilCommand` branch on `daliResponseType` after `waitForDaliResponse()` and emit a Modbus exception when the DALI batch did not complete OK. Group-bank writes that change zero bits are reported as a no-op success.
-- **Broadcasts** — `inputIsValidModbusCommand()` only accepts deviceId 0 for write-style functions (`0x05`, `0x06`, `0x0F`); broadcast reads are dropped to avoid bus-collision responses. Once accepted, `was_broadcast` is set and `sendResponse` / `sendError` skip the actual transmission so the slave never replies on a broadcast — required by Modbus §2.4.1.
-- **Initial silence gate** — at startup the slave is in a "draining" state: the RXC ISR throws away every byte until `rs485Timer_timeout` reports 3.5 char of silence (≥ 4 ms at 9600 baud). This handles the case where the master was mid-frame at reset time — without the gate we would start latching from a random byte position, fail CRC, and waste bus time on retries. The gate is one-shot; once silence is observed the slave behaves normally for the rest of its uptime.
+- **DALI command queue (`commandQ`, `q_size`)** - `dali_queue_command()` wraps the size-check / slot-write / post-increment in `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)`, and atomically claims the "start TX" role by clearing `dali_idle` in the same block. This prevents a TCA0/TCB0 ISR (running e.g. `scan_result_received`) from compacting the queue between main's read of `q_size` and its slot write.
+- **Background scan state (`scan_index`, `scan_err_count`)** - `dali_start_background_scan()` is called from both the RTC_PIT ISR and the TCA0 callback chain (`scan_result_received`); the reset + initial queue is wrapped in `ATOMIC_BLOCK` so the two callers can't interleave.
+- **Streaming TX register reads** - the DRE ISR reads each `dali_holding_regs` word inside `ATOMIC_BLOCK` (TCA0 LVL1 can preempt the DRE ISR; the 16-bit load needs to be uninterruptible to avoid a torn high/low pair).
+- **Modbus error reporting** - `processSetSingleHoldingRegisterCommand` and `processSetSingleCoilCommand` branch on `daliResponseType` after `waitForDaliResponse()` and emit a Modbus exception when the DALI batch did not complete OK. Group-bank writes that change zero bits are reported as a no-op success.
+- **Broadcasts** - `inputIsValidModbusCommand()` only accepts deviceId 0 for write-style functions (`0x05`, `0x06`, `0x0F`); broadcast reads are dropped to avoid bus-collision responses. Once accepted, `was_broadcast` is set and `sendResponse` / `sendError` skip the actual transmission so the slave never replies on a broadcast - required by Modbus §2.4.1.
+- **Initial silence gate** - at startup the slave is in a "draining" state: the RXC ISR throws away every byte until `rs485Timer_timeout` reports 3.5 char of silence (≥ 4 ms at 9600 baud). This handles the case where the master was mid-frame at reset time - without the gate we would start latching from a random byte position, fail CRC, and waste bus time on retries. The gate is one-shot; once silence is observed the slave behaves normally for the rest of its uptime.
 
 ---
 
 ## Known Limitations
 
-Issues uncovered by the multi-agent protocol-compliance review that have been knowingly left unfixed. Each is bounded — none can lock the device up — but they are deviations or quirks worth being aware of.
+Issues uncovered by the multi-agent protocol-compliance review that have been knowingly left unfixed. Each is bounded - none can lock the device up - but they are deviations or quirks worth being aware of.
 
 ### Modbus
 
-- **0x0F (Write Multiple Coils) worst-case time can exceed master timeout.** The handler iterates per coil, waiting up to 600 ms per `waitForDaliResponse()`. With `MAX_MULTI_COIL_COUNT = 8`, a fully-NAKing batch takes ~4.8 s. Most masters time out at ~1 s. The WDT (8.2 s) protects the chip from a hang, but the master will declare a timeout, retransmit, and may interpret our late response as part of a new frame. **Mitigation when this matters:** keep individual 0x0F writes small (1–2 coils), or use 0x05 per coil in sequence.
-- **0x04 (Read Input Registers) returns an ASCII info string, not a register address space.** `MechDALI v0.1:` followed by 20 hex characters of the chip's unique serial number, packed two bytes per register. Generic Modbus discovery tools that expect a register file will see ASCII bytes — the master needs to know how to interpret the response.
-- **DALI exception sub-codes 0x20–0x33** (used by `dali_response_to_err` for collision / pulse / short-response failures) are outside Modbus's reserved 0x01–0x0B range. Strict masters may log them as unknown; lenient masters surface them verbatim.
+- **0x0F (Write Multiple Coils) worst-case time can exceed master timeout.** The handler iterates per coil, waiting up to 600 ms per `waitForDaliResponse()`. With `MAX_MULTI_COIL_COUNT = 8`, a fully-NAKing batch takes ~4.8 s. Most masters time out at ~1 s. The WDT (8.2 s) protects the chip from a hang, but the master will declare a timeout, retransmit, and may interpret our late response as part of a new frame. **Mitigation when this matters:** keep individual 0x0F writes small (1-2 coils), or use 0x05 per coil in sequence.
+- **0x04 (Read Input Registers) returns an ASCII info string, not a register address space.** `MechDALI v0.1:` followed by 20 hex characters of the chip's unique serial number, packed two bytes per register. Generic Modbus discovery tools that expect a register file will see ASCII bytes - the master needs to know how to interpret the response.
+- **DALI exception sub-codes 0x20-0x33** (used by `dali_response_to_err` for collision / pulse / short-response failures) are outside Modbus's reserved 0x01-0x0B range. Strict masters may log them as unknown; lenient masters surface them verbatim.
 
 ### DALI
 
-- **Group readback queries the wrong half of the cache.** `dali_add_to_group` always reads back via `GET_GROUPS0_7`, and `dali_remove_from_group` always reads back via `GET_GROUPS8_15`, regardless of which group bit changed. Result: cache for groups 8–15 is never refreshed by adds, and cache for groups 0–7 is never refreshed by removes. Background scan eventually corrects both within ~64 s. Pure cache drift; the device-side state is correct.
+- **Group readback queries the wrong half of the cache.** `dali_add_to_group` always reads back via `GET_GROUPS0_7`, and `dali_remove_from_group` always reads back via `GET_GROUPS8_15`, regardless of which group bit changed. Result: cache for groups 8-15 is never refreshed by adds, and cache for groups 0-7 is never refreshed by removes. Background scan eventually corrects both within ~64 s. Pure cache drift; the device-side state is correct.
 - **No collision detection during our own transmission.** The transmitter does not monitor RX while sending; if a second master starts transmitting concurrently, we don't notice and bus data is silently corrupted. Acceptable for the intended single-master deployment.
 - **WAIT_FOR_IDLE skipped after a NAK timeout.** `timeoutWaitingForResponse()` returns directly to IDLE rather than going through the 22 Te idle wait. Currently safe by coincidence: NAK_TIMEOUT (22 Te) + 4 Te stop bits already exceeds the 22 Te inter-frame requirement, so 26 Te of bus idle has elapsed before any new transmission begins. Defense-in-depth would route through `dali_wait_for_idle_state_enter()` instead.
 - **SET-helper sequences are not atomic against unrelated queue insertions.** `dali_set_min_level`, `_max_level`, `_fade_*`, `_power_*` issue three separate `dali_queue_command()` calls (DTR0 → SET_X → GET_X). A custom DALI command (Modbus 0x44) carrying a `0xA3xx` (SET_DTR0) opcode interleaved between these calls would corrupt DTR0 between SET and re-fire. Currently safe because nothing else in the firmware writes DTR0; would need an enqueue-batch API to fully close.
-- **Receiver dead band classifies 500–667 µs pulses as malformed.** The pulse-width classifier rejects any pulse in the 500–750 µs gap between the half-bit and full-bit windows. DALI 62386-101 puts the boundary closer to 666 µs, so a slightly off-spec ballast or noisy bus can produce 700 µs pulses that this firmware will treat as `PULSE_IN_MIDDLE` errors. Tighten by lowering `FULLBIT_MIN_TICKS` if interop with such ballasts is needed.
-- **`dali_set_fade_time` writes the basic fade-time register but the README's Bank 2 layout describes the high byte as "extended fade time".** After the fix to query `GET_FADE` instead of `GET_EXT_FADE`, the cache write `shortVal = val` is now the only thing that puts the user's fade-time value into bank 2 high — the readback updates bank 2 low (with the combined fade-time/rate byte). The cache reflects what the user wrote, not what the device's extended-fade-time register holds. To fully fix would require adding `SET_EXTENDED_FADE_TIME` (opcode 0x33) and routing `dali_set_fade_time` through it.
-- **Background scan consumes ~30 % of DALI bus duty cycle.** A full 64-address scan walks 10 GET commands per address; at ~25 ms per command (no NAK) to ~50 ms (with NAK), one full scan takes 16–32 s of bus activity. With the rescan period of 64 s, ~30–50 % of the bus is occupied by background scans, which can introduce 25–60 ms of latency for user-initiated commands.
+- **Receiver dead band classifies 500-667 µs pulses as malformed.** The pulse-width classifier rejects any pulse in the 500-750 µs gap between the half-bit and full-bit windows. DALI 62386-101 puts the boundary closer to 666 µs, so a slightly off-spec ballast or noisy bus can produce 700 µs pulses that this firmware will treat as `PULSE_IN_MIDDLE` errors. Tighten by lowering `FULLBIT_MIN_TICKS` if interop with such ballasts is needed.
+- **`dali_set_fade_time` writes the basic fade-time register but the README's Bank 2 layout describes the high byte as "extended fade time".** After the fix to query `GET_FADE` instead of `GET_EXT_FADE`, the cache write `shortVal = val` is now the only thing that puts the user's fade-time value into bank 2 high - the readback updates bank 2 low (with the combined fade-time/rate byte). The cache reflects what the user wrote, not what the device's extended-fade-time register holds. To fully fix would require adding `SET_EXTENDED_FADE_TIME` (opcode 0x33) and routing `dali_set_fade_time` through it.
+- **Background scan consumes ~30 % of DALI bus duty cycle.** A full 64-address scan walks 10 GET commands per address; at ~25 ms per command (no NAK) to ~50 ms (with NAK), one full scan takes 16-32 s of bus activity. With the rescan period of 64 s, ~30-50 % of the bus is occupied by background scans, which can introduce 25-60 ms of latency for user-initiated commands.
 
 ### RS-485 hardware
 
-- **DE pin floats for ~50–200 µs on every reset (cold boot, WDT, power glitch).** PA4 is high-Z from reset vector until `main.c`'s `OUTCLR PA4`. Common RS-485 transceivers don't have an internal pull-down on DE, so the line can momentarily assert and disrupt the bus. **Recommended fix: external 10 kΩ pull-down on PA4 at the next PCB rev.**
+- **DE pin floats for ~50-200 µs on every reset (cold boot, WDT, power glitch).** PA4 is high-Z from reset vector until `main.c`'s `OUTCLR PA4`. Common RS-485 transceivers don't have an internal pull-down on DE, so the line can momentarily assert and disrupt the bus. **Recommended fix: external 10 kΩ pull-down on PA4 at the next PCB rev.**
 - **No BOD configured.** A brown-out below ~1.8 V can leave USART registers (including TXEN) in undefined state, with no reset to recover; DE could end up driven high by stale USART state. **Recommended fix:** configure the `BODCFG` fuse for active-mode brown-out detection at ≥ 2.6 V, and remove `-R .fuse` from the Makefile so the fuse section actually flashes. Until then, the firmware assumes a stable supply ≥ 4.5 V (the 10 MHz operating minimum per the ATtiny1604 datasheet).
 
 Once both hardware mitigations are in place (external pull-down + BOD fuse), DE is provably safe across all power-event paths. Without them, the runtime is correct but reset windows are exposed.

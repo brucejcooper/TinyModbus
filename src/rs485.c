@@ -80,11 +80,11 @@ static volatile uint16_t streamCrc;      // running CRC over header + already-st
 volatile bool modbus_idle = true;
 static bool modbus_cmd_available = false;
 // Set when inputIsValidModbusCommand accepts a broadcast (deviceId 0) write. sendResponse and
-// sendError check this flag and skip the actual transmission — Modbus spec forbids slaves from
+// sendError check this flag and skip the actual transmission - Modbus spec forbids slaves from
 // responding to broadcasts; multiple slaves replying would collide on the bus.
 static bool was_broadcast = false;
 // Modbus §2.5.1.1: at startup the slave must observe 3.5 character times of silence on the bus
-// before accepting bytes as the start of a frame — otherwise we'd start latching mid-frame if
+// before accepting bytes as the start of a frame - otherwise we'd start latching mid-frame if
 // the master happened to be transmitting at reset time. While !initial_silence_observed the RXC
 // ISR drains incoming bytes (resetting the silence countdown each time); when rs485Timer_timeout
 // fires before any new byte, the flag is set and normal frame-accumulation begins.
@@ -112,7 +112,7 @@ static const uint16_t crc_table[256] = {
 
 // Computes CRC-16/Modbus over pkt[0..len-1], appends 2 CRC bytes, and sets the global sz to
 // the total transmit length. Caller must ensure the response (len + 2 + any further trailing
-// bytes) fits inside buf — sz is uint8_t and would wrap if len ≥ 254.
+// bytes) fits inside buf - sz is uint8_t and would wrap if len ≥ 254.
 static inline void appendCrc(uint8_t *pkt, uint8_t len) {
     if (len > MAX_PKT_SZ - 2) len = MAX_PKT_SZ - 2;
     uint16_t crc = 0xFFFF;
@@ -149,7 +149,7 @@ static inline bool inputIsValidModbusCommand() {
     uint8_t expectedSz = 255;
 
     if (cmdDeviceId == deviceId || cmdDeviceId == 0) {
-        // Per Modbus spec, broadcasts (deviceId 0) are write-only — multiple slaves replying
+        // Per Modbus spec, broadcasts (deviceId 0) are write-only - multiple slaves replying
         // to a broadcast read would collide. Only accept broadcasts for write functions.
         bool acceptBroadcast = false;
         switch (cmd) {
@@ -210,7 +210,7 @@ static void sendResponse(uint8_t *buf, uint8_t sz) {
 
 static void sendError(modbus_err_t err) {
     if (was_broadcast) {
-        // Same as sendResponse: don't transmit on a broadcast — even an exception. Just rearm RX.
+        // Same as sendResponse: don't transmit on a broadcast - even an exception. Just rearm RX.
         abandon_tx_re_enable_rx();
         return;
     }
@@ -271,7 +271,7 @@ static void processGetCoilsCommand() {
     uint16_t count = buf[4] << 8 | buf[5];
 
     // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t when the
-    // master sends a large addr (e.g. 65535) — without this, a wrap to a small value would pass
+    // master sends a large addr (e.g. 65535) - without this, a wrap to a small value would pass
     // the bound check and cause out-of-bounds reads of dali_holding_regs.
     if (count == 0) {
         sendError(MODBUS_ERR_ILLEGAL_VALUE);  // Modbus §7: count out of range → ILLEGAL_VALUE
@@ -282,7 +282,7 @@ static void processGetCoilsCommand() {
         return;
     }
 
-    // Pointer arithmetic must come after the bound check — forming a pointer more than one past
+    // Pointer arithmetic must come after the bound check - forming a pointer more than one past
     // an array's end is UB even if it's never dereferenced.
     uint16_t *sptr = (uint16_t *)dali_holding_regs.banks[DALI_STATUS_BANK] + addr;
     uint8_t numBytes = (count + 7) / 8;
@@ -300,13 +300,13 @@ static void processGetCoilsCommand() {
 
 // Reads holding registers and sends the response by streaming data directly from
 // dali_holding_regs in the DRE ISR. The DRE ISR reads each register fresh and folds the byte
-// into the CRC as it goes, so the CRC always matches the bytes actually sent — even if a TCA0
+// into the CRC as it goes, so the CRC always matches the bytes actually sent - even if a TCA0
 // ISR updates a register mid-response. Modbus RTU caps a read at 125 registers.
 static void sendHoldingRegs() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
 
-    // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t — see
+    // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t - see
     // processGetCoilsCommand for the equivalent justification. streamSrc would otherwise be
     // pointed past the end of dali_holding_regs and the streaming TX would read out-of-bounds.
     if (count == 0 || count > 125) {
@@ -390,7 +390,7 @@ static void sendInfo() {
 }
 
 // Stored as uint8_t (not dali_response_type_t) so reads and writes are single-instruction
-// atomic on AVR — both main and ISR contexts write here, and the original 16-bit storage
+// atomic on AVR - both main and ISR contexts write here, and the original 16-bit storage
 // could tear between PENDING (0x00FF) and any value with a non-zero high byte. The enum is
 // numbered to fit in 8 bits, so no information is lost.
 static volatile uint8_t daliResponseType;
@@ -506,7 +506,7 @@ static void processSetSingleHoldingRegisterCommand() {
                 }
                 waitForDaliResponse();
             } else {
-                // No bits actually changed — treat as a no-op success.
+                // No bits actually changed - treat as a no-op success.
                 daliResponseType = DALI_RESPONSE_OK;
             }
             break;
@@ -522,7 +522,7 @@ static void processSetSingleHoldingRegisterCommand() {
     }
 }
 
-// Forward declaration — defined in dali_state_idle.c. We call this directly (instead of
+// Forward declaration - defined in dali_state_idle.c. We call this directly (instead of
 // dali_off/dali_goto_last_active or dali_custom_command) because those helpers route through
 // track_fade and the singleton post_cmd_callback, which would race across iterations of the
 // per-coil loop below.
@@ -544,7 +544,7 @@ static void processSetCoilsCommand() {
 
     // (uint32_t) cast prevents addr+count from wrapping in uint16_t. Without it, a large addr
     // would alias to a small DALI address (after the << 9 shift in ENCODE_CMD's caller below),
-    // potentially even matching the broadcast address byte 0xFF — turning a stray write into
+    // potentially even matching the broadcast address byte 0xFF - turning a stray write into
     // a bus-wide GOTO_LAST_ACTIVE/OFF.
     if (count == 0 || count > MAX_MULTI_COIL_COUNT) {
         sendError(MODBUS_ERR_ILLEGAL_VALUE);  // Modbus §7: count range error → ILLEGAL_VALUE
@@ -586,7 +586,7 @@ static void processSetSingleCoilCommand() {
     }
 
     // Modbus §6.5: data must be 0xFF00 (ON) or 0x0000 (OFF). We additionally accept 0x55xx
-    // (any low byte) as a non-standard toggle extension — masters that don't know about it
+    // (any low byte) as a non-standard toggle extension - masters that don't know about it
     // simply won't use it. Anything else is an illegal value per spec.
     daliResponseType = DALI_RESPONSE_PENDING;
     if (buf[4] == 0x55) {
@@ -640,12 +640,12 @@ extern void rs485_init(uint8_t rs485_device_id) {
     RS485_PORT.PIN7CTRL = PORT_PULLUPEN_bm;
     RS485_PORT.PIN1CTRL = PORT_PULLUPEN_bm;
     RS485_PORT.OUTSET = RS485_TX_bm;                // PA1 (TXD) idles high.
-    RS485_PORT.OUTCLR = RS485_DE_bm;                // PA4 (DE) low for receive — pre-USART safety.
+    RS485_PORT.OUTCLR = RS485_DE_bm;                // PA4 (DE) low for receive - pre-USART safety.
     RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;  // PA1 (TXD) and PA4 (DE/XDIR) are outputs.
     RS485_PORT.DIRCLR = RS485_RX_bm;                // PA2 (RXD) is an input.
     // Note: once USART0 is enabled below with USART_RS485_EXT_gc, PA4 is taken over as the
     // hardware-driven XDIR signal. The USART asserts XDIR around active transmissions and
-    // deasserts it at TXC automatically — firmware should NOT manually toggle PA4 after this.
+    // deasserts it at TXC automatically - firmware should NOT manually toggle PA4 after this.
 
     USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD);  // Set Baud rate to 9600
     // N81 Async Sserial
@@ -655,7 +655,7 @@ extern void rs485_init(uint8_t rs485_device_id) {
 
     // Arm the 3.5-character initial-silence countdown. 3.5 char @ 9600 baud = 3.65 ms; with
     // TCA0 PER = 416.67 µs and an asynchronous decrement, rs485Timer = 10 yields a 9-10 tick
-    // window (3.75-4.17 ms) — both bounds comfortably above the spec minimum.
+    // window (3.75-4.17 ms) - both bounds comfortably above the spec minimum.
     initial_silence_observed = false;
     rs485Timer = 10;
 }
@@ -732,7 +732,7 @@ ISR(USART0_DRE_vect) {
 
         if (streamWords == 0 && streamHighByte) {
             // Just sent the final low byte. Park the running CRC and switch to buf-send mode
-            // for the trailing 2 CRC bytes (CRC low first, then CRC high — Modbus RTU).
+            // for the trailing 2 CRC bytes (CRC low first, then CRC high - Modbus RTU).
             buf[3] = streamCrc & 0xFF;
             buf[4] = streamCrc >> 8;
             ptr = buf + 3;
@@ -751,7 +751,7 @@ ISR(USART0_TXC_vect) {
     modbus_reset_buffer();
     modbus_idle = true;
 
-    // Drain any bytes the master sent during our transmission — they sit in the USART RX FIFO
+    // Drain any bytes the master sent during our transmission - they sit in the USART RX FIFO
     // (depth 2) and would otherwise be prepended to the next legitimate packet, corrupting its
     // length/CRC and forcing a timeout-driven recovery. Reading RXDATAL clears RXCIF.
     while (USART0.STATUS & USART_RXCIF_bm) {

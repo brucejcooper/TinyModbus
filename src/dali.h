@@ -57,16 +57,20 @@ typedef enum {
 #define DALI_RX_bm PIN1_bm
 #define DALI_RX_PINCTRL PIN1CTRL
 
+// All values fit in a uint8_t so the daliResponseType variable (declared as uint8_t in rs485.c)
+// can be read and written atomically from main and ISR contexts without ATOMIC_BLOCK.
+// dali_response_to_err in rs485.c relies on PULSE_TOO_SHORT..PULSE_TOO_LONG being sequential
+// after MALFORMED, and on the SHORT range covering 16 contiguous values.
 typedef enum {
   DALI_RESPONSE_OK = 0,
-  DALI_RESPONSE_NAK = 404,
-  DALI_RESPONSE_COLLISION = 409,
-  DALI_RESPONSE_MALFORMED = 500,
-  DALI_RESPONSE_PULSE_TOO_SHORT,
-  DALI_RESPONSE_PULSE_IN_MIDDLE,
-  DALI_RESPONSE_PULSE_TOO_LONG,
-  DALI_RESPONSE_SHORT = 600,
-  DALI_RESPONSE_PENDING = 255,
+  DALI_RESPONSE_NAK = 1,
+  DALI_RESPONSE_COLLISION = 2,
+  DALI_RESPONSE_MALFORMED = 3,
+  DALI_RESPONSE_PULSE_TOO_SHORT = 4,
+  DALI_RESPONSE_PULSE_IN_MIDDLE = 5,
+  DALI_RESPONSE_PULSE_TOO_LONG = 6,
+  DALI_RESPONSE_SHORT = 16,        // base for 16 short-response sub-codes (16..31)
+  DALI_RESPONSE_PENDING = 0xFF,    // sentinel; distinct from every value above
 } dali_response_type_t;
 
 

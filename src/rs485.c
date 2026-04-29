@@ -336,7 +336,11 @@ static void sendInfo() {
     }
 }
 
-static volatile dali_response_type_t daliResponseType;
+// Stored as uint8_t (not dali_response_type_t) so reads and writes are single-instruction
+// atomic on AVR — both main and ISR contexts write here, and the original 16-bit storage
+// could tear between PENDING (0x00FF) and any value with a non-zero high byte. The enum is
+// numbered to fit in 8 bits, so no information is lost.
+static volatile uint8_t daliResponseType;
 static volatile uint8_t daliResponse;
 
 static void waitForDaliResponse() {
@@ -664,6 +668,13 @@ ISR(USART0_DRE_vect) {
 ISR(USART0_TXC_vect) {
     modbus_reset_buffer();
     modbus_idle = true;
+
+    // Drain any bytes the master sent during our transmission — they sit in the USART RX FIFO
+    // (depth 2) and would otherwise be prepended to the next legitimate packet, corrupting its
+    // length/CRC and forcing a timeout-driven recovery. Reading RXDATAL clears RXCIF.
+    while (USART0.STATUS & USART_RXCIF_bm) {
+        (void)USART0.RXDATAL;
+    }
 
     // Clear any pending flags.
     USART0.STATUS = USART_RXSIF_bm | USART_TXCIF_bm;

@@ -118,6 +118,13 @@ void dali_state_receiving_enter() {
     // We want to start TCA0 as soon as possible, to mirror the pulse widths being measured by TCB0.
     // However, in the wait_for_respone state, the timer would have been taken over with its own timeout.
     // As a result, we must take over the timer again.
+    //
+    // We're called from PORTB_PORT_vect (LVL0) while daliTimer is still mid-countdown from
+    // dali_wait_for_response_state_enter. daliTimerCallback is a 16-bit pointer and is written
+    // with two non-atomic STS instructions; if TCA0 LVL1 fires between them and daliTimer hits
+    // zero in the same cycle, the dispatched callback would be a torn pointer. Zeroing daliTimer
+    // first suppresses any in-flight dispatch while we swap the pointer.
+    daliTimer = 0;
     daliTimerCallback = timerOverflow;
     daliTimer = 5; // Anything between 2 and 2.5 bits
 }

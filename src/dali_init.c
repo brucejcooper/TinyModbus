@@ -90,8 +90,15 @@ ISR(PORTB_PORT_vect) {
         // wiped by the trailing clear, and we'd miss it.
         DALI_PORT.INTFLAGS = DALI_RX_bm;
         DALI_PORT.DALI_RX_PINCTRL = 0;  // Disable until the callback re-arms.
-        if (dali_rx_callback) {
-            dali_rx_callback();
+        // dali_rx_callback is a 16-bit function pointer; this ISR runs at LVL0 and can be
+        // preempted by TCA0 LVL1, whose callback chains rewrite dali_rx_callback. Snapshot
+        // the pointer atomically so we never call a torn (partly-old / partly-new) value.
+        void (*cb)();
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            cb = dali_rx_callback;
+        }
+        if (cb) {
+            cb();
         }
     }
 }

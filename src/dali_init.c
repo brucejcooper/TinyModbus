@@ -12,11 +12,10 @@
 // Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
 
 /**
- * @brief We may want to do different things with the DALI rising signal interrupt.  This stores a pointer to the current thing.
- * May be NULL to do nothing.
- *
+ * @brief Current handler for the DALI RX pin interrupt — used for both rising-edge (start of
+ * external transmission) and level-low (bus released) one-shot waits. May be NULL to do nothing.
  */
-void (*dali_rx_rising_callback)() = NULL;
+void (*dali_rx_callback)() = NULL;
 
 // PIT fires once per second; trigger a full bus rescan every RESCAN_PERIOD seconds.
 #define RESCAN_PERIOD 64
@@ -67,20 +66,20 @@ uint8_t dali_is_bus_shorted() {
 }
 
 void dali_call_on_rising_once(void (*callback)()) {
-    dali_rx_rising_callback = callback;
+    dali_rx_callback = callback;
     DALI_PORT.INTFLAGS = DALI_RX_bm;                 // Clear any pending interrupts.
     DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_RISING_gc;  // Enable ISR 
 }
 
 void dali_call_on_low_once(void (*callback)()) {
-    dali_rx_rising_callback = callback;
+    dali_rx_callback = callback;
     DALI_PORT.INTFLAGS = DALI_RX_bm;                // Clear any pending interrupts.
     DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_LEVEL_gc;  // Enable ISR 
 }
 
 void dali_cancel_edge_detect() {
     DALI_PORT.DALI_RX_PINCTRL = 0;
-    dali_rx_rising_callback = NULL;
+    dali_rx_callback = NULL;
 }
 
 // This controls the one-shot event on rising for detecting the start of data.
@@ -91,8 +90,8 @@ ISR(PORTB_PORT_vect) {
         // wiped by the trailing clear, and we'd miss it.
         DALI_PORT.INTFLAGS = DALI_RX_bm;
         DALI_PORT.DALI_RX_PINCTRL = 0;  // Disable until the callback re-arms.
-        if (dali_rx_rising_callback) {
-            dali_rx_rising_callback();
+        if (dali_rx_callback) {
+            dali_rx_callback();
         }
     }
 }

@@ -468,7 +468,7 @@ A single read can return up to the Modbus RTU limit of 125 registers without eve
 | **Static total** | **849** |
 | **Stack headroom** | **175** |
 
-Stack is well above the 150-byte minimum needed for the deepest interrupt-nested call chain (TCA0 ISR preempting USART_RXC, with the deepest path being `process_command_response` → callback → `dali_queue_command` → `dali_transmitting_state_enter`), with margin for the AVR-libc ISR prologue.
+The build sets `-fstack-usage`, emitting per-function `.su` files in `build/` after each compile. The deepest interrupt-nested call chain measured from those files (main thread executing `dali_set_min_level` → `dali_queue_command` → `dali_transmitting_state_enter`, USART0_RXC ISR preempting it, TCA0 LVL1 preempting USART0_RXC and running the full receive-timeout chain through `process_command_response` → `scan_result_received` → `dali_start_background_scan` → `dali_queue_command` → `dali_transmitting_state_enter`) consumes **≈ 100 bytes** of stack. Worst-case with safety margin for ISR register saves is ≈ 115 bytes, leaving ≈ 60 bytes of headroom against the 175-byte budget. Re-check `build/*.su` after any change that materially deepens a frame.
 
 ### Flash Budget
 

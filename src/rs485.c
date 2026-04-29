@@ -236,7 +236,10 @@ static void processGetCoilsCommand() {
     uint16_t count = buf[4] << 8 | buf[5];
     uint16_t *sptr = (uint16_t *)dali_holding_regs.banks[DALI_STATUS_BANK] + addr;
 
-    if (count == 0 || addr + count > DALI_MAX_DEVICES) {
+    // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t when the
+    // master sends a large addr (e.g. 65535) — without this, a wrap to a small value would pass
+    // the bound check and cause out-of-bounds reads of dali_holding_regs.
+    if (count == 0 || (uint32_t)addr + count > DALI_MAX_DEVICES) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
         return;
     }
@@ -262,7 +265,10 @@ static void sendHoldingRegs() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
 
-    if (count == 0 || count > 125 || addr + count > DALI_MAX_HOLDING_REGISTER) {
+    // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t — see
+    // processGetCoilsCommand for the equivalent justification. streamSrc would otherwise be
+    // pointed past the end of dali_holding_regs and the streaming TX would read out-of-bounds.
+    if (count == 0 || count > 125 || (uint32_t)addr + count > DALI_MAX_HOLDING_REGISTER) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
         return;
     }
@@ -325,14 +331,17 @@ static void sendInfo() {
     *ptr++ = 0; // Just in case the resulting string length is odd.
     uint8_t strRegs = (VERSTR_LEN + 20 + 1) / 2;  // VERSTR + 20 hex chars, rounded up to whole registers
 
-    if (count > 0 && addr + count <= strRegs) {
-        buf[2] = count * 2;
-        if (addr > 0)
-            memmove(buf + 3, buf + 3 + addr * 2, count * 2);
-        sendResponse(buf, count * 2 + 3);
-    } else {
+    // (uint32_t) cast: with addr/count both uint16_t, addr+count can wrap to a small value
+    // when addr is large; without the cast the bound check would pass and memmove(buf+3,
+    // buf+3+addr*2, count*2) would read out of bounds.
+    if (count == 0 || (uint32_t)addr + count > strRegs) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+        return;
     }
+    buf[2] = count * 2;
+    if (addr > 0)
+        memmove(buf + 3, buf + 3 + addr * 2, count * 2);
+    sendResponse(buf, count * 2 + 3);
 }
 
 // Stored as uint8_t (not dali_response_type_t) so reads and writes are single-instruction
@@ -488,7 +497,11 @@ static void processSetCoilsCommand() {
     uint16_t count = buf[4] << 8 | buf[5];
     uint8_t numBytes = buf[6];
 
-    if (count == 0 || count > MAX_MULTI_COIL_COUNT || addr + count > DALI_MAX_DEVICES) {
+    // (uint32_t) cast prevents addr+count from wrapping in uint16_t. Without it, a large addr
+    // would alias to a small DALI address (after the << 9 shift in ENCODE_CMD's caller below),
+    // potentially even matching the broadcast address byte 0xFF — turning a stray write into
+    // a bus-wide GOTO_LAST_ACTIVE/OFF.
+    if (count == 0 || count > MAX_MULTI_COIL_COUNT || (uint32_t)addr + count > DALI_MAX_DEVICES) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
         return;
     }

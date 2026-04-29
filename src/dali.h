@@ -42,7 +42,7 @@
 #define DALI_CMD_QUERY_GROUP_0_7      0xC0u
 #define DALI_CMD_QUERY_GROUP_8_15     0xC1u
 
-// Configuration commands — require SEND_TWICE; DTR0 loaded with new value first
+// Configuration commands - require SEND_TWICE; DTR0 loaded with new value first
 #define DALI_CMD_SET_MAX_LEVEL        0x2Au
 #define DALI_CMD_SET_MIN_LEVEL        0x2Bu
 #define DALI_CMD_SET_SYS_FAIL_LEVEL   0x2Cu
@@ -108,7 +108,7 @@ void dali_state_receiving_prepare(void);
 // Assumes dali_state_receiving_prepare() was called first.
 void dali_state_receiving_enter(void);
 
-// Single authority for post-command state transitions — called from ISR context.
+// Single authority for post-command state transitions - called from ISR context.
 // Updates the target register (if any), fires the optional callback, decrements
 // repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
 void cmdq_result_received(dali_response_type_t type, uint8_t value);

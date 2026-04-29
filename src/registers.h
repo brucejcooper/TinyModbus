@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include "types.h"
 
-// Paired structs — stored high-byte first to match Modbus wire format.
+// Paired structs - stored high-byte first to match Modbus wire format.
 // Blocks can be memcpy'd directly into FC04 response buffers.
 typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
 typedef struct { uint8_t min;       uint8_t max;        } ballast_mm_t;
@@ -58,14 +58,14 @@ extern register_map_t g_regs;
 
 // ---- Modbus holding register (FC03/FC06) addresses ------------------------
 
-// Raw DALI forward frame — [15:8]=frame byte 0, [7:0]=frame byte 1
+// Raw DALI forward frame - [15:8]=frame byte 0, [7:0]=frame byte 1
 #define MBREG_RAW_CMD           0x1000u  // single send, waits for response
 #define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
 
-// Direct arc power control — [15:8]=DALI address byte, [7:0]=arc level
+// Direct arc power control - [15:8]=DALI address byte, [7:0]=arc level
 #define MBREG_DAPC              0x1002u
 
-// Per-ballast action commands — write low byte = DALI address byte
+// Per-ballast action commands - write low byte = DALI address byte
 #define MBREG_GOTO_LAST_ACTIVE  0x1003u
 #define MBREG_OFF               0x1004u
 #define MBREG_UP                0x1005u
@@ -75,12 +75,12 @@ extern register_map_t g_regs;
 #define MBREG_RECALL_MAX        0x1009u
 #define MBREG_RECALL_MIN        0x100Au
 
-// DTR set commands — write low byte = value to load into DTR
+// DTR set commands - write low byte = value to load into DTR
 #define MBREG_SET_DTR0          0x100Bu
 #define MBREG_SET_DTR1          0x100Cu
 #define MBREG_SET_DTR2          0x100Du
 
-// Bus scan — write 0x0001 to trigger a full bus scan
+// Bus scan - write 0x0001 to trigger a full bus scan
 #define MBREG_SCAN_TRIGGER      0x1010u
 
 // Configuration registers (persisted to EEPROM)
@@ -116,7 +116,7 @@ bool     regs_read_holding(uint16_t addr, uint16_t *val);
 
 // Write one FC06/FC10 holding register; validates value range for config registers.
 // Returns false if addr is unknown or val is out of range.
-// Does NOT enqueue DALI commands — dispatch_action_reg in modbus.c does that.
+// Does NOT enqueue DALI commands - dispatch_action_reg in modbus.c does that.
 bool     regs_write_holding(uint16_t addr, uint16_t val);
 
 // Store one field from a DALI query response into the appropriate register block.
@@ -137,7 +137,7 @@ void     regs_clear_ballast(uint8_t ballast_idx);
 uint16_t regs_read_clear_dirty(uint8_t word_idx);
 
 // Recompute group membership for ballast_idx from a QUERY_GROUP response byte.
-// high_groups=false → groups 0–7; high_groups=true → groups 8–15.
+// high_groups=false → groups 0-7; high_groups=true → groups 8-15.
 // Rebuilds the 8 group_status entries for the affected half only.
 void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups);
 

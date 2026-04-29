@@ -8,10 +8,10 @@ extern volatile bool modbus_idle;
 
 void modbus_init(uint8_t slave_addr);
 
-// Called from main loop — processes one complete Modbus frame if available.
+// Called from main loop - processes one complete Modbus frame if available.
 void modbus_process(void);
 
-// Called from TCA0_OVF ISR — drives the inter-character silence timer.
+// Called from TCA0_OVF ISR - drives the inter-character silence timer.
 void modbus_tick(void);
 
 #endif

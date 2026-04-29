@@ -18,7 +18,7 @@ extern volatile tick_cb_t dali_timer_cb;
 
 void tick_init(void);
 
-// Called from TCA0_OVF ISR — fires dali_timer callback when countdown hits 0.
+// Called from TCA0_OVF ISR - fires dali_timer callback when countdown hits 0.
 void dali_tick(void);
 
 // Prototypes for the other ISR-dispatched tick functions (implemented in their modules).

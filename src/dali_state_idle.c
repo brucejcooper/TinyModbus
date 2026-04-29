@@ -24,7 +24,7 @@ static void external_message_started(void) {
     dali_wait_for_idle_state_enter();
 }
 
-// ---- cmdq_result_received — called from ISR context --------------------
+// ---- cmdq_result_received - called from ISR context --------------------
 
 // Processes the result of the head-of-queue command:
 //   - updates the target register (if any)
@@ -74,7 +74,7 @@ void dali_idle_state_enter(void) {
     if (!cmdq_empty()) {
         cleanup();
         if (dali_is_bus_active()) {
-            // Bus became active between the idle check and now — wait for it to clear.
+            // Bus became active between the idle check and now - wait for it to clear.
             dali_wait_for_idle_state_enter();
         } else {
             cmd_entry_t cmd;

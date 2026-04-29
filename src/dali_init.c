@@ -1,16 +1,23 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <stdbool.h>
+#include <util/atomic.h>
 
 #include "dali.h"
 #include "tick.h"
 
 // One-shot callback pointer armed by dali_call_on_rising_once / dali_call_on_low_once.
 // Cleared by the ISR immediately before firing so it cannot fire twice.
-void (*dali_rx_rising_callback)(void) = NULL;
+//
+// PORTB_PORT_vect runs at LVL0 and reads this pointer with two LDS instructions; TCB0
+// (LVL1) can preempt during the read and rewrite the pointer through the
+// cmdq_result_received chain (which calls dali_idle_state_enter / dali_call_on_rising_once).
+// Both reads and LVL0 writes are wrapped in ATOMIC_BLOCK to keep the 16-bit access
+// uninterruptible.
+void (*dali_rx_callback)(void) = NULL;
 
 void dali_init(void) {
-    // TX: output, initially low (open-drain, OUTCLR stays low — only DIR is toggled)
+    // TX: output, initially low (open-drain, OUTCLR stays low - only DIR is toggled)
     DALI_PORT.OUTCLR = DALI_TX_bm;
     DALI_PORT.DIRSET = DALI_TX_bm;
 
@@ -38,27 +45,43 @@ uint8_t dali_is_bus_active(void) {
 }
 
 void dali_call_on_rising_once(void (*callback)(void)) {
-    dali_rx_rising_callback = callback;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_rx_callback = callback;
+    }
     DALI_PORT.INTFLAGS       = DALI_RX_bm;
     DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_RISING_gc;
 }
 
 void dali_call_on_low_once(void (*callback)(void)) {
-    dali_rx_rising_callback = callback;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_rx_callback = callback;
+    }
     DALI_PORT.INTFLAGS       = DALI_RX_bm;
     DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_LEVEL_gc;
 }
 
 void dali_cancel_edge_detect(void) {
     DALI_PORT.DALI_RX_PINCTRL = 0;
-    dali_rx_rising_callback   = NULL;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_rx_callback = NULL;
+    }
 }
 
 ISR(PORTB_PORT_vect) {
+    // Clear INTFLAGS at the start of the ISR so an edge that arrives after the callback
+    // re-arms PINCTRL (e.g. start_receiving_response → dali_state_receiving_prepare)
+    // is not clobbered by a trailing flag-clear at the end of this handler.
     if (DALI_PORT.INTFLAGS & DALI_RX_bm) {
-        DALI_PORT.DALI_RX_PINCTRL = 0;
         DALI_PORT.INTFLAGS = DALI_RX_bm;
-        if (dali_rx_rising_callback)
-            dali_rx_rising_callback();
+        DALI_PORT.DALI_RX_PINCTRL = 0;
+
+        // Snapshot the 16-bit pointer atomically: TCB0 (LVL1) can preempt this LVL0 ISR
+        // and rewrite dali_rx_callback through the cmdq_result_received chain.
+        void (*cb)(void);
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            cb = dali_rx_callback;
+        }
+        if (cb)
+            cb();
     }
 }

@@ -36,9 +36,9 @@ bool         cmdq_peek(cmd_entry_t *entry);
 // Remove the head entry.  No-op if empty.
 void         cmdq_pop(void);
 
-// Push a Direct Arc Power Control (DAPC) command — sets arc level directly.
+// Push a Direct Arc Power Control (DAPC) command - sets arc level directly.
 // dali_addr: encoded DALI address byte (use DALI_SHORT_ADDR / DALI_GROUP_ADDR / DALI_BROADCAST).
-// ballast_idx: register map index (0–63), or 0xFF for group/broadcast commands.
+// ballast_idx: register map index (0-63), or 0xFF for group/broadcast commands.
 sys_result_t cmdq_push_arc(uint8_t dali_addr, uint8_t level, uint8_t ballast_idx);
 
 // Push a single-send command with no register update on completion.

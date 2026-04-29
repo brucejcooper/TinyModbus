@@ -3,13 +3,13 @@
 
 #include <stdint.h>
 
-// Called from TCA0_OVF ISR — no-op, kept for API compatibility.
+// Called from TCA0_OVF ISR - no-op, kept for API compatibility.
 void bgtasks_tick(void);
 
-// Called from main loop — starts a bus scan when one is pending.
+// Called from main loop - starts a bus scan when one is pending.
 void bgtasks_run(void);
 
-// Trigger a full bus scan (addr 0–63).  Safe to call from main loop or ISR.
+// Trigger a full bus scan (addr 0-63).  Safe to call from main loop or ISR.
 void bgtasks_trigger_scan(void);
 
 // Start a reactive fade-tracking chain for a single short-address ballast.

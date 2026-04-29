@@ -26,10 +26,27 @@ static const uint16_t s_baud_reg[] = {
     (uint16_t)USART0_BAUD_RATE(38400),
 };
 
-// 3.5-character silence threshold in TCA0 ticks (~416 µs each), per baud rate.
-// 9600: 3.5×10/9600 = 3.65 ms → 9 ticks; 19200 → 5; 38400 → 3.
-static const uint8_t  s_silence_threshold[] = { 9, 5, 3 };
+// 3.5-character silence threshold in TCA0 ticks (~417 µs each), per baud rate.
+// USART is configured for 1 start + 8 data + 1 stop = 10 bits/char.  The first decrement
+// after a byte arrival can land anywhere from 0 to 1 tick later, so silence_ticks = N
+// gives an observed silence window of (N-1) to N ticks.  N is sized so the lower bound
+// (N-1 ticks) meets Modbus §2.5.1.1's 3.5-char minimum.
+//   3.5 char @ 9600  = 3.65 ms = 8.74 ticks -> N = 10 -> 9-10 ticks (3.75-4.17 ms)
+//   3.5 char @ 19200 = 1.82 ms = 4.37 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
+//   3.5 char @ 38400 = 0.91 ms = 2.19 ticks -> N = 4  -> 3-4  ticks (1.25-1.67 ms)
+static const uint8_t  s_silence_threshold[] = { 10, 6, 4 };
 static volatile uint8_t  s_silence_ticks;
+
+// Modbus §2.5.1.1 initial-silence gate.  After reset (power-on or WDT) the slave must
+// observe 3.5 char of bus silence before treating bytes as the start of a new frame -
+// otherwise we would latch onto whatever byte position the master happens to be sending
+// if it was mid-frame at reset, fail CRC, and waste bus time on the recovery cycle.
+//
+// While clear, the RXC ISR drains incoming bytes (resetting the silence countdown each
+// time a byte/SFD arrives) but does not accumulate them into buf.  When the silence
+// countdown completes without an intervening byte, the flag flips to true and normal
+// frame accumulation resumes.  One-shot for the lifetime of the chip.
+static volatile bool initial_silence_observed = false;
 
 #define FC_READ_COILS        0x01
 #define FC_READ_HOLDING      0x03
@@ -141,7 +158,7 @@ static void send_error(mb_err_t err) {
     start_tx(3);
 }
 
-// ---- Dispatch table for action registers 0x1003–0x100A -----------------
+// ---- Dispatch table for action registers 0x1003-0x100A -----------------
 // Write value low byte = DALI address byte; high byte ignored.
 
 typedef struct {
@@ -259,7 +276,7 @@ static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, u
     }
 }
 
-// ---- FC04 — read input registers ----------------------------------------
+// ---- FC04 - read input registers ----------------------------------------
 
 // Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
 // at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.
@@ -282,7 +299,14 @@ static void process_fc04(void) {
         return;
     }
 
-    if (count == 0 || count > MAX_REG_RD || addr + count > FC04_MAX_ADDR + 1u) {
+    if (count == 0 || count > MAX_REG_RD) {
+        send_error(MB_ERR_ILLEGAL_VALUE);
+        return;
+    }
+    // addr and count come straight off the wire as 16-bit values; the addition can
+    // wrap inside uint16_t (e.g. addr=0xFFFF, count=1 → sum=0) and pass the bound
+    // check.  Cast to uint32_t so the comparison happens at full precision.
+    if ((uint32_t)addr + count > (uint32_t)FC04_MAX_ADDR + 1u) {
         send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
@@ -301,7 +325,7 @@ static void process_fc04(void) {
     start_tx(3 + buf[2]);
 }
 
-// ---- FC03 — read holding registers --------------------------------------
+// ---- FC03 - read holding registers --------------------------------------
 
 // Handle FC03 (Read Holding Registers).  Returns an exception if any address in
 // the requested range is not in the holding register map.
@@ -309,11 +333,17 @@ static void process_fc03(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-    if (count == 0 || count > MAX_REG_RD) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
+    if (count == 0 || count > MAX_REG_RD) { send_error(MB_ERR_ILLEGAL_VALUE); return; }
 
     buf[2] = (uint8_t)(count * 2u);
     uint8_t *response_ptr = buf + 3;
-    for (uint16_t reg_addr = addr; reg_addr < addr + count; reg_addr++) {
+    // Iterate by offset, not `reg_addr < addr + count`: with addr=0xFFFF and count=2 the
+    // upper bound wraps to 0x0001 in uint16_t and the loop body never runs, but buf[2] has
+    // already been set to 4 - start_tx would then ship 4 bytes of stale buffer.  Iterating
+    // by index keeps the iteration count exact, and any wrapped reg_addr that doesn't map
+    // to a real holding register fails regs_read_holding and triggers ILLEGAL_ADDRESS.
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t reg_addr = (uint16_t)(addr + i);
         uint16_t reg_value = 0;
         if (!regs_read_holding(reg_addr, &reg_value)) {
             send_error(MB_ERR_ILLEGAL_ADDRESS);
@@ -325,7 +355,7 @@ static void process_fc03(void) {
     start_tx(3 + buf[2]);
 }
 
-// ---- FC06 / FC10 — write register(s) -----------------------------------
+// ---- FC06 / FC10 - write register(s) -----------------------------------
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
@@ -474,7 +504,7 @@ static void process_fc10(void) {
     start_tx(6);
 }
 
-// ---- FC01 / FC05 / FC0F — coils (ballast on/off state) ------------------
+// ---- FC01 / FC05 / FC0F - coils (ballast on/off state) ------------------
 //
 // Coil N maps to ballast N (0-63).  A coil reads as 1 when the ballast is
 // present (per present bitmask) and brightness > 0.
@@ -486,7 +516,9 @@ static void process_fc01(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
-    if (count == 0 || addr >= 64u || addr + count > 64u) {
+    if (count == 0) { send_error(MB_ERR_ILLEGAL_VALUE);   return; }
+    // (uint32_t) cast prevents wrap when addr is near 0xFFFF.
+    if (addr >= 64u || (uint32_t)addr + count > 64u) {
         send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
@@ -537,9 +569,13 @@ static void process_fc0f(void) {
     uint16_t count  = ((uint16_t)buf[4] << 8) | buf[5];
     uint8_t  nbytes = buf[6];
 
-    if (count == 0 || addr >= 64u || addr + count > 64u ||
-            nbytes != (uint8_t)((count + 7u) >> 3)) {
+    if (count == 0 || nbytes != (uint8_t)((count + 7u) >> 3)) {
         send_error(MB_ERR_ILLEGAL_VALUE);
+        return;
+    }
+    // (uint32_t) cast prevents wrap when addr is near 0xFFFF.
+    if (addr >= 64u || (uint32_t)addr + count > 64u) {
+        send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
 
@@ -637,9 +673,13 @@ void modbus_init(uint8_t addr) {
     rx_sz       = 0;
     frame_ready = false;
     modbus_idle = true;
+    initial_silence_observed = false;
 
     uint8_t bidx = (g_regs.baud_index <= 2) ? g_regs.baud_index : 0;
     s_silence_ticks = s_silence_threshold[bidx];
+    // Arm the initial 3.5-char silence countdown.  modbus_tick will set
+    // initial_silence_observed when it expires without an intervening byte.
+    silence_ticks = s_silence_ticks;
 
     PORTMUX.CTRLB          = PORTMUX_USART0_ALTERNATE_gc;
     RS485_PORT.PIN1CTRL    = PORT_PULLUPEN_bm;
@@ -657,10 +697,17 @@ void modbus_init(uint8_t addr) {
 
 void modbus_tick(void) {
     // Silence counter: decremented here, frame_ready set when it hits 0.
-    // The silence threshold is set (reset to non-zero) by the RXC ISR.
+    // The silence threshold is set (reset to non-zero) by the RXC ISR and at boot
+    // (to arm the initial-silence gate).
     if (silence_ticks) {
         silence_ticks--;
         if (!silence_ticks) {
+            if (!initial_silence_observed) {
+                // 3.5 char of post-reset silence has elapsed - switch on normal
+                // frame accumulation.  No frame to validate yet.
+                initial_silence_observed = true;
+                return;
+            }
             if (frame_is_valid()) {
                 frame_ready = true;
                 USART0.CTRLA = USART_RS485_EXT_gc;  // Disable RX ISRs during processing
@@ -709,6 +756,13 @@ ISR(USART0_DRE_vect) {
 }
 
 ISR(USART0_TXC_vect) {
+    // Drain any bytes the master sent during our transmission - they sit in the
+    // USART RX FIFO (depth 2) and would otherwise be prepended to the next
+    // legitimate packet, corrupting its length/CRC and forcing a timeout-driven
+    // recovery.  Reading RXDATAL clears RXCIF.
+    while (USART0.STATUS & USART_RXCIF_bm) {
+        (void)USART0.RXDATAL;
+    }
     return_to_rx();
 }
 
@@ -716,6 +770,18 @@ ISR(USART0_RXC_vect) {
     modbus_idle    = false;
     silence_ticks  = s_silence_ticks;
     USART0.STATUS  = USART_RXSIF_bm;
+
+    if (!initial_silence_observed) {
+        // Modbus §2.5.1.1: until 3.5 char of post-reset silence has been observed,
+        // any incoming byte is residue from a frame already in progress at reset
+        // time.  Drain it (clears RXCIF) but do not accumulate; the silence reset
+        // above re-arms the countdown so the gate only fires once the master
+        // finishes its in-progress frame.
+        if (USART0.STATUS & USART_RXCIF_bm) {
+            (void)USART0.RXDATAL;
+        }
+        return;
+    }
 
     if (USART0.STATUS & USART_RXCIF_bm) {
         uint8_t val = USART0.RXDATAL;

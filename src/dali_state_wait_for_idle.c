@@ -10,7 +10,7 @@
 
 static void on_bus_shorted(void);
 
-// The 22 TE quiet period has elapsed; the bus is clean — dispatch the next command.
+// The 22 TE quiet period has elapsed; the bus is clean - dispatch the next command.
 static void idle_period_expired(void) {
     dali_cancel_edge_detect();
     dali_idle_state_enter();
@@ -31,7 +31,7 @@ static void bus_stuck_timeout(void) {
     dali_idle_state_enter();
 }
 
-// Bus went high — another master is active, or a collision occurred.
+// Bus went high - another master is active, or a collision occurred.
 // Wait for it to release the bus (go low), then begin the idle countdown.
 static void on_bus_shorted(void) {
     dali_call_on_low_once(on_idle_bus);

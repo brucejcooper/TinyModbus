@@ -73,15 +73,26 @@ void dali_state_receiving_prepare(void) {
     shift_reg = 0;
     num_bits  = 0;
     TCB0.CTRLA   = 0;
-    TCB0.CNT     = 73;  // pre-bias absorbs ISR entry latency (~2–4 µs at 10 MHz)
+    TCB0.CNT     = 73;  // pre-bias absorbs ISR entry latency (~2-4 µs at 10 MHz)
     TCB0.EVCTRL  = TCB_CAPTEI_bm | TCB_EDGE_bm;
     TCB0.INTCTRL = TCB_CAPT_bm;
 }
 
 void dali_state_receiving_enter(void) {
-    TCB0.CTRLA   = TCB_CLKSEL_CLKDIV1_gc | TCB_ENABLE_bm;
+    // dali_timer is still mid-countdown from dali_wait_for_response_state_enter; zero it
+    // first to suppress any pending dispatch of the previous (timeout_waiting_for_response)
+    // callback while we swap the pointer.  Without this, TCA0 dispatch could fire on the
+    // OLD callback once dali_timer expires, even though we have just transitioned out of
+    // wait-for-response.  Order is important: timer to 0, then the pointer write, then
+    // the new countdown.
+    dali_timer    = 0;
+    TCB0.CTRLA    = TCB_CLKSEL_CLKDIV1_gc | TCB_ENABLE_bm;
     TCB0.INTFLAGS = TCB_CAPT_bm;
-    dali_timer_cb = timer_overflow;
+    // TCB0 is now armed; a pulse-decoder error inside TCB0_INT_vect (LVL1) can preempt
+    // the LDS pair below and rewrite dali_timer_cb through cmdq_result_received.
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_timer_cb = timer_overflow;
+    }
     dali_timer    = 5;
 }
 

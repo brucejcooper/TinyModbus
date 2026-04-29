@@ -16,7 +16,7 @@ static volatile uint16_t rescan_counter  = 64u;  // matches default MBREG_RESCAN
 static volatile bool     scan_trigger    = false;
 
 // ---- Fade chain state ---------------------------------------------
-// One bit per ballast (64 ballasts = 4 × uint16_t).
+// One bit per ballast (64 ballasts = 4 x uint16_t).
 // Set while a self-sustaining STATUS → BRIGHTNESS → STATUS chain
 // is active for that ballast.  Prevents duplicate chains.
 
@@ -193,7 +193,7 @@ void bgtasks_run(void) {
     }
 }
 
-// ---- RTC PIT — periodic rescan (same cadence as original) ----------
+// ---- RTC PIT - periodic rescan (same cadence as original) ----------
 
 ISR(RTC_PIT_vect) {
     uint16_t interval = regs_get_rescan_interval();

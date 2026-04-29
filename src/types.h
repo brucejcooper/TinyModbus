@@ -16,7 +16,7 @@ typedef enum {
 } dali_response_type_t;
 
 typedef enum __attribute__((packed)) {
-    CMD_DIRECT_ARC,   // DAPC — no backward frame expected
+    CMD_DIRECT_ARC,   // DAPC - no backward frame expected
     CMD_SEND,         // single send, no backward frame expected
     CMD_SEND_TWICE,   // two sends within ~50ms (DALI config commands)
     CMD_QUERY,        // single send, backward frame expected
@@ -45,7 +45,7 @@ typedef struct {
     cmd_type_t      type;
     uint8_t         dali_addr;    // encoded DALI address byte
     uint8_t         dali_cmd;     // command byte or arc level
-    uint8_t         ballast_idx;  // 0–63; 0xFF for non-ballast cmds
+    uint8_t         ballast_idx;  // 0-63; 0xFF for non-ballast cmds
     reg_target_t    reg_target;   // where to store query response
     uint8_t         repeat;       // remaining sends: 1 normally, 2 for CMD_SEND_TWICE
     cmd_result_cb_t on_result;    // NULL for most commands; used by scan/fade

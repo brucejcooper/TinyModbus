@@ -13,34 +13,6 @@
 
 
 
-void pulse_led(uint8_t times) {
-    int bits = 8;
-    // Start bit
-    PORTB.OUTCLR = PIN3_bm;
-    _delay_us(104);
-    while (bits--) {
-        if (times & 0x01) {
-            PORTB.OUTSET = PIN3_bm;
-        } else {
-            PORTB.OUTCLR = PIN3_bm;
-        }
-        _delay_us(103);
-        times >>=1;
-    }
-    PORTB.OUTSET = PIN3_bm;
-    _delay_us(208); // Stop bit
-
-
-
-
-    // while (times--) {
-    //     PORTB.OUTTGL = PIN3_bm;
-    //     PORTB.OUTTGL = PIN3_bm;
-    // }
-}
-    
-
-
 int main(void) {
 
     // Drive RS485 DE low before anything else so the transceiver does not drive the
@@ -72,13 +44,15 @@ int main(void) {
     rs485_init(userrow == 0xFE ? 1 : (uint8_t)(userrow + 2));
     dali_init();
     set_sleep_mode(SLEEP_MODE_STANDBY);
-    sei();  // Enable Interrupts
 
     // Set up a WDT, with a timeout of 8.2 seconds. This is ooodles more than needed.
     // WDT.CTRLA is Configuration Change Protected — _PROTECTED_WRITE emits the CCP unlock
-    // followed by the register write inside the required 4-cycle window.
+    // followed by the register write, and must complete uninterrupted within 4 cycles.
+    // We do this before sei() so an ISR can't slip in between the OUT and STS instructions.
     _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);
     wdt_reset();
+
+    sei();  // Enable Interrupts
 
 
     sleep_enable();

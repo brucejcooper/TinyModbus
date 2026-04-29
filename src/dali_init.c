@@ -86,11 +86,14 @@ void dali_cancel_edge_detect() {
 // This controls the one-shot event on rising for detecting the start of data.
 ISR(PORTB_PORT_vect) {
     if (DALI_PORT.INTFLAGS & DALI_RX_bm) {
-        DALI_PORT.DALI_RX_PINCTRL = 0;  // Because we only want the call to happen once, disable the ISC
+        // Clear the flag for the edge that fired this ISR up front. If we cleared at the end,
+        // any new edge that arrived after the callback re-armed PINCTRL would have its flag
+        // wiped by the trailing clear, and we'd miss it.
+        DALI_PORT.INTFLAGS = DALI_RX_bm;
+        DALI_PORT.DALI_RX_PINCTRL = 0;  // Disable until the callback re-arms.
         if (dali_rx_rising_callback) {
             dali_rx_rising_callback();
         }
-        DALI_PORT.INTFLAGS = DALI_RX_bm;  // Clear the Interrupt flag.
     }
 }
 

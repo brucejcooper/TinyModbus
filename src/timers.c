@@ -33,6 +33,12 @@ void timer_init() {
 
 
 ISR(TCA0_OVF_vect) {
+    // Clear the OVF flag at the start. If a callback runs longer than one PER (~417 µs),
+    // the timer will overflow again during this ISR; clearing at the end (the previous pattern)
+    // would mask that re-entry by clearing the new flag too. Clearing at the start preserves it,
+    // so the next ISR fires immediately on return and at most one tick is ever lost.
+    TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm;
+
     if (daliTimer && (--daliTimer == 0)) {
         daliTimerCallback();
     }
@@ -40,5 +46,4 @@ ISR(TCA0_OVF_vect) {
     if (rs485Timer && (--rs485Timer == 0)) {
         rs485Timer_timeout();
     }
-    TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm; // Clear interrupt flag
 }

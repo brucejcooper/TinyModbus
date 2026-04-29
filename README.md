@@ -341,7 +341,7 @@ Register address = (bank × 64) + DALI_short_address
 |------|--------------|------------------|-----------------|
 | 0 — Status | 0–63 | High byte: status bits; Low byte: current arc level | Write low byte only (0–254) → sends DAPC |
 | 1 — Min/Max | 64–127 | High byte: max level; Low byte: min level | Writes both min and max via DTR0 |
-| 2 — Fade | 128–191 | High byte: fade time; Low byte: fade rate | Writes fade rate then fade time via DTR0 |
+| 2 — Fade | 128–191 | High byte: extended fade time (8-bit, from `QUERY_EXTENDED_FADE_TIME`); Low byte: combined fade time / fade rate byte (high nibble = basic fade time, low nibble = fade rate, from `QUERY_FADE_TIME_FADE_RATE`) | Write low byte → fade rate via DTR0; write high byte → extended fade time via DTR0 |
 | 3 — Power | 192–255 | High byte: power-fail level; Low byte: power-on level | Writes both via DTR0 |
 | 4 — Groups | 256–319 | 16-bit bitmask of group membership (bit N = group N) | Diffs against cached value and issues Add/Remove per changed bit |
 

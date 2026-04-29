@@ -107,8 +107,6 @@ typedef struct dali_command_t {
 extern dali_all_holding_registers_t dali_holding_regs;
 #define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
 
-extern void pulse_led(uint8_t times);
-
 extern void dali_init();
 uint8_t dali_is_bus_shorted();
 

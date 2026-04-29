@@ -401,25 +401,39 @@ static void processSetSingleHoldingRegisterCommand() {
         case DALI_MINMAX_BANK:
             dali_set_min_level(daliAddr, val & 0xFF, NULL);
             dali_set_max_level(daliAddr, val >> 8 , dali_cmd_completed);
-            dali_holding_regs.banks[DALI_MINMAX_BANK][daliAddr].shortVal = val;
+            // The 16-bit cache write is two STS instructions; wrap so a TCA0 ISR doing a byte
+            // write to the same register can't interleave and produce a torn shortVal.
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                dali_holding_regs.banks[DALI_MINMAX_BANK][daliAddr].shortVal = val;
+            }
             waitForDaliResponse();
             break;
         case DALI_FADE_BANK:
             dali_set_fade_rate(daliAddr, val & 0xFF, NULL);
             dali_set_fade_time(daliAddr, val >> 8, dali_cmd_completed);
-            dali_holding_regs.banks[DALI_FADE_BANK][daliAddr].shortVal = val;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                dali_holding_regs.banks[DALI_FADE_BANK][daliAddr].shortVal = val;
+            }
             waitForDaliResponse();
             break;
         case DALI_POWER_BANK:
             dali_set_power_on_level(daliAddr, val & 0xFF, NULL);
             dali_set_power_fail_level(daliAddr, val >> 8, dali_cmd_completed);
-            dali_holding_regs.banks[DALI_POWER_BANK][daliAddr].shortVal = val;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                dali_holding_regs.banks[DALI_POWER_BANK][daliAddr].shortVal = val;
+            }
             waitForDaliResponse();
             break;
-        case DALI_GROUPS_BANK:
-            groupChanges = dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal ^ val;
+        case DALI_GROUPS_BANK: {
+            uint16_t cached;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                cached = dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal;
+            }
+            groupChanges = cached ^ val;
             if (groupChanges > 0) {
-                dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal = val;
+                ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                    dali_holding_regs.banks[DALI_GROUPS_BANK][daliAddr].shortVal = val;
+                }
                 for (uint8_t bit = 0; bit < 16; bit++) {
                     if (groupChanges & 0x01) {
                         // We only want the callback for the very last change.
@@ -439,6 +453,7 @@ static void processSetSingleHoldingRegisterCommand() {
                 daliResponseType = DALI_RESPONSE_OK;
             }
             break;
+        }
         default:
             sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
             return;

@@ -326,7 +326,7 @@ pymcuprog -t uart -u ${PORT} -d ${DEVICE} -m user_row write -l 0x01
 | 0x04 | Read Input Registers | Read device info string |
 | 0x05 | Write Single Coil | Toggle/on/off a single DALI device |
 | 0x06 | Write Single Holding Register | Write a DALI device parameter |
-| 0x0F | Write Multiple Coils | (stub — not yet implemented) |
+| 0x0F | Write Multiple Coils | Set on/off across up to 8 consecutive DALI devices in a single request (LSB-first bit packing per spec) |
 | 0x44 | Custom: Execute DALI Command | Send a raw 16-bit DALI command and get the response |
 
 ### Holding Register Map
@@ -353,9 +353,10 @@ Address = DALI short address (0–63).
 
 | Value | DALI action |
 |-------|-------------|
-| 0x55xx | Toggle (query level, then Off or GoToLastActive) |
-| 0xFFxx | Go To Last Active level |
-| 0x00xx | Off |
+| 0x55xx | **Non-standard extension:** Toggle (query level, then Off or GoToLastActive). Low byte ignored. |
+| 0xFF00 | Go To Last Active level (Modbus "ON") |
+| 0x0000 | Off (Modbus "OFF") |
+| anything else | `MODBUS_ERR_ILLEGAL_VALUE` per Modbus §6.5 |
 
 ### Custom DALI Command (0x44)
 
@@ -488,4 +489,34 @@ Where shared state is touched from both main context and ISR context, the follow
 - **Background scan state (`scan_index`, `scan_err_count`)** — `dali_start_background_scan()` is called from both the RTC_PIT ISR and the TCA0 callback chain (`scan_result_received`); the reset + initial queue is wrapped in `ATOMIC_BLOCK` so the two callers can't interleave.
 - **Streaming TX register reads** — the DRE ISR reads each `dali_holding_regs` word inside `ATOMIC_BLOCK` (TCA0 LVL1 can preempt the DRE ISR; the 16-bit load needs to be uninterruptible to avoid a torn high/low pair).
 - **Modbus error reporting** — `processSetSingleHoldingRegisterCommand` and `processSetSingleCoilCommand` branch on `daliResponseType` after `waitForDaliResponse()` and emit a Modbus exception when the DALI batch did not complete OK. Group-bank writes that change zero bits are reported as a no-op success.
-- **Broadcasts** — `inputIsValidModbusCommand()` only accepts deviceId 0 for write-style functions (`0x05`, `0x06`, `0x0F`); broadcast reads are dropped to avoid bus-collision responses.
+- **Broadcasts** — `inputIsValidModbusCommand()` only accepts deviceId 0 for write-style functions (`0x05`, `0x06`, `0x0F`); broadcast reads are dropped to avoid bus-collision responses. Once accepted, `was_broadcast` is set and `sendResponse` / `sendError` skip the actual transmission so the slave never replies on a broadcast — required by Modbus §2.4.1.
+
+---
+
+## Known Limitations
+
+Issues uncovered by the multi-agent protocol-compliance review that have been knowingly left unfixed. Each is bounded — none can lock the device up — but they are deviations or quirks worth being aware of.
+
+### Modbus
+
+- **0x0F (Write Multiple Coils) worst-case time can exceed master timeout.** The handler iterates per coil, waiting up to 600 ms per `waitForDaliResponse()`. With `MAX_MULTI_COIL_COUNT = 8`, a fully-NAKing batch takes ~4.8 s. Most masters time out at ~1 s. The WDT (8.2 s) protects the chip from a hang, but the master will declare a timeout, retransmit, and may interpret our late response as part of a new frame. **Mitigation when this matters:** keep individual 0x0F writes small (1–2 coils), or use 0x05 per coil in sequence.
+- **0x04 (Read Input Registers) returns an ASCII info string, not a register address space.** `MechDALI v0.1:` followed by 20 hex characters of the chip's unique serial number, packed two bytes per register. Generic Modbus discovery tools that expect a register file will see ASCII bytes — the master needs to know how to interpret the response.
+- **No initial 3.5-char silence gate on RX.** After power-on or WDT reset, the RX ISR latches whatever bytes arrive first. If the master is mid-frame at reset time, the partial frame fails CRC, the inter-byte timeout fires, and the buffer is reset cleanly — but Modbus §2.5.1.1 strictly requires the slave to wait for 3.5 char of silence before accepting frames. Self-recovering, ~1 frame of bus time wasted.
+- **DALI exception sub-codes 0x20–0x33** (used by `dali_response_to_err` for collision / pulse / short-response failures) are outside Modbus's reserved 0x01–0x0B range. Strict masters may log them as unknown; lenient masters surface them verbatim.
+
+### DALI
+
+- **Group readback queries the wrong half of the cache.** `dali_add_to_group` always reads back via `GET_GROUPS0_7`, and `dali_remove_from_group` always reads back via `GET_GROUPS8_15`, regardless of which group bit changed. Result: cache for groups 8–15 is never refreshed by adds, and cache for groups 0–7 is never refreshed by removes. Background scan eventually corrects both within ~64 s. Pure cache drift; the device-side state is correct.
+- **No collision detection during our own transmission.** The transmitter does not monitor RX while sending; if a second master starts transmitting concurrently, we don't notice and bus data is silently corrupted. Acceptable for the intended single-master deployment.
+- **WAIT_FOR_IDLE skipped after a NAK timeout.** `timeoutWaitingForResponse()` returns directly to IDLE rather than going through the 22 Te idle wait. Currently safe by coincidence: NAK_TIMEOUT (22 Te) + 4 Te stop bits already exceeds the 22 Te inter-frame requirement, so 26 Te of bus idle has elapsed before any new transmission begins. Defense-in-depth would route through `dali_wait_for_idle_state_enter()` instead.
+- **SET-helper sequences are not atomic against unrelated queue insertions.** `dali_set_min_level`, `_max_level`, `_fade_*`, `_power_*` issue three separate `dali_queue_command()` calls (DTR0 → SET_X → GET_X). A custom DALI command (Modbus 0x44) carrying a `0xA3xx` (SET_DTR0) opcode interleaved between these calls would corrupt DTR0 between SET and re-fire. Currently safe because nothing else in the firmware writes DTR0; would need an enqueue-batch API to fully close.
+- **Receiver dead band classifies 500–667 µs pulses as malformed.** The pulse-width classifier rejects any pulse in the 500–750 µs gap between the half-bit and full-bit windows. DALI 62386-101 puts the boundary closer to 666 µs, so a slightly off-spec ballast or noisy bus can produce 700 µs pulses that this firmware will treat as `PULSE_IN_MIDDLE` errors. Tighten by lowering `FULLBIT_MIN_TICKS` if interop with such ballasts is needed.
+- **`dali_set_fade_time` writes the basic fade-time register but the README's Bank 2 layout describes the high byte as "extended fade time".** After the fix to query `GET_FADE` instead of `GET_EXT_FADE`, the cache write `shortVal = val` is now the only thing that puts the user's fade-time value into bank 2 high — the readback updates bank 2 low (with the combined fade-time/rate byte). The cache reflects what the user wrote, not what the device's extended-fade-time register holds. To fully fix would require adding `SET_EXTENDED_FADE_TIME` (opcode 0x33) and routing `dali_set_fade_time` through it.
+- **Background scan consumes ~30 % of DALI bus duty cycle.** A full 64-address scan walks 10 GET commands per address; at ~25 ms per command (no NAK) to ~50 ms (with NAK), one full scan takes 16–32 s of bus activity. With the rescan period of 64 s, ~30–50 % of the bus is occupied by background scans, which can introduce 25–60 ms of latency for user-initiated commands.
+
+### RS-485 hardware
+
+- **DE pin floats for ~50–200 µs on every reset (cold boot, WDT, power glitch).** PA4 is high-Z from reset vector until `main.c`'s `OUTCLR PA4`. Common RS-485 transceivers don't have an internal pull-down on DE, so the line can momentarily assert and disrupt the bus. **Recommended fix: external 10 kΩ pull-down on PA4 at the next PCB rev.**
+- **No BOD configured.** A brown-out below ~1.8 V can leave USART registers (including TXEN) in undefined state, with no reset to recover; DE could end up driven high by stale USART state. **Recommended fix:** configure the `BODCFG` fuse for active-mode brown-out detection at ≥ 2.6 V, and remove `-R .fuse` from the Makefile so the fuse section actually flashes. Until then, the firmware assumes a stable supply ≥ 4.5 V (the 10 MHz operating minimum per the ATtiny1604 datasheet).
+
+Once both hardware mitigations are in place (external pull-down + BOD fuse), DE is provably safe across all power-event paths. Without them, the runtime is correct but reset windows are exposed.

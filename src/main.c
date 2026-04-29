@@ -36,12 +36,17 @@ int main(void) {
     PORTA.OUTSET = PIN7_bm;
 
 
-    // Device ID is stored in the first byte of the USERRROW EEPROM.  It is offset by 2, so that when set to the
-    // default value (0xFF), it comes out as Device no 1.  If you want device 2, write 0x00.
-    // Guard the one byte (0xFE) that would wrap to 0 (broadcast self) — fall back to ID 1 in that case.
+    // Device ID is stored in the first byte of the USERROW EEPROM, offset by 2 (so the factory
+    // default 0xFF maps to ID 1; write 0x00 for ID 2, etc.). Modbus reserves IDs 0 and 248–255,
+    // so we clamp anything that would map there back to the default ID 1:
+    //   userrow ≤ 0xF5 → IDs 2..247  (valid)
+    //   userrow 0xF6..0xFD → would map to reserved IDs 248..255 → clamp to 1
+    //   userrow 0xFE → would wrap to 0 (broadcast) → clamp to 1
+    //   userrow 0xFF (default) → wraps to 1 (default)
     timer_init();
     uint8_t userrow = USERROW.USERROW0;
-    rs485_init(userrow == 0xFE ? 1 : (uint8_t)(userrow + 2));
+    uint8_t deviceId = (userrow >= 0xF6 && userrow != 0xFF) ? 1 : (uint8_t)(userrow + 2);
+    rs485_init(deviceId);
     dali_init();
     set_sleep_mode(SLEEP_MODE_STANDBY);
 

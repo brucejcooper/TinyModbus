@@ -164,8 +164,12 @@ void dali_set_fade_rate(uint8_t addr, uint8_t val, dali_callback_t callback) {
 
 void dali_set_fade_time(uint8_t addr, uint8_t val, dali_callback_t callback) {
     dali_set_dtr0(val, NULL);
-    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_FADE_TIME, addr), 2, NULL); 
-    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_EXT_FADE, addr), 1, callback); 
+    dali_queue_command(ENCODE_CMD(DALI_CMD_SET_FADE_TIME, addr), 2, NULL);
+    // Read back via GET_FADE (the basic-fade-time/rate combined query) since SET_FADE_TIME
+    // writes the basic fade-time register. The previous code queried GET_EXT_FADE, which reads
+    // the extended-fade-time register that nothing in this firmware ever sets — so the readback
+    // never reflected what we just wrote.
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GET_FADE, addr), 1, callback);
 }
 
 void dali_set_power_on_level(uint8_t addr, uint8_t val, dali_callback_t callback) {

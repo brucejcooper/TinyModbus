@@ -79,6 +79,10 @@ static volatile uint16_t streamCrc;      // running CRC over header + already-st
 
 volatile bool modbus_idle = true;
 static bool modbus_cmd_available = false;
+// Set when inputIsValidModbusCommand accepts a broadcast (deviceId 0) write. sendResponse and
+// sendError check this flag and skip the actual transmission — Modbus spec forbids slaves from
+// responding to broadcasts; multiple slaves replying would collide on the bus.
+static bool was_broadcast = false;
 
 static inline char hexDigit(uint8_t n) {
     return n < 10 ? '0' + n : 'A' + (n - 10);
@@ -164,12 +168,32 @@ static inline bool inputIsValidModbusCommand() {
         if (cmdDeviceId == 0 && !acceptBroadcast) {
             return false;
         }
-        return sz == expectedSz;
+        if (sz == expectedSz) {
+            was_broadcast = (cmdDeviceId == 0);
+            return true;
+        }
+        return false;
     }
     return false;
 }
 
+static void modbus_reset_buffer();
+
+// Skip the TX entirely (broadcast path) but still re-arm RX so we can receive the next request.
+// Used by the broadcast-suppression branches in sendResponse/sendError.
+static inline void abandon_tx_re_enable_rx() {
+    modbus_reset_buffer();
+    modbus_idle = true;
+    USART0.STATUS = USART_RXSIF_bm | USART_TXCIF_bm;
+    USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
+}
+
 static void sendResponse(uint8_t *buf, uint8_t sz) {
+    if (was_broadcast) {
+        // Modbus §2.4.1: slaves must not respond to broadcasts. Just clear state and listen again.
+        abandon_tx_re_enable_rx();
+        return;
+    }
     appendCrc(buf, sz);
     ptr = buf;
 
@@ -179,6 +203,11 @@ static void sendResponse(uint8_t *buf, uint8_t sz) {
 }
 
 static void sendError(modbus_err_t err) {
+    if (was_broadcast) {
+        // Same as sendResponse: don't transmit on a broadcast — even an exception. Just rearm RX.
+        abandon_tx_re_enable_rx();
+        return;
+    }
     buf[0] = deviceId;
     buf[1] |= 0x80;  // Set the high bit to indicate an error.
     buf[2] = err;
@@ -238,8 +267,12 @@ static void processGetCoilsCommand() {
     // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t when the
     // master sends a large addr (e.g. 65535) — without this, a wrap to a small value would pass
     // the bound check and cause out-of-bounds reads of dali_holding_regs.
-    if (count == 0 || (uint32_t)addr + count > DALI_MAX_DEVICES) {
-        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+    if (count == 0) {
+        sendError(MODBUS_ERR_ILLEGAL_VALUE);  // Modbus §7: count out of range → ILLEGAL_VALUE
+        return;
+    }
+    if ((uint32_t)addr + count > DALI_MAX_DEVICES) {
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS); // addr range invalid → ILLEGAL_ADDRESS
         return;
     }
 
@@ -270,8 +303,12 @@ static void sendHoldingRegs() {
     // (uint32_t) cast prevents the addr+count comparison from wrapping in uint16_t — see
     // processGetCoilsCommand for the equivalent justification. streamSrc would otherwise be
     // pointed past the end of dali_holding_regs and the streaming TX would read out-of-bounds.
-    if (count == 0 || count > 125 || (uint32_t)addr + count > DALI_MAX_HOLDING_REGISTER) {
-        sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+    if (count == 0 || count > 125) {
+        sendError(MODBUS_ERR_ILLEGAL_VALUE);  // Modbus §7: count range error → ILLEGAL_VALUE
+        return;
+    }
+    if ((uint32_t)addr + count > DALI_MAX_HOLDING_REGISTER) {
+        sendError(MODBUS_ERR_ILLEGAL_ADDRESS); // addr range error → ILLEGAL_ADDRESS
         return;
     }
 
@@ -503,7 +540,11 @@ static void processSetCoilsCommand() {
     // would alias to a small DALI address (after the << 9 shift in ENCODE_CMD's caller below),
     // potentially even matching the broadcast address byte 0xFF — turning a stray write into
     // a bus-wide GOTO_LAST_ACTIVE/OFF.
-    if (count == 0 || count > MAX_MULTI_COIL_COUNT || (uint32_t)addr + count > DALI_MAX_DEVICES) {
+    if (count == 0 || count > MAX_MULTI_COIL_COUNT) {
+        sendError(MODBUS_ERR_ILLEGAL_VALUE);  // Modbus §7: count range error → ILLEGAL_VALUE
+        return;
+    }
+    if ((uint32_t)addr + count > DALI_MAX_DEVICES) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
         return;
     }
@@ -531,26 +572,33 @@ static void processSetCoilsCommand() {
 
 static void processSetSingleCoilCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];
-    uint8_t val = buf[4];
+    uint16_t val = buf[4] << 8 | buf[5];
 
-    if (addr < DALI_MAX_DEVICES) {
-        daliResponseType = DALI_RESPONSE_PENDING;
-        if (val == 0x55) {
-            dali_toggle(addr, dali_cmd_completed);
-        } else if (val == 0xFF) {
-            dali_goto_last_active(addr, dali_cmd_completed);
-        } else {
-            dali_off(addr, dali_cmd_completed);
-        }
-        waitForDaliResponse();
-        if (daliResponseType == DALI_RESPONSE_OK) {
-            // Mirror the request back to the caller as the success response.
-            sendResponse(buf, sz - 2);
-        } else {
-            sendError(dali_response_to_err(daliResponseType));
-        }
-    } else {
+    if (addr >= DALI_MAX_DEVICES) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+        return;
+    }
+
+    // Modbus §6.5: data must be 0xFF00 (ON) or 0x0000 (OFF). We additionally accept 0x55xx
+    // (any low byte) as a non-standard toggle extension — masters that don't know about it
+    // simply won't use it. Anything else is an illegal value per spec.
+    daliResponseType = DALI_RESPONSE_PENDING;
+    if (buf[4] == 0x55) {
+        dali_toggle(addr, dali_cmd_completed);
+    } else if (val == 0xFF00) {
+        dali_goto_last_active(addr, dali_cmd_completed);
+    } else if (val == 0x0000) {
+        dali_off(addr, dali_cmd_completed);
+    } else {
+        sendError(MODBUS_ERR_ILLEGAL_VALUE);
+        return;
+    }
+    waitForDaliResponse();
+    if (daliResponseType == DALI_RESPONSE_OK) {
+        // Mirror the request back to the caller as the success response.
+        sendResponse(buf, sz - 2);
+    } else {
+        sendError(dali_response_to_err(daliResponseType));
     }
 }
 
@@ -560,6 +608,7 @@ static void modbus_reset_buffer() {
     sz = 0;
     streamWords = 0;
     modbus_cmd_available = false;
+    was_broadcast = false;
 }
 
 void rs485Timer_timeout() {
@@ -578,10 +627,13 @@ extern void rs485_init(uint8_t rs485_device_id) {
     PORTMUX.CTRLB = PORTMUX_USART0_ALTERNATE_gc;
     RS485_PORT.PIN7CTRL = PORT_PULLUPEN_bm;
     RS485_PORT.PIN1CTRL = PORT_PULLUPEN_bm;
-    RS485_PORT.OUTSET = RS485_TX_bm;                // PB2 defaults high, because its UART out.
-    RS485_PORT.OUTCLR = RS485_DE_bm;                // PB2 defaults high, because its UART out.
-    RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;  // PB0 (XDIR) and PB2 (TXD) are outputs
-    RS485_PORT.DIRCLR = RS485_RX_bm;                // PB3 (RXD) is an input
+    RS485_PORT.OUTSET = RS485_TX_bm;                // PA1 (TXD) idles high.
+    RS485_PORT.OUTCLR = RS485_DE_bm;                // PA4 (DE) low for receive — pre-USART safety.
+    RS485_PORT.DIRSET = RS485_TX_bm | RS485_DE_bm;  // PA1 (TXD) and PA4 (DE/XDIR) are outputs.
+    RS485_PORT.DIRCLR = RS485_RX_bm;                // PA2 (RXD) is an input.
+    // Note: once USART0 is enabled below with USART_RS485_EXT_gc, PA4 is taken over as the
+    // hardware-driven XDIR signal. The USART asserts XDIR around active transmissions and
+    // deasserts it at TXC automatically — firmware should NOT manually toggle PA4 after this.
 
     USART0.BAUD = USART0_BAUD_RATE(MODBUS_BAUD);  // Set Baud rate to 9600
     // N81 Async Sserial
@@ -699,11 +751,11 @@ ISR(USART0_TXC_vect) {
 ISR(USART0_RXC_vect) {
     // Reset the countdown Timer.
     modbus_idle = false;
-    // if (USART0.STATUS & USART_RXSIF_bm) {
-    // This timeout will be somewhere between 3 ticks (1.25 millis) and 4 ticks (1.666 millis).
-    // Strictly the limit is 1.5msec, but this will be fine.
-
-    rs485Timer = 4;
+    // Modbus RTU inter-character timeout is 1.5 char times (≈ 1.56 ms at 9600 baud). The TCA0
+    // OVF tick is 416.67 µs and rs485Timer decrement is asynchronous to byte arrival, so a value
+    // of N gives an effective timeout window of (N-1) to N ticks. rs485Timer = 5 → 4 to 5 ticks
+    // = 1.667 to 2.083 ms, which keeps the lower bound at or above the 1.5-char minimum.
+    rs485Timer = 5;
     USART0.STATUS = USART_RXSIF_bm;  // clear the interrupt flag.
     // }
 

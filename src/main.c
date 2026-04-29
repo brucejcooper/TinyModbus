@@ -65,15 +65,19 @@ int main(void) {
 
 
     // Device ID is stored in the first byte of the USERRROW EEPROM.  It is offset by 2, so that when set to the
-    // default value (0xFF), it comes out as Device no 1.  If you want device 2, write 0x00
+    // default value (0xFF), it comes out as Device no 1.  If you want device 2, write 0x00.
+    // Guard the one byte (0xFE) that would wrap to 0 (broadcast self) — fall back to ID 1 in that case.
     timer_init();
-    rs485_init(USERROW.USERROW0 + 2);
+    uint8_t userrow = USERROW.USERROW0;
+    rs485_init(userrow == 0xFE ? 1 : (uint8_t)(userrow + 2));
     dali_init();
     set_sleep_mode(SLEEP_MODE_STANDBY);
     sei();  // Enable Interrupts
 
     // Set up a WDT, with a timeout of 8.2 seconds. This is ooodles more than needed.
-    WDT.CTRLA = WDT_PERIOD_8KCLK_gc;
+    // WDT.CTRLA is Configuration Change Protected — _PROTECTED_WRITE emits the CCP unlock
+    // followed by the register write inside the required 4-cycle window.
+    _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);
     wdt_reset();
 
 

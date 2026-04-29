@@ -1,4 +1,5 @@
 #include <string.h>
+#include <util/atomic.h>
 #include "dali.h"
 
 
@@ -41,20 +42,24 @@ static void scan_result_received(dali_response_type_t err, uint16_t cmd, uint8_t
     uint8_t addr = DALI_DECODE_ADDR(cmd);
 
     switch (err) {
-        case DALI_RESPONSE_OK: 
+        case DALI_RESPONSE_OK: {
+            // Capture the index that *produced* this response before we advance to the next
+            // command; otherwise the "fading device" check below can never see scan_index == 0.
+            uint8_t completedIndex = scan_index;
             scan_err_count = 0;
             if (scan_index < 9) {
                 // Send the next command
-                dali_queue_command(ENCODE_CMD(scan_command_sequence[++scan_index], addr), 1, scan_result_received); 
+                dali_queue_command(ENCODE_CMD(scan_command_sequence[++scan_index], addr), 1, scan_result_received);
             } else {
                 // We are done with this address. Move onto the next one.
                 dali_start_background_scan(addr + 1);
             }
-            if (scan_index == 0 && response & 0x10) {
+            if (completedIndex == 0 && (response & 0x10)) {
                 // We scanned a device that is currently fading... schedule an ongoing poll
                 track_fade(addr);
             }
             break;
+        }
         default:
             // We try again for a maximum of three times, then we treat it as a device that is not found.
             if (scan_err_count++ < 3) {
@@ -90,11 +95,16 @@ static void toggle_based_on_level(dali_response_type_t err, uint16_t cmd, uint8_
     track_fade(addr);
 }
 
-void dali_start_background_scan(uint8_t addr) { 
+void dali_start_background_scan(uint8_t addr) {
     if (addr < 64) {
-        scan_index = 0;
-        scan_err_count = 0;
-        dali_queue_command(ENCODE_CMD(scan_command_sequence[scan_index], addr), 1, scan_result_received); 
+        // Both the RTC_PIT ISR and TCA0 (via scan_result_received's chain) can call this. TCA0
+        // has higher priority and can preempt RTC_PIT, leaving scan_index/scan_err_count
+        // inconsistent with what's queued. Atomic block serialises the reset+queue.
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            scan_index = 0;
+            scan_err_count = 0;
+            dali_queue_command(ENCODE_CMD(scan_command_sequence[scan_index], addr), 1, scan_result_received);
+        }
     }
 }
 

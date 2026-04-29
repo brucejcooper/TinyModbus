@@ -18,7 +18,7 @@
  */
 void (*dali_rx_rising_callback)() = NULL;
 
-// By default, we go off once per 64 seconds (8 x 1 second periods)
+// PIT fires once per second; trigger a full bus rescan every RESCAN_PERIOD seconds.
 #define RESCAN_PERIOD 64
 
 

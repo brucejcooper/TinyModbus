@@ -9,7 +9,8 @@
 #include <inttypes.h>
 #include <stdbool.h>
 
-// 19.86 ms is the highest value that this will support.
+// Converts microseconds to TCA0/TCB0 ticks at F_CPU. The result is uint16_t, so the largest
+// value that can be expressed is ~6553 µs at F_CPU = 10 MHz (uint16_t max / ticks-per-µs).
 #define USEC_TO_TICKS(u) ((uint16_t)(((float)u) * (F_CPU / 1000000.0) + 0.5))
 
 typedef void (*timer_callback_t)();

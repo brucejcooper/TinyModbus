@@ -372,11 +372,13 @@ On error (no response, collision, malformed), a Modbus exception is returned.
 
 ### Input Registers (0x04)
 
-Reading input registers at address 0 returns a 64-byte ASCII device info string packed two bytes per register:
+Reading input registers returns an ASCII device info string packed two bytes per register. The string is generated on demand into the response buffer (no fixed RAM is reserved for it):
 
 ```
 Mechination DALI v<major>.<minor> ID:<10-byte-hex-serial>
 ```
+
+The 10-byte serial is read from the SIGROW unique-ID registers, so each chip reports a globally unique identifier.
 
 ### Background Scan
 
@@ -418,162 +420,72 @@ Programming is via UPDI on the test point. Use a serial adapter wired as describ
 
 ---
 
-## Bug Analysis: Stuck Bus and RS485 Lockout
+## Reliability Features
 
-The following are confirmed or likely defects found by static analysis. They collectively explain the intermittent DALI bus-stuck-low and RS485 unresponsive symptoms.
+The firmware includes several layers of protection against bus faults and lockup:
 
----
+### Watchdog Timer
 
-### BUG 1 — CRITICAL: `WAIT_FOR_IDLE` has no timeout when bus is permanently stuck low
+The WDT runs at 8.2 s (`WDT_PERIOD_8KCLK_gc`) and is reset on every iteration of the main loop. If any blocking path runs longer than 8.2 s — or if the main loop stops for any reason — the MCU resets cleanly.
 
-**Location:** `dali_state_wait_for_idle.c`, `onBusShorted()`
+### `WAIT_FOR_IDLE` bus-stuck timeout (`dali_state_wait_for_idle.c`)
 
-```c
-static void onBusShorted() {
-    daliTimer = 0;                      // Stops TCA0 countdown — no timeout
-    dali_call_on_low_once(onIdleBus);   // Wait for RX pin to go LOW (bus HIGH)
-}
-```
+When the DALI bus is shorted (active low) longer than 200 Te ≈ 83 ms, `busStuckTimeout()` fires. It defensively releases our TX pin, cancels the edge detector, and re-enters the idle state machine. This prevents an external bus fault (faulty ballast, shorted wiring) from hanging the state machine indefinitely.
 
-The RX pin is HIGH when the bus is being driven LOW. `dali_call_on_low_once` arms a level-triggered interrupt that fires when RX goes LOW (i.e., the bus returns to idle). If the bus never goes idle — because a ballast is malfunctioning, the wiring is shorted, or our own TX is stuck — the interrupt never fires.
+### `waitForDaliResponse()` Modbus timeout (`rs485.c`)
 
-`daliTimer = 0` means TCA0 keeps running but does nothing. The state machine simply stops. There is no escape.
+The Modbus handler bounds its wait for a DALI response at 600 ms. **Any Modbus command whose underlying DALI batch has not completed within ~500 ms will be reported to the master as a NAK** — well before the 8.2 s WDT fires. The DALI commands themselves remain queued and continue to execute on the bus; only the Modbus-visible status is affected. This caps how long an RS485 master can be blocked by a single command, regardless of DALI bus state.
 
-**Why the WDT doesn't save you:** The WDT in the main loop (`wdt_reset()` called every iteration) only fails to be reset if the main loop is *blocked*. When stuck in `WAIT_FOR_IDLE`, the main loop runs freely — it calls `rs485_process_command()` (returns immediately if no command is pending), calls `wdt_reset()`, and loops. The WDT is reset on every iteration. The system hangs **permanently** with DALI dead, no recovery.
+### RS485 DE-pin startup safety (`main.c`)
 
-The WDT *does* eventually fire, but only if a Modbus command arrives and triggers the `waitForDaliResponse()` busy-loop (Bug 2 below). Without an active Modbus command, the hang is indefinite.
+The very first thing `main()` does — before clock setup or any subsystem init — is drive PA4 (RS485 DE) low and configure it as an output. This eliminates the post-reset window during which the transceiver could otherwise assert the bus while DE floats.
 
-**What causes the bus to go low in the first place:**
-- A DALI ballast malfunctioning and continuously pulling the bus low
-- A bus wiring short circuit
-- The MCU's own TX pin left HIGH (bus LOW) after an incomplete transmission (less likely, but possible under EMI or electrical stress)
-- Power supply glitch that drops DALI bus voltage, causing the bus state to be misread
+### Modbus packet-size validation
 
----
+The RX ISR drops bytes once `sz` reaches `MAX_PKT_SZ`, and `inputIsValidModbusCommand()` requires both a CRC of zero and a function-specific exact length match before delivering a packet to the handler. The read-holding-registers path streams data directly from `dali_holding_regs` (see below) so the response is not constrained by `buf`'s capacity.
 
-### BUG 2 — HIGH: `waitForDaliResponse()` busy-loop blocks RS485 with no timeout
+### Streaming TX for read-holding-registers
 
-**Location:** `rs485.c`, `waitForDaliResponse()`
+A 64-register response is 133 bytes — too large for `buf` (70 bytes). Rather than grow `buf` to fit the worst case, `sendHoldingRegs()` streams data straight from `dali_holding_regs` in the DRE ISR:
 
-```c
-void waitForDaliResponse() {
-    while (daliResponseType == DALI_RESPONSE_PENDING) {
-        ;   // No timeout, no wdt_reset()
-    }
-}
-```
+1. The 3-byte header (device addr, func code, byte count) is placed at `buf[0..2]` and the running CRC is seeded over those bytes.
+2. The DRE ISR sends the 3 header bytes from `buf`, then enters streaming mode.
+3. While streaming, the ISR reads each register fresh (one atomic 16-bit load per word, used for both the high and low byte) and folds each transmitted byte into the running CRC. This means the CRC always matches the bytes actually sent — even if a TCA0 ISR (e.g. the periodic scan) updates a register mid-response.
+4. After the final low byte is sent, the running CRC is parked at `buf[3..4]` and the ISR sends 2 trailing CRC bytes from there.
 
-When any Modbus holding-register write (0x06) or custom DALI command (0x44) is received, the Modbus handler calls `waitForDaliResponse()`. This spins until the DALI state machine delivers a result via `dali_cmd_completed()`.
+A single read can return up to the Modbus RTU limit of 125 registers without ever buffering the data. Streaming state costs 7 bytes (`streamSrc`, `streamWords`, `streamHighByte`, `streamLowByte`, `streamCrc`).
 
-If the DALI state machine is stuck (Bug 1), `dali_cmd_completed()` is never called. The loop spins indefinitely. Because `wdt_reset()` is called in the main loop (not inside `waitForDaliResponse()`), the WDT is **not** being reset. The WDT fires after 8.2 seconds and resets the MCU.
+### RAM Budget
 
-During those 8.2 seconds:
-- The RS485 RX ISR is disabled (disabled by the receive state machine when the valid Modbus command was recognised — see `inputIsValidModbusCommand()` → `USART0.CTRLA = USART_RS485_EXT_gc`).
-- No response is sent, so the RS485 master times out.
-- The master cannot retry or talk to other devices while waiting for its timeout to expire.
+| Item | Bytes |
+|------|-------|
+| ATtiny1604 SRAM | 1024 |
+| `dali_holding_regs` | 640 |
+| `commandQ` (20 × 5 B) | 100 |
+| `buf` | 70 |
+| Streaming TX state | 7 |
+| Misc state | ~32 |
+| **Static total** | **849** |
+| **Stack headroom** | **175** |
 
-This is the mechanism that makes the RS485 master "stuck" — the slave swallows a command and goes silent for 8.2 seconds.
+Stack is well above the 150-byte minimum needed for the deepest interrupt-nested call chain (TCA0 ISR preempting USART_RXC, with the deepest path being `process_command_response` → callback → `dali_queue_command` → `dali_transmitting_state_enter`), with margin for the AVR-libc ISR prologue.
 
----
+### Flash Budget
 
-### BUG 3 — HIGH: RS485 DE pin floats during WDT reset, potentially driving the bus
+| Item | Bytes |
+|------|-------|
+| ATtiny1604 flash | 16384 |
+| Program (.text + .rodata + .data init) | 9492 |
+| **Free** | **6892** (~42 %) |
 
-**Location:** `main()` startup sequence, hardware design
+The build uses no `printf`, `malloc`, or floating-point — `static const` tables (CRC, command sequences, state machine) live in flash via the avrxmega3 unified memory map and are accessed with plain LD instructions, no `PROGMEM` needed.
 
-When the WDT fires (from Bug 2), the MCU resets. During reset, all GPIO pins revert to high-impedance input mode. If the RS485 transceiver chip's DE pin has any pull-up (on-chip or PCB-level), DE goes HIGH and the RS485 driver asserts, driving the bus from the slave device side.
+### Concurrency Model
 
-This lasts from the reset until `rs485_init()` calls `RS485_PORT.OUTCLR = RS485_DE_bm` — a window of several milliseconds while clocks are configured, timers initialised, etc.
+Where shared state is touched from both main context and ISR context, the following mechanisms keep it consistent:
 
-If the MCU is resetting repeatedly (stuck bus → WDT fires → re-stuck immediately on the same bus fault → WDT fires again), the RS485 bus sees repeated spurious drive events. This is the most likely explanation for "the RS485 bus held in a state where the master can't operate."
-
-**Fix:** Add a pull-down resistor on DE so the chip defaults to receive mode when DE floats. Alternatively, as the very first line of `main()`, before any clock configuration: drive DE low.
-
----
-
-### BUG 4 — MEDIUM: After WDT reset, state machine immediately re-sticks if bus fault persists
-
-**Location:** `dali_init.c`
-
-```c
-void dali_init() {
-    ...
-    dali_wait_for_idle_state_enter();   // First thing the state machine does
-}
-```
-
-After WDT reset, `dali_init()` correctly releases the TX pin (TX = 0 → bus HIGH) but then immediately calls `dali_wait_for_idle_state_enter()`. If the external bus fault that caused the original hang still exists, `dali_is_bus_shorted()` returns true, `onBusShorted()` is called with `daliTimer = 0`, and the state machine is stuck again — this time from the very first millisecond of operation.
-
-The result is a repeated crash loop: WDT fires → MCU resets → state machine immediately re-sticks → next Modbus command triggers `waitForDaliResponse()` → WDT fires again. The 8.2-second WDT period becomes the system's effective response time for every Modbus command.
-
----
-
-### BUG 5 — LOW: USART STATUS register write uses CTRLA bitmask names
-
-**Location:** `rs485.c`, `USART0_TXC_vect`
-
-```c
-USART0.STATUS = USART_RXSIE_bm | USART_RXCIE_bm | USART_TXCIF_bm;
-```
-
-`USART_RXSIE_bm` and `USART_RXCIE_bm` are *interrupt enable* bits from CTRLA, not status flags. This compiles without warning because the bit positions happen to coincide between CTRLA and STATUS on the ATtiny1604 (bit 4 = RXSIF in STATUS, bit 7 = RXCIF in STATUS). The clear of TXCIF is correct. The accidental write to RXCIF (bit 7 in STATUS) has no effect because RXCIF is read-cleared by reading RXDATAL, not W1C.
-
-The code works by accident but will silently break on any MCU where the bit positions diverge.
-
----
-
-### Recommended Fixes (in priority order)
-
-**1. Add a timeout to `onBusShorted()` in WAIT_FOR_IDLE**
-
-```c
-#define BUS_STUCK_TIMEOUT_TE 1000   // ~417 ms — far beyond any legitimate DALI activity
-
-static void busStuckTimeout() {
-    // Bus has been active for too long — something is wrong.
-    // Force a clean reset via WDT by disabling the reset call.
-    // Alternatively: dali_idle_state_enter() to keep trying.
-    dali_cancel_edge_detect();
-    dali_idle_state_enter();   // or wdt_reset disable + spin to force WDT
-}
-
-static void onBusShorted() {
-    dali_call_on_low_once(onIdleBus);
-    daliTimerCallback = busStuckTimeout;
-    daliTimer = BUS_STUCK_TIMEOUT_TE;   // Escape hatch
-}
-```
-
-This ensures the state machine always escapes WAIT_FOR_IDLE, even if the bus is stuck. Once it escapes, the WDT fires normally on the next `waitForDaliResponse()` call, or Modbus commands can report a DALI fault.
-
-**2. Add a timeout to `waitForDaliResponse()`**
-
-```c
-void waitForDaliResponse() {
-    // Each iteration is much less than 1 ms; 50 ms gives ample time for any DALI transaction
-    uint16_t timeout = 50000;
-    while (daliResponseType == DALI_RESPONSE_PENDING && --timeout) {
-        _delay_us(1);
-    }
-    if (timeout == 0) {
-        daliResponseType = DALI_RESPONSE_NAK;
-    }
-}
-```
-
-This caps the RS485 lockout to ~50 ms regardless of DALI state. The Modbus master receives a prompt error instead of an 8.2-second silence.
-
-**3. Clear DE immediately on startup, before clock configuration**
-
-```c
-int main(void) {
-    // Ensure RS485 driver is not driving the bus during startup
-    PORTA.OUTCLR = PIN4_bm;   // DE = 0 (receive mode)
-    PORTA.DIRSET = PIN4_bm;
-    
-    // Clock configuration follows...
-    CCP = CCP_IOREG_gc;
-    ...
-}
-```
-
-This closes the window where a floating DE drives the RS485 bus during post-WDT startup.
+- **DALI command queue (`commandQ`, `q_size`)** — `dali_queue_command()` wraps the size-check / slot-write / post-increment in `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)`, and atomically claims the "start TX" role by clearing `dali_idle` in the same block. This prevents a TCA0/TCB0 ISR (running e.g. `scan_result_received`) from compacting the queue between main's read of `q_size` and its slot write.
+- **Background scan state (`scan_index`, `scan_err_count`)** — `dali_start_background_scan()` is called from both the RTC_PIT ISR and the TCA0 callback chain (`scan_result_received`); the reset + initial queue is wrapped in `ATOMIC_BLOCK` so the two callers can't interleave.
+- **Streaming TX register reads** — the DRE ISR reads each `dali_holding_regs` word inside `ATOMIC_BLOCK` (TCA0 LVL1 can preempt the DRE ISR; the 16-bit load needs to be uninterruptible to avoid a torn high/low pair).
+- **Modbus error reporting** — `processSetSingleHoldingRegisterCommand` and `processSetSingleCoilCommand` branch on `daliResponseType` after `waitForDaliResponse()` and emit a Modbus exception when the DALI batch did not complete OK. Group-bank writes that change zero bits are reported as a no-op success.
+- **Broadcasts** — `inputIsValidModbusCommand()` only accepts deviceId 0 for write-style functions (`0x05`, `0x06`, `0x0F`); broadcast reads are dropped to avoid bus-collision responses.

@@ -17,15 +17,8 @@
 
 // Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
 
-static volatile uint32_t shiftreg = 0;
+static volatile uint8_t shiftreg_in = 0;
 static volatile uint8_t numBits = 0;
-
-static volatile bool inStartBit = true;
-static volatile bool atHalfBit;
-static volatile uint8_t lastBit;
-
-typedef void (*pulse_received_cb_t)(bool longpulse);
-static volatile pulse_received_cb_t handler;
 
 #define STATE_STARTBIT 0
 #define STATE_START_0 1
@@ -80,7 +73,7 @@ static void timerOverflow() {
 
     if ((state == STATE_START_0 || state == STATE_MIDDLE_1) && numBits == 8) {
         // We have come to a valid end of sequence.  Process what we have read.
-        process_command_response(DALI_RESPONSE_OK, shiftreg);
+        process_command_response(DALI_RESPONSE_OK, shiftreg_in);
     } else {
         // Some timing error or collision occurred.
         process_command_response(DALI_RESPONSE_MALFORMED, 0);
@@ -96,7 +89,7 @@ static void timerOverflow() {
  */
 void dali_state_receiving_prepare() {
     state = STATE_STARTBIT;
-    shiftreg = 0;
+    shiftreg_in = 0;
     numBits = 0;
 
     // Timer is not running yet
@@ -187,7 +180,7 @@ ISR(TCB0_INT_vect) {
     // Take the action (from the old state.
     uint8_t bitSet = action & 0x03;
     if (bitSet != NOSHIFT) {
-        shiftreg = (shiftreg << 1) | bitSet;
+        shiftreg_in = (shiftreg_in << 1) | bitSet;
         numBits++;
     }
 }

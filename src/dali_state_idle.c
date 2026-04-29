@@ -18,12 +18,6 @@ static void cleanup() {
     dali_cancel_edge_detect();
 }
 
-typedef struct {
-    uint16_t command;
-    uint8_t bank;
-    uint8_t byte_offset;
-} command_bank_mapping_t;
-
 static const uint16_t command_bank_mapping[] = {
     DALI_CMD_GET_LEVEL,
     DALI_CMD_QUERY_STATUS,
@@ -82,18 +76,37 @@ void process_command_response(dali_response_type_t err, uint8_t res) {
  */
 
 dali_result_t dali_queue_command(uint16_t cmd, uint8_t repeat, dali_callback_t callback) {
-    if (q_size >= CMD_Q_SIZE) {
-        return DALI_ERR_QUEUEFULL;
-    }
-    commandQ[q_size].cmd = cmd;
-    commandQ[q_size].callback = callback;
-    commandQ[q_size++].repeat = repeat < 2 ? 1 : 2;  // Min 1 times, max 2.
+    bool startTx = false;
+    dali_result_t result;
 
-    if (dali_idle) {
-        cleanup();
+    // Queue manipulation must be atomic w.r.t. ISR contexts: this function is called from main
+    // (Modbus handlers) and from TCA0/TCB0 ISR callbacks (e.g. scan_result_received via
+    // process_command_response). Without protection, main could read q_size, an ISR could fire
+    // and shrink+compact the queue, then main would write to a freed slot. We also claim the
+    // "start TX" role atomically by clearing dali_idle in the same block, so concurrent callers
+    // can't both decide to start a transmission.
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if (q_size >= CMD_Q_SIZE) {
+            result = DALI_ERR_QUEUEFULL;
+        } else {
+            commandQ[q_size].cmd = cmd;
+            commandQ[q_size].callback = callback;
+            commandQ[q_size++].repeat = repeat < 2 ? 1 : 2;  // Min 1 times, max 2.
+            result = DALI_OK;
+            if (dali_idle) {
+                dali_idle = false;
+                startTx = true;
+            }
+        }
+    }
+
+    if (startTx) {
+        // dali_idle was already cleared inside the atomic block; just disable the rising-edge
+        // detector and start the transmission.
+        dali_cancel_edge_detect();
         dali_transmitting_state_enter(commandQ);
     }
-    return DALI_OK;
+    return result;
 }
 
 void externalDaliMessageStarted() {

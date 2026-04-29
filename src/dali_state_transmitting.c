@@ -10,7 +10,7 @@
 
 // Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
 
-static volatile uint16_t shiftReg;
+static volatile uint16_t shiftreg_out;
 static volatile uint8_t bitsLeft;
 
 static void finishedTransmission() {
@@ -47,16 +47,16 @@ static void halfBitToggle() {
     if (--bitsLeft == 0) {
         daliTimerCallback = startStopBits;
     } else {
-        daliTimerCallback = shiftReg & 0x8000 ? sendOne: sendZero;
-        shiftReg <<= 1;
+        daliTimerCallback = shiftreg_out & 0x8000 ? sendOne: sendZero;
+        shiftreg_out <<= 1;
     }
     daliTimer = 1;
 }
 
 extern void dali_transmitting_state_enter(dali_command_t *cmd) {
     // Before we start messing with stuff, make sure the timer is off
-    shiftReg = cmd->cmd;
-    bitsLeft = 17; // One extra for the stop bit. 
+    shiftreg_out = cmd->cmd;
+    bitsLeft = 17; // 1 start bit + 16 data bits; stop bits are emitted by startStopBits() afterwards.
 
     // We send a one as the start bit.
     // cli();

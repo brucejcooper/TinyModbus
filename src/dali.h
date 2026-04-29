@@ -44,13 +44,6 @@ typedef enum {
 
 
 
-typedef enum {
-    RESPONSE,
-    NO_RESPONSE,
-    COLLISION,
-} dali_command_result_t;
-
-
 #define DALI_BAUD                   (1200)
 #define DALI_BIT_USECS              (1000000.0/DALI_BAUD)
 #define DALI_HALF_BIT_USECS         (DALI_BIT_USECS/2.0)
@@ -111,9 +104,6 @@ typedef struct dali_command_t {
 
 
 
-// extern uint16_t dali_input_regs[DALI_MAX_DEVICES];
-// #define DALI_MAX_INPUT_REGISTER (sizeof(dali_input_regs) / sizeof(uint16_t))
-
 extern dali_all_holding_registers_t dali_holding_regs;
 #define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
 
@@ -127,8 +117,6 @@ uint8_t dali_is_bus_shorted();
 void dali_idle_state_enter();
 extern void dali_transmitting_state_enter(dali_command_t *cmd);
 void dali_wait_for_idle_state_enter();
-void dali_receiving_state_enter();
-void dali_waiting_for_response_state_enter();
 
 void dali_call_on_rising_once(void (*callback)());
 void dali_call_on_low_once(void (*callback)());

@@ -7,13 +7,19 @@
 #include <avr/wdt.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <util/atomic.h>
 #include <util/delay.h>
 
 #include "dali.h"
 #include "timers.h"
+
+// Stringify the version macros set by the Makefile so the reported version tracks the build.
+#define _STRINGIFY(x) #x
+#define STRINGIFY(x) _STRINGIFY(x)
+static const char verstr[] = "MechDALI v" STRINGIFY(FW_VER_MAJOR) "." STRINGIFY(FW_VER_MINOR) ":";
+#define VERSTR_LEN (sizeof(verstr) - 1)
+
 
 #define MODBUS_READ_COILS_CMD 0x01
 #define MODBUS_READ_DISCRETE_INPUTS_CMD 0x02
@@ -49,22 +55,35 @@ typedef enum {
 #define RS485_RX_bm PIN2_bm
 #define RS485_DE_bm PIN4_bm
 
-#define MAX_PKT_SZ 64 * 2 + 8
+// buf only needs to hold the largest non-streamed response. Read-holding-regs uses a streaming
+// path that pulls data directly from dali_holding_regs in the DRE ISR, so it isn't bounded by buf.
+// 70 bytes covers every other handler comfortably (sendInfo writes ~37 bytes; everything else is shorter).
+#define MAX_PKT_SZ 70
 
 static uint8_t deviceId = 1;
 
 static volatile uint16_t crc = 0xFFFF;
-static uint8_t buf[MAX_PKT_SZ];  // Allow for a lot of input (but not the full 256 that MODBUS allows for)
+static uint8_t buf[MAX_PKT_SZ];
 static volatile uint8_t *ptr = buf;
 static volatile uint8_t sz = 0;
+
+// Streaming TX state for read-holding-regs responses. While streamWords > 0, the DRE ISR reads
+// each register fresh from dali_holding_regs (one read per word, used for both bytes) and updates
+// the CRC on the fly so the transmitted bytes always match the CRC even if a register is updated
+// mid-stream. After the data drains, the final CRC bytes are parked in buf and sent from there.
+static volatile uint16_t *streamSrc;
+static volatile uint8_t streamWords = 0;
+static volatile bool streamHighByte;
+static volatile uint8_t streamLowByte;   // pending low byte of the current word
+static volatile uint16_t streamCrc;      // running CRC over header + already-streamed data bytes
+
 volatile bool modbus_idle = true;
 volatile uint8_t readCountDown;
 static bool modbus_cmd_available = false;
 
-/**
- * Stores an indentifier string for this device.  Clients can fetch 32 registers worth of Input registers at address 0 to get the string.
- */
-static char verStr[64];
+static inline char hexDigit(uint8_t n) {
+    return n < 10 ? '0' + n : 'A' + (n - 10);
+}
 
 static const uint16_t crc_table[256] = {
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241, 0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440, 0xCC01, 0x0CC0, 0x0D80,
@@ -82,7 +101,11 @@ static const uint16_t crc_table[256] = {
     0x4B00, 0x8BC1, 0x8A81, 0x4A40, 0x4E00, 0x8EC1, 0x8F81, 0x4F40, 0x8D01, 0x4DC0, 0x4C80, 0x8C41, 0x4400, 0x84C1, 0x8581, 0x4540, 0x8701, 0x47C0, 0x4680,
     0x8641, 0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040};
 
+// Computes CRC-16/Modbus over pkt[0..len-1], appends 2 CRC bytes, and sets the global sz to
+// the total transmit length. Caller must ensure the response (len + 2 + any further trailing
+// bytes) fits inside buf — sz is uint8_t and would wrap if len ≥ 254.
 static inline void appendCrc(uint8_t *pkt, uint8_t len) {
+    if (len > MAX_PKT_SZ - 2) len = MAX_PKT_SZ - 2;
     uint16_t crc = 0xFFFF;
     sz = len + 2;
     while (len--) {
@@ -92,6 +115,13 @@ static inline void appendCrc(uint8_t *pkt, uint8_t len) {
     }
     *pkt++ = crc;
     *pkt++ = crc >> 8;
+}
+
+// Single-byte CRC update step used by the streaming TX path (header bytes in sendHoldingRegs
+// and data bytes in the DRE ISR). Folds one byte into a running CRC-16/Modbus.
+static inline uint16_t crc_step(uint16_t c, uint8_t b) {
+    uint8_t x = b ^ c;
+    return (c >> 8) ^ crc_table[x];
 }
 
 static inline bool inputIsValidModbusCommand() {
@@ -110,21 +140,30 @@ static inline bool inputIsValidModbusCommand() {
     uint8_t expectedSz = 255;
 
     if (cmdDeviceId == deviceId || cmdDeviceId == 0) {
+        // Per Modbus spec, broadcasts (deviceId 0) are write-only — multiple slaves replying
+        // to a broadcast read would collide. Only accept broadcasts for write functions.
+        bool acceptBroadcast = false;
         switch (cmd) {
             case MODBUS_WRITE_COILS_CMD:
                 expectedSz = 9 + buf[6];
+                acceptBroadcast = true;
                 break;
-            case MODBUS_READ_COILS_CMD:
             case MODBUS_WRITE_SINGLE_COIL_CMD:
-            case MODBUS_READ_INPUT_REGISTERS_CMD:
-            case MODBUS_READ_HOLDING_REGISTERS_CMD:
             case MODBUS_WRITE_SINGLE_HOLDING_REGISTER_CMD:
                 expectedSz = 8;
+                acceptBroadcast = true;
                 break;
-
+            case MODBUS_READ_COILS_CMD:
+            case MODBUS_READ_INPUT_REGISTERS_CMD:
+            case MODBUS_READ_HOLDING_REGISTERS_CMD:
+                expectedSz = 8;
+                break;
             case MODBUS_CUSTOM_EXEC_DALI_CMD:
                 expectedSz = 7;
                 break;
+        }
+        if (cmdDeviceId == 0 && !acceptBroadcast) {
+            return false;
         }
         return sz == expectedSz;
     }
@@ -196,44 +235,64 @@ void got_dali_lowreg(dali_response_type_t err, uint16_t cmd, uint8_t res) {
 static void processGetCoilsCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
-    uint8_t *dptr = buf + 2;
     uint16_t *sptr = (uint16_t *)dali_holding_regs.banks[DALI_STATUS_BANK] + addr;
 
-    if (count > 0 && addr + count <= DALI_MAX_DEVICES) {
-        *dptr = count / 8 + (count % 8 ? 1 : 0);
-        for (int i = 0; i < count; i++) {
-            if (i % 8 == 0) {
-                dptr++;
-            }
-            *dptr = *dptr << 1 | (*sptr++ ? 1 : 0);
-        }
-        sendResponse(buf, buf[2] + 3);
-    } else {
-        // We can't query downstream sources, so this should return an illegal address error.
+    if (count == 0 || addr + count > DALI_MAX_DEVICES) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+        return;
     }
+
+    uint8_t numBytes = (count + 7) / 8;
+    buf[2] = numBytes;
+    // Modbus 0x01 packs coils LSB-first: bit 0 of byte N holds the lowest-numbered coil in that byte.
+    // Zero the data bytes first so we don't OR into uninitialised memory (which would leak prior buf contents).
+    memset(buf + 3, 0, numBytes);
+    for (uint16_t i = 0; i < count; i++) {
+        if (*sptr++) {
+            buf[3 + (i >> 3)] |= 1 << (i & 7);
+        }
+    }
+    sendResponse(buf, numBytes + 3);
 }
 
+// Reads holding registers and sends the response by streaming data directly from
+// dali_holding_regs in the DRE ISR. The DRE ISR reads each register fresh and folds the byte
+// into the CRC as it goes, so the CRC always matches the bytes actually sent — even if a TCA0
+// ISR updates a register mid-response. Modbus RTU caps a read at 125 registers.
 static void sendHoldingRegs() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
 
-    uint16_t *sptr = (uint16_t *)&dali_holding_regs;
-
-    if (count > 0 && count < 128 && addr + count <= DALI_MAX_HOLDING_REGISTER) {
-        buf[2] = 2 * count;
-        sptr += addr;
-        uint16_t *end = sptr + count;
-        uint8_t *dptr = buf + 3;
-
-        while (sptr < end) {
-            *dptr++ = *sptr >> 8;
-            *dptr++ = *sptr++ & 0xFF;
-        }
-        sendResponse(buf, buf[2] + 3);
-    } else {
+    if (count == 0 || count > 125 || addr + count > DALI_MAX_HOLDING_REGISTER) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+        return;
     }
+
+    // Header: buf[0] (device id) and buf[1] (func code 0x03) are already correct from the request.
+    buf[2] = 2 * count;
+
+    // Seed the running CRC with the 3 header bytes; the DRE ISR will continue folding in each
+    // data byte as it's transmitted. After the data drains, the final CRC is written to buf[3..4].
+    uint16_t c = 0xFFFF;
+    c = crc_step(c, buf[0]);
+    c = crc_step(c, buf[1]);
+    c = crc_step(c, buf[2]);
+    streamCrc = c;
+
+    streamSrc = (uint16_t *)&dali_holding_regs + addr;
+    streamWords = count;
+    streamHighByte = true;
+
+    ptr = buf;
+    sz = 3;  // 3 header bytes; ISR will then stream data, then send 2 CRC bytes from buf+3.
+
+    USART0.STATUS = USART_TXCIF_bm;
+    USART0.CTRLA = USART_RS485_EXT_gc | USART_DREIE_bm | USART_TXCIE_bm;
+}
+
+static inline void tohexstr(uint8_t num, char *hexStr) {
+    hexStr[0] = hexDigit(num >> 4);
+    hexStr[1] = hexDigit(num & 0x0F);
 }
 
 /**
@@ -243,11 +302,35 @@ static void sendInfo() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
 
-    if (count > 0 && addr + count <= (sizeof(verStr) / 2)) {
-        buf[2] = count * 2;
-        memcpy(buf + 3, verStr + addr * 2, count * 2);
+    strcpy((char *) buf+3, verstr);
+    char *ptr = (char *) (buf+3 + VERSTR_LEN);
+    tohexstr(SIGROW_SERNUM0, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM1, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM2, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM3, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM4, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM5, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM6, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM7, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM8, ptr);
+    ptr+= 2;
+    tohexstr(SIGROW_SERNUM9, ptr);
+    *ptr++ = 0; // Just in case the resulting string length is odd.
+    uint8_t strRegs = (VERSTR_LEN + 20 + 1) / 2;  // VERSTR + 20 hex chars, rounded up to whole registers
 
-        sendResponse(buf, buf[2] + 3);
+    if (count > 0 && addr + count <= strRegs) {
+        buf[2] = count * 2;
+        if (addr > 0)
+            memmove(buf + 3, buf + 3 + addr * 2, count * 2);
+        sendResponse(buf, count * 2 + 3);
     } else {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
@@ -256,11 +339,12 @@ static void sendInfo() {
 static volatile dali_response_type_t daliResponseType;
 static volatile uint8_t daliResponse;
 
-void waitForDaliResponse() {
-    // Bound the wait to ~300 ms — enough for 3 queued DALI commands (each ≤ ~56 ms worst case)
-    // but short enough to give the Modbus master a timely error response instead of an 8-second silence.
+static void waitForDaliResponse() {
+    // Bound the wait to ~600 ms. Any DALI batch that has not completed within this window is
+    // reported to the Modbus master as a NAK (well before the 8.2 s WDT). The commands themselves
+    // remain queued and continue executing on the DALI bus regardless of the Modbus response.
     // TCA0 ISRs continue to fire during _delay_ms, so the DALI state machine keeps running.
-    for (uint16_t t = 300; t > 0 && daliResponseType == DALI_RESPONSE_PENDING; t--) {
+    for (uint16_t t = 600; t > 0 && daliResponseType == DALI_RESPONSE_PENDING; t--) {
         _delay_ms(1);
     }
     if (daliResponseType == DALI_RESPONSE_PENDING) {
@@ -350,42 +434,66 @@ static void processSetSingleHoldingRegisterCommand() {
                     val >>= 1;
                 }
                 waitForDaliResponse();
+            } else {
+                // No bits actually changed — treat as a no-op success.
+                daliResponseType = DALI_RESPONSE_OK;
             }
             break;
-        //     dali_set_min_level(bankAddr, val, NULL);
-        //     dali_set_max_level(bankAddr, val, dali_cmd_completed);
-        //     break;
         default:
             sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
             return;
     }
-    sendResponse(buf, sz - 2);
-
+    if (daliResponseType == DALI_RESPONSE_OK) {
+        sendResponse(buf, sz - 2);
+    } else {
+        sendError(dali_response_to_err(daliResponseType));
+    }
 }
 
+// Forward declaration — defined in dali_state_idle.c. We call this directly (instead of
+// dali_off/dali_goto_last_active or dali_custom_command) because those helpers route through
+// track_fade and the singleton post_cmd_callback, which would race across iterations of the
+// per-coil loop below.
+extern dali_result_t dali_queue_command(uint16_t cmd, uint8_t repeat, dali_callback_t callback);
+
+// Modbus 0x0F (Write Multiple Coils): maps each bit to a DALI device on/off, mirroring the
+// semantics of processSetSingleCoilCommand (bit set → goto-last-active, bit clear → off). Coils
+// are addressed as DALI short addresses 0..63. We process one coil at a time so the DALI command
+// queue depth never exceeds 1 per iteration regardless of count, and the cached holding registers
+// are refreshed by the next background scan rather than being kept in lockstep here.
+//
+// MAX_MULTI_COIL_COUNT is bounded so the worst-case batch (every device NAKing) completes well
+// within the WDT window: count × waitForDaliResponse ≤ MAX_MULTI_COIL_COUNT × 600 ms.
+#define MAX_MULTI_COIL_COUNT 8
 static void processSetCoilsCommand() {
     uint16_t addr = buf[2] << 8 | buf[3];
     uint16_t count = buf[4] << 8 | buf[5];
     uint8_t numBytes = buf[6];
 
-    uint8_t *coilData = buf + 7;
-    if (addr < 8) {
-        // At least some of the coil values are for this unit
-        uint8_t bitsForThisUnit = 8 - addr;
-        if (bitsForThisUnit > count) {
-            bitsForThisUnit = count;
-        }
-        // Set coil values.
-        // for (uint8_t i = 0; i < bitsForThisUnit; i++) {
-        //     setCoil(addr + i, val & 0x01 ? 0xFF : 0x00);
-        //     val >>= 1;
-        // }
-        // latchOutputs();
-
-        sendResponse(buf, 6);
-    } else {
+    if (count == 0 || count > MAX_MULTI_COIL_COUNT || addr + count > DALI_MAX_DEVICES) {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
+        return;
     }
+    if (numBytes != (uint8_t)((count + 7) / 8)) {
+        sendError(MODBUS_ERR_ILLEGAL_VALUE);
+        return;
+    }
+
+    // Modbus packs coils LSB-first: bit 0 of byte N holds the lowest-numbered coil in that byte.
+    uint8_t *coilData = buf + 7;
+    for (uint16_t i = 0; i < count; i++) {
+        bool on = (coilData[i >> 3] >> (i & 7)) & 1;
+        uint16_t cmd = (on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF) | ((addr + i) << 9);
+        daliResponseType = DALI_RESPONSE_PENDING;
+        dali_queue_command(cmd, 1, dali_cmd_completed);
+        waitForDaliResponse();
+        if (daliResponseType != DALI_RESPONSE_OK) {
+            sendError(dali_response_to_err(daliResponseType));
+            return;
+        }
+    }
+    // Modbus 0x0F success response echoes the request's first 6 bytes (addr + func + start + count).
+    sendResponse(buf, 6);
 }
 
 static void processSetSingleCoilCommand() {
@@ -402,8 +510,12 @@ static void processSetSingleCoilCommand() {
             dali_off(addr, dali_cmd_completed);
         }
         waitForDaliResponse();
-        // Simply mirror the request back to the caller
-        sendResponse(buf, sz - 2);
+        if (daliResponseType == DALI_RESPONSE_OK) {
+            // Mirror the request back to the caller as the success response.
+            sendResponse(buf, sz - 2);
+        } else {
+            sendError(dali_response_to_err(daliResponseType));
+        }
     } else {
         sendError(MODBUS_ERR_ILLEGAL_ADDRESS);
     }
@@ -413,6 +525,7 @@ static void modbus_reset_buffer() {
     ptr = buf;
     crc = 0xFFFF;
     sz = 0;
+    streamWords = 0;
     modbus_cmd_available = false;
 }
 
@@ -427,9 +540,6 @@ extern void rs485_init(uint8_t rs485_device_id) {
     modbus_reset_buffer();
 
     deviceId = rs485_device_id;
-    memset(verStr, 0, sizeof(verStr));
-    snprintf(verStr, sizeof(verStr), "Mechination DALI v%d.%d ID:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", FW_VER_MAJOR, FW_VER_MINOR, SIGROW_SERNUM0,
-             SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3, SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7, SIGROW_SERNUM8, SIGROW_SERNUM9);
 
     // Set up USART to operate at 9600, running on alternate pins.
     PORTMUX.CTRLB = PORTMUX_USART0_ALTERNATE_gc;
@@ -454,10 +564,10 @@ void rs485_process_command() {
     // modbus_cmd_available variable.  When it is set, there is a valid command in
     // the incoming buffer, and RX has been temporarily turned off. 
     if (modbus_cmd_available) {
-        // MODBUS requires a small delay between receiving a request, and responding.
-        _delay_us(1500);
+        // Modbus RTU requires at least 3.5 character times of silence (≈ 3.65 ms at 9600 baud)
+        // between request and response so masters relying on inter-frame timing can separate the two.
+        _delay_ms(4);
 
-        uint8_t cmd_addr = buf[0];
         switch (buf[1]) {
             case MODBUS_READ_COILS_CMD:
                 processGetCoilsCommand();
@@ -494,10 +604,41 @@ void rs485_process_command() {
  */
 ISR(USART0_DRE_vect) {
     if (sz) {
+        // Header bytes (CRC was seeded over them in sendHoldingRegs) or, after the stream
+        // drains, the trailing CRC bytes (no further CRC update for these).
         USART0.TXDATAL = *ptr++;
         sz--;
+    } else if (streamWords) {
+        uint8_t b;
+        if (streamHighByte) {
+            // Read the register fresh, atomically. TCA0 (LVL1) can preempt this ISR, so the
+            // 16-bit load needs to be uninterruptible to avoid a torn high/low pair.
+            uint16_t w;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                w = *streamSrc;
+            }
+            b = w >> 8;
+            streamLowByte = w & 0xFF;
+            streamHighByte = false;
+        } else {
+            b = streamLowByte;
+            streamSrc++;
+            streamWords--;
+            streamHighByte = true;
+        }
+        USART0.TXDATAL = b;
+        streamCrc = crc_step(streamCrc, b);
+
+        if (streamWords == 0 && streamHighByte) {
+            // Just sent the final low byte. Park the running CRC and switch to buf-send mode
+            // for the trailing 2 CRC bytes (CRC low first, then CRC high — Modbus RTU).
+            buf[3] = streamCrc & 0xFF;
+            buf[4] = streamCrc >> 8;
+            ptr = buf + 3;
+            sz = 2;
+        }
     } else {
-        // Disable DRE ISR
+        // Nothing left to send.
         USART0.CTRLA = USART_RS485_EXT_gc | USART_TXCIE_bm;
     }
 }

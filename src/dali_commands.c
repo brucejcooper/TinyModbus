@@ -6,7 +6,17 @@
 #define ENCODE_CMD(cmd, addr) ((cmd) | ((addr) << 9))
 
 
+// Singleton "fade completed" callback — written from main-thread Modbus handlers and
+// read+cleared by check_fade_completed running in ISR context. The 16-bit pointer assignment
+// is two non-atomic STS instructions; if an ISR fires between them, check_fade_completed
+// would call a torn (partly-old / partly-new) pointer. set_post_cmd_callback wraps the write
+// in ATOMIC_BLOCK so the writer can't be split by an interrupt.
 static dali_callback_t post_cmd_callback = NULL;
+static inline void set_post_cmd_callback(dali_callback_t cb) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        post_cmd_callback = cb;
+    }
+}
 static const uint16_t scan_command_sequence[] = {
     DALI_CMD_QUERY_STATUS,
     DALI_CMD_GET_LEVEL,
@@ -108,21 +118,21 @@ void dali_start_background_scan(uint8_t addr) {
     }
 }
 
-void dali_set_level(uint8_t addr, uint8_t level, dali_callback_t final) { 
-    post_cmd_callback = final;
-    dali_queue_command(ENCODE_CMD(level, addr), 1, NULL); 
+void dali_set_level(uint8_t addr, uint8_t level, dali_callback_t final) {
+    set_post_cmd_callback(final);
+    dali_queue_command(ENCODE_CMD(level, addr), 1, NULL);
     track_fade(addr);
 }
 
-void dali_goto_last_active(uint8_t addr, dali_callback_t cb) { 
-    post_cmd_callback = cb;
-    dali_queue_command(ENCODE_CMD(DALI_CMD_GOTO_LAST_ACTIVE, addr), 1, NULL); 
+void dali_goto_last_active(uint8_t addr, dali_callback_t cb) {
+    set_post_cmd_callback(cb);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_GOTO_LAST_ACTIVE, addr), 1, NULL);
     track_fade(addr);
 }
 
-void dali_off(uint8_t addr, dali_callback_t cb) { 
-    post_cmd_callback = cb;
-    dali_queue_command(ENCODE_CMD(DALI_CMD_OFF, addr), 1, NULL); 
+void dali_off(uint8_t addr, dali_callback_t cb) {
+    set_post_cmd_callback(cb);
+    dali_queue_command(ENCODE_CMD(DALI_CMD_OFF, addr), 1, NULL);
     track_fade(addr);
 }
 
@@ -185,7 +195,7 @@ void dali_remove_from_group(uint8_t addr, uint8_t group, dali_callback_t callbac
 
 void dali_toggle(uint8_t addr, dali_callback_t cb) {
     // Start by fetching the current level
-    post_cmd_callback = cb;
+    set_post_cmd_callback(cb);
     dali_queue_command(ENCODE_CMD(DALI_CMD_GET_LEVEL, addr), 1, toggle_based_on_level);
 }
 
@@ -196,7 +206,7 @@ void dali_custom_command(uint16_t cmd, dali_callback_t responseCallback, uint8_t
     dali_queue_command(cmd, repeat, isLevelChanging ? NULL : responseCallback);
     if (isLevelChanging) {
         uint8_t addr = DALI_DECODE_ADDR(cmd);
-        post_cmd_callback = responseCallback;
+        set_post_cmd_callback(responseCallback);
         track_fade(DALI_DECODE_ADDR(addr));
     }
 }

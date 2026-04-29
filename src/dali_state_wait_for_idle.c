@@ -30,6 +30,10 @@ static void idlePeriodExprired() {
 
 static void onIdleBus() {
     dali_call_on_rising_once(onBusShorted);
+    // When entered from PORT_vect (LVL0) the previous state's daliTimer is still mid-countdown.
+    // Zero it before swapping the (16-bit, non-atomic) callback pointer so TCA0 LVL1 can't fire
+    // a torn pointer if the timer happens to expire between the two STS instructions.
+    daliTimer = 0;
     daliTimerCallback = idlePeriodExprired;
     daliTimer = IDLE_THRESHOLD_TE;
 }
@@ -51,6 +55,9 @@ static void onBusShorted() {
     // Wait for the bus to return to idle (RX pin goes low).
     dali_call_on_low_once(onIdleBus);
     // Safety net: if the bus never recovers, escape after BUS_STUCK_TIMEOUT_TE.
+    // Zero daliTimer first so TCA0 LVL1 can't fire a torn callback while the (16-bit,
+    // non-atomic) pointer write is in flight — see the equivalent comment in onIdleBus.
+    daliTimer = 0;
     daliTimerCallback = busStuckTimeout;
     daliTimer = BUS_STUCK_TIMEOUT_TE;
 }

@@ -37,8 +37,11 @@
 #define DALI_CMD_QUERY_MAX_LEVEL      0xA2u
 #define DALI_CMD_QUERY_POWER_ON_LEVEL 0xA3u
 #define DALI_CMD_QUERY_FAIL_LEVEL     0xA4u
-#define DALI_CMD_QUERY_FADE_RATE      0xA5u
-#define DALI_CMD_QUERY_FADE_TIME      0xA6u
+// QUERY_FADE_TIME_FADE_RATE returns one byte: high nibble = fade time
+// (0..15), low nibble = fade rate (0..15).  Both fields refresh from this
+// single query.  (DALI opcode 0xA6 is reserved by IEC 62386-102 - never
+// issue it.)
+#define DALI_CMD_QUERY_FADE_TIME_FADE_RATE  0xA5u
 #define DALI_CMD_QUERY_GROUP_0_7      0xC0u
 #define DALI_CMD_QUERY_GROUP_8_15     0xC1u
 

@@ -37,15 +37,16 @@ static void enqueue_scan_for_addr(uint8_t addr);  // forward decl
 typedef struct { uint8_t dali_cmd; reg_target_t reg_target; } scan_query_t;
 
 static const scan_query_t scan_queries[] PROGMEM = {
-    { DALI_CMD_QUERY_ACTUAL_LEVEL,   REG_BRIGHTNESS },
-    { DALI_CMD_QUERY_MIN_LEVEL,      REG_MIN        },
-    { DALI_CMD_QUERY_MAX_LEVEL,      REG_MAX        },
-    { DALI_CMD_QUERY_POWER_ON_LEVEL, REG_POWER_ON   },
-    { DALI_CMD_QUERY_FAIL_LEVEL,     REG_SYS_FAIL   },
-    { DALI_CMD_QUERY_FADE_RATE,      REG_FADE_RATE  },
-    { DALI_CMD_QUERY_FADE_TIME,      REG_FADE_TIME  },
-    { DALI_CMD_QUERY_GROUP_0_7,      REG_GROUP_0_7  },
-    { DALI_CMD_QUERY_GROUP_8_15,     REG_GROUP_8_15 },
+    { DALI_CMD_QUERY_ACTUAL_LEVEL,         REG_BRIGHTNESS },
+    { DALI_CMD_QUERY_MIN_LEVEL,            REG_MIN        },
+    { DALI_CMD_QUERY_MAX_LEVEL,            REG_MAX        },
+    { DALI_CMD_QUERY_POWER_ON_LEVEL,       REG_POWER_ON   },
+    { DALI_CMD_QUERY_FAIL_LEVEL,           REG_SYS_FAIL   },
+    // One DALI query refreshes both fade_time and fade_rate (regs_apply_result
+    // splits the response byte's nibbles into block3.fade_time/fade_rate).
+    { DALI_CMD_QUERY_FADE_TIME_FADE_RATE,  REG_FADE_RATE  },
+    { DALI_CMD_QUERY_GROUP_0_7,            REG_GROUP_0_7  },
+    { DALI_CMD_QUERY_GROUP_8_15,           REG_GROUP_8_15 },
 };
 #define NUM_SCAN_QUERIES (sizeof(scan_queries) / sizeof(scan_queries[0]))
 
@@ -196,7 +197,7 @@ void bgtasks_run(void) {
 // ---- RTC PIT - periodic rescan (same cadence as original) ----------
 
 ISR(RTC_PIT_vect) {
-    uint16_t interval = regs_get_rescan_interval();
+    uint16_t interval = userrow_get_rescan_interval();
     if (rescan_counter > interval) rescan_counter = interval;
     if (interval > 0 && --rescan_counter == 0) {
         rescan_counter = interval;

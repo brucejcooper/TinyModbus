@@ -38,9 +38,6 @@ typedef struct {
     uint16_t       fading[4];
     uint16_t       dirty[4];
     uint16_t       raw_cmd_result;   // FC04 0x015D, see RAW_RESULT_* below
-    // Config (mirrored in holding regs 0x1012-0x1013; beyond FC04 window)
-    uint8_t        mb_slave_addr;   // 1-247
-    uint8_t        baud_index;      // 0=9600 1=19200 2=38400
 } register_map_t;
 
 extern register_map_t g_regs;
@@ -83,7 +80,10 @@ extern register_map_t g_regs;
 // Bus scan - write 0x0001 to trigger a full bus scan
 #define MBREG_SCAN_TRIGGER      0x1010u
 
-// Configuration registers (persisted to EEPROM)
+// Configuration registers
+//   - rescan interval is persisted to EEPROM (changes often, byte-erasable)
+//   - slave addr / baud are persisted to USERROW (changes rarely, survives chip
+//     erase + reflash so a re-flashed unit keeps its address)
 #define MBREG_RESCAN_INTERVAL   0x1011u  // seconds between periodic bus rescans; 0 = disabled
 #define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
 #define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400
@@ -101,9 +101,26 @@ extern register_map_t g_regs;
 #define RAW_RESULT_OK(b)   (0x0200u | (uint8_t)(b))  // response received
 #define RAW_RESULT_ERR(e)  (0x0300u | (uint8_t)(e))  // bus/timing error
 
-// Initialise the register map to defaults and load persisted config from EEPROM.
-// Slave address preference: EEPROM > USERROW formula > 1.
+// Initialise the register map to zeroed defaults.  All persisted config
+// (slave addr, baud, rescan interval) lives in USERROW and is read on demand
+// via the userrow_* accessors below - no caching in the register map.
 void     regs_init(void);
+
+// USERROW-backed config.  USERROW survives chip erase + reflash, so units
+// keep their identity through firmware updates.  Reads are zero-overhead;
+// writes go through NVMCTRL page-erase-write (~3.4 ms, CPU halted during
+// the operation) and are skipped if the value already matches.
+//
+// Layout: byte 0 = slave addr (encoded as addr - 2; 0xFF = address 1),
+//         byte 1 = baud index (0/1/2; 0xFF = 9600),
+//         bytes 2-3 = rescan interval big-endian (0xFFFF = 64 s).
+// Reserved Modbus addresses (0, 248-255) are clamped to 1 on read.
+uint8_t  userrow_get_slave_addr(void);
+bool     userrow_set_slave_addr(uint8_t addr);    // false on out-of-range
+uint8_t  userrow_get_baud_index(void);
+bool     userrow_set_baud_index(uint8_t idx);     // false on out-of-range
+uint16_t userrow_get_rescan_interval(void);
+bool     userrow_set_rescan_interval(uint16_t v);
 
 // Copy count FC04 input registers starting at addr into buf (big-endian, 2 bytes each).
 // The register_map_t layout mirrors the FC04 address space, so this is a direct memcpy.
@@ -143,8 +160,5 @@ void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_gro
 
 // Recompute group_status[group_idx].status by ORing the status of all member ballasts.
 void     regs_rebuild_group_status(uint8_t group_idx);
-
-// Return the current periodic rescan interval in seconds (0 = disabled).
-uint16_t regs_get_rescan_interval(void);
 
 #endif

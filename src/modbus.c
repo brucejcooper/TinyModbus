@@ -19,7 +19,7 @@
 #define USART0_BAUD_RATE(B) ((float)(F_CPU * 64 / (16 * (float)(B))) + 0.5f)
 
 // Precomputed USART BAUD register values for each supported baud rate.
-// Indexed by g_regs.baud_index: 0=9600, 1=19200, 2=38400.
+// Indexed by userrow_get_baud_index(): 0=9600, 1=19200, 2=38400.
 static const uint16_t s_baud_reg[] = {
     (uint16_t)USART0_BAUD_RATE(9600),
     (uint16_t)USART0_BAUD_RATE(19200),
@@ -88,6 +88,15 @@ static volatile bool     frame_ready   = false;
 static          uint8_t  tx_sz    = 0;
 static          bool     no_response   = false;
 volatile bool            modbus_idle   = true;
+
+// Set when a write to MBREG_SLAVE_ADDR or MBREG_BAUD_INDEX has just landed in
+// USERROW.  The runtime change (USART0.BAUD, slave_addr local) is deferred
+// until the response we are about to send has cleared the wire - see
+// apply_pending_config().  USERROW already holds the new value, so we just
+// re-read on apply.
+#define APPLY_BAUD   0x01u
+#define APPLY_SLAVE  0x02u
+static volatile uint8_t  pending_apply_mask = 0;
 
 
 // ---- CRC-16 table ---------------------------------------------------
@@ -224,8 +233,12 @@ static void classify_raw_cmd(uint8_t addr_byte, uint8_t cmd_byte) {
         case DALI_CMD_SET_MIN_LEVEL:      qcmd = DALI_CMD_QUERY_MIN_LEVEL;      qtarget = REG_MIN;       break;
         case DALI_CMD_SET_SYS_FAIL_LEVEL: qcmd = DALI_CMD_QUERY_FAIL_LEVEL;     qtarget = REG_SYS_FAIL;  break;
         case DALI_CMD_SET_POWER_ON_LEVEL: qcmd = DALI_CMD_QUERY_POWER_ON_LEVEL; qtarget = REG_POWER_ON;  break;
-        case DALI_CMD_SET_FADE_TIME:      qcmd = DALI_CMD_QUERY_FADE_TIME;      qtarget = REG_FADE_TIME; break;
-        case DALI_CMD_SET_FADE_RATE:      qcmd = DALI_CMD_QUERY_FADE_RATE;      qtarget = REG_FADE_RATE; break;
+        // SET_FADE_TIME and SET_FADE_RATE both modify the same DALI register
+        // (high/low nibble respectively), and the readback comes from the same
+        // QUERY_FADE_TIME_FADE_RATE opcode.  regs_apply_result splits the byte
+        // back into block3.fade_time / block3.fade_rate.
+        case DALI_CMD_SET_FADE_TIME:
+        case DALI_CMD_SET_FADE_RATE:      qcmd = DALI_CMD_QUERY_FADE_TIME_FADE_RATE; qtarget = REG_FADE_RATE; break;
         default: return;
     }
     s_raw_post.ballast_idx  = bidx;
@@ -314,12 +327,23 @@ static void process_fc04(void) {
     buf[2] = (uint8_t)(count * 2u);
     regs_read_input_bulk(addr, (uint8_t)count, buf + 3);
 
-    // Clear dirty flags after copying so the master sees the actual bits, not zeros
+    // If the read range covers any dirty-flag words, atomically read-and-clear
+    // each one and OVERWRITE the corresponding bytes in buf with the captured
+    // value.  Without this overwrite, an ISR setting a new dirty bit between
+    // the bulk-read above and the clear below would: (1) be sent to the
+    // master as 0 in the bulk-read snapshot, then (2) be wiped by the clear
+    // before the next FC04 - silently losing the update.  The atomic
+    // read-and-clear inside regs_read_clear_dirty captures the up-to-the-
+    // moment state, which we then ship to the master.
     if (addr + count > FC04_DIRTY_BASE && addr <= FC04_DIRTY_END) {
         uint16_t d_start = (addr < FC04_DIRTY_BASE) ? FC04_DIRTY_BASE : addr;
         uint16_t d_end   = (addr + count - 1u > FC04_DIRTY_END) ? FC04_DIRTY_END : (addr + count - 1u);
-        for (uint16_t a = d_start; a <= d_end; a++)
-            regs_read_clear_dirty((uint8_t)(a - FC04_DIRTY_BASE));
+        for (uint16_t a = d_start; a <= d_end; a++) {
+            uint16_t fresh   = regs_read_clear_dirty((uint8_t)(a - FC04_DIRTY_BASE));
+            uint16_t buf_off = (uint16_t)(a - addr) * 2u;
+            buf[3 + buf_off]      = (uint8_t)(fresh >> 8);
+            buf[3 + buf_off + 1u] = (uint8_t)fresh;
+        }
     }
 
     start_tx(3 + buf[2]);
@@ -365,12 +389,17 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         // (addressed, group, broadcast, or special command).
         // MBREG_RAW_CMD = single send (waits for response);
         // MBREG_RAW_CMD_TWICE = send twice (no response expected).
-        // Reject if a previous raw command is still pending.
+        // Reject if a previous raw command is still pending.  TCB0 (LVL1) can write
+        // raw_cmd_result via cmdq_result_received -> raw_cmd_*_done, so disable
+        // TCB0 in addition to LVL0 ISRs while we sample-and-claim PENDING.
         bool pending;
+        uint8_t old_tcb_intctrl = TCB0.INTCTRL;
+        TCB0.INTCTRL = 0;
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             pending = (g_regs.raw_cmd_result == RAW_RESULT_PENDING);
             if (!pending) g_regs.raw_cmd_result = RAW_RESULT_PENDING;
         }
+        TCB0.INTCTRL = old_tcb_intctrl;
         if (pending) return MB_ERR_DEVICE_BUSY;
 
         bool is_twice = (mb_reg == MBREG_RAW_CMD_TWICE);
@@ -435,6 +464,15 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
     return 0;
 }
 
+// Mark slave-addr / baud-index writes for deferred runtime apply.  The
+// USERROW write itself has already happened inside regs_write_holding; this
+// just remembers to flip the live USART/slave_addr after the response is
+// fully on the wire.
+static void note_runtime_config_write(uint16_t mb_reg) {
+    if (mb_reg == MBREG_SLAVE_ADDR) pending_apply_mask |= APPLY_SLAVE;
+    if (mb_reg == MBREG_BAUD_INDEX) pending_apply_mask |= APPLY_BAUD;
+}
+
 // Handle FC06 (Write Single Register): validate, update register map, dispatch DALI action.
 static void process_fc06(void) {
     uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
@@ -444,6 +482,7 @@ static void process_fc06(void) {
         send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
+    note_runtime_config_write(addr);
     mb_err_t err = dispatch_action_reg(addr, val);
     if (err) { send_error(err); return; }
     // Echo the request back (standard FC06 response)
@@ -473,20 +512,20 @@ static void process_fc10(void) {
                 if (r == MBREG_RAW_CMD || r == MBREG_RAW_CMD_TWICE) has_raw_cmd = true;
             }
         }
-        if (has_raw_cmd) {
-            bool pending;
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                pending = (g_regs.raw_cmd_result == RAW_RESULT_PENDING);
-            }
-            if (pending) { send_error(MB_ERR_DEVICE_BUSY); return; }
+        // Both checks below need to fence out TCB0 (LVL1) writers in addition to
+        // LVL0: cmdq_result_received fires from TCB0 and can both pop the queue
+        // (changes cmdq_count) and write raw_cmd_result via raw_cmd_*_done.
+        uint8_t old_tcb_intctrl = TCB0.INTCTRL;
+        TCB0.INTCTRL = 0;
+        bool busy = false;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            if (has_raw_cmd && g_regs.raw_cmd_result == RAW_RESULT_PENDING)
+                busy = true;
+            else if (need_slots > (CMD_QUEUE_SIZE - 1u) - cmdq_count())
+                busy = true;
         }
-        if (need_slots > 0) {
-            uint8_t avail;
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                avail = (CMD_QUEUE_SIZE - 1u) - cmdq_count();
-            }
-            if (need_slots > avail) { send_error(MB_ERR_DEVICE_BUSY); return; }
-        }
+        TCB0.INTCTRL = old_tcb_intctrl;
+        if (busy) { send_error(MB_ERR_DEVICE_BUSY); return; }
     }
 
     uint8_t *payload_ptr = buf + 7;
@@ -497,6 +536,7 @@ static void process_fc10(void) {
             send_error(MB_ERR_ILLEGAL_ADDRESS);
             return;
         }
+        note_runtime_config_write(addr + i);
         mb_err_t err = dispatch_action_reg(addr + i, reg_value);
         if (err) { send_error(err); return; }
     }
@@ -649,6 +689,31 @@ static bool frame_is_valid(void) {
     return rx_sz == expected_size;
 }
 
+// ---- Deferred slave-addr / baud apply ----------------------------------
+
+// Read the freshly-written USERROW value(s) and update the live USART /
+// slave-addr state.  Called after the response we sent at the OLD config
+// has cleared the wire (either from the TXC ISR for normal frames, or from
+// modbus_process for broadcasts that send no response), and BEFORE
+// return_to_rx re-enables RX so the next byte arrives at the new baud and
+// is matched against the new slave address.
+//
+// USART0.BAUD must not be written mid-transmission, but TXC fires after the
+// last stop bit has cleared so it is safe here.
+static void apply_pending_config(void) {
+    uint8_t mask = pending_apply_mask;
+    if (!mask) return;
+    pending_apply_mask = 0;
+    if (mask & APPLY_BAUD) {
+        uint8_t bidx = userrow_get_baud_index();
+        USART0.BAUD     = s_baud_reg[bidx];
+        s_silence_ticks = s_silence_threshold[bidx];
+    }
+    if (mask & APPLY_SLAVE) {
+        slave_addr = userrow_get_slave_addr();
+    }
+}
+
 // ---- Return to receive mode ---------------------------------------------
 
 // Reset frame state and re-enable the USART receiver.
@@ -675,7 +740,7 @@ void modbus_init(uint8_t addr) {
     modbus_idle = true;
     initial_silence_observed = false;
 
-    uint8_t bidx = (g_regs.baud_index <= 2) ? g_regs.baud_index : 0;
+    uint8_t bidx = userrow_get_baud_index();
     s_silence_ticks = s_silence_threshold[bidx];
     // Arm the initial 3.5-char silence countdown.  modbus_tick will set
     // initial_silence_observed when it expires without an intervening byte.
@@ -721,7 +786,11 @@ void modbus_tick(void) {
 void modbus_process(void) {
     if (!frame_ready) return;
 
-    _delay_us(1500);  // Modbus turnaround guard
+    // Modbus RTU requires at least 3.5 char times of silence (~3.65 ms at 9600
+    // baud) between request and response so masters relying on inter-frame
+    // timing can separate the two and so the master's TX-to-RX transceiver
+    // switch-over completes before our first response byte hits the wire.
+    _delay_ms(4);
 
     no_response = (buf[0] == 0);
 
@@ -738,6 +807,9 @@ void modbus_process(void) {
 
     if (no_response) {
         no_response = false;
+        // Broadcast: no response was sent, so apply the new config now (no
+        // outgoing frame to wait for).
+        apply_pending_config();
         return_to_rx();
     }
 
@@ -763,6 +835,10 @@ ISR(USART0_TXC_vect) {
     while (USART0.STATUS & USART_RXCIF_bm) {
         (void)USART0.RXDATAL;
     }
+    // Response is fully on the wire now: safe to flip USART0.BAUD or update
+    // slave_addr.  Done before return_to_rx so the next byte is sampled at
+    // the new baud rate and matched against the new slave address.
+    apply_pending_config();
     return_to_rx();
 }
 

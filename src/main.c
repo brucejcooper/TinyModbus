@@ -26,7 +26,7 @@ int main(void) {
     regs_init();
     cmdq_init();
     tick_init();                          // starts TCA0 - ticks begin here
-    modbus_init(g_regs.mb_slave_addr);
+    modbus_init(userrow_get_slave_addr());
     dali_init();
 
     set_sleep_mode(SLEEP_MODE_STANDBY);

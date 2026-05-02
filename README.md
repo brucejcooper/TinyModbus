@@ -441,3 +441,45 @@ make         # build, erase device, and flash
 ```
 
 `pymcuprog` is required for flashing. Programming is via UPDI on the test point using a USB-UART adapter.
+
+A standard `make` (build + erase + flash) does NOT touch USERROW — the slave address, baud rate, and rescan interval persist across reflashes. To write the persisted-config bytes:
+
+```sh
+make configure                                              # defaults: address 1, 9600 baud, 64 s rescan
+make configure SLAVE_ADDR=5 BAUD_INDEX=1                    # address 5, 19200 baud, default rescan
+make configure RESCAN_INTERVAL=120                          # change just the rescan
+make configure SLAVE_ADDR=42 BAUD_INDEX=2 RESCAN_INTERVAL=30
+```
+
+`BAUD_INDEX` is `0=9600 / 1=19200 / 2=38400`. `make configure` rewrites all 32 USERROW bytes — the four config bytes plus 28 bytes of `0xFF`.
+
+## Known Limitations
+
+These are residual issues that the current firmware does not address. None are runtime-fatal; each has a documented workaround or expected impact.
+
+### Modbus
+
+- **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2-3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
+- **FC10 partial execution on register-map holes.**  The holding-register set has gaps at 0x100E and 0x100F.  A multi-register write spanning the gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the hole.
+- **FC0F worst-case latency.**  Writing 64 coils at once dispatches 64 DALI commands; with the mandatory 22 Te idle gap between frames the bus takes ~4.8 s to drain.  A master that times out faster than that will see `DEVICE_BUSY` on follow-up writes until the queue clears.
+- **FC04 0x0200 returns an ASCII version string, not a register address space.**  Reading exactly 16 input registers from address 0x0200 yields the 32-byte string `"DALI v<maj>.<min> <serial>"`.  Other lengths at this address fall through to the standard register-range check and return `ILLEGAL_ADDRESS`.
+
+### DALI
+
+- **Add/remove-from-group readback bug.**  A raw `ADD_TO_GROUP` / `REMOVE_FROM_GROUP` command (0x60-0x7F) is dispatched but no follow-up `QUERY_GROUPS_*` is queued, so the cached `group_mask` does not refresh until the periodic bus scan runs (default 64 s).
+- **No multi-master collision detection during our own TX.**  If another master begins driving the bus while we are already transmitting, the resulting collision is not detected; the receiving ballast simply sees a malformed frame and ignores it.
+- **`WAIT_FOR_IDLE` skipped after a backward-frame NAK.**  After a query that NAKs (no response), the state machine goes directly to the next command without an explicit 22 Te idle wait.  Safe in practice because the NAK timeout itself spans well over 22 Te, but it is structural rather than enforced.
+- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a tolerance window; pulses falling between the half-bit and full-bit ranges (~500-667 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
+- **Bus duty cycle during scan.**  A full 64-address scan with each ballast's nine follow-up queries occupies the bus at roughly 30% duty for ~30 s.  Other DALI traffic (DAPC commands from the master) is queued and dispatched between scan steps but with reduced throughput.
+- **`MBREG_SET_DTR0` / `SET_DTR1` / `SET_DTR2` race against raw set helpers.**  A raw DALI set sequence (e.g. SET_MAX_LEVEL, which loads DTR0 then sends the SET command twice) runs as multiple queue entries; an interleaved write to `MBREG_SET_DTR0` from the master can clobber DTR0 mid-sequence.  Use either the helper or the raw flow exclusively, not both concurrently.
+
+### Concurrency
+
+- **`bgtasks_start_fade_poll` race.**  The check-and-set on `fade_chain_active` inside `ATOMIC_BLOCK` only fences out LVL0 ISRs; TCB0 (LVL1) clearing the bit between LVL0's check and its set can drop a fresh fade-tracking request.  Symptom: stale `block0[idx].brightness` until the next user action on the same ballast.
+- **Double-pop race on receive timeout.**  In a microsecond-wide window during `rx_cleanup`, both LVL0 (`timer_overflow`) and LVL1 (`send_rx_error`) can call `cmdq_result_received` for the same outstanding command, popping the queue twice.  Triggers only if `TCB0.INTFLAGS` is already pending at the moment TCA0 dispatches the receive timeout - vanishingly unlikely under spec-compliant DALI timing.
+
+### Hardware / runtime
+
+- **Stack budget tight.**  Worst-case nested-ISR depth (TCA0 LVL0 chain + TCB0 LVL1 chain + main thread mid-`modbus_process`) leaves ~30-50 bytes of headroom over the 175 B available.  The largest contributor is the `snprintf` call in the FC04 version-string path; if that path grows, monitor stack usage with the `.su` files emitted by `-fstack-usage`.
+- **RS-485 DE pin floats briefly at reset.**  `main` drives PA4 low immediately, but there is a ~50-200 µs window after reset (before that store executes) where the pin is high-Z.  An external pull-down on PA4 plus the BOD fuse on the next PCB revision is the recommended fix.
+- **`USERROW` write halts the CPU.**  A `MBREG_SLAVE_ADDR`/`BAUD_INDEX`/`RESCAN_INTERVAL` write performs a NVMCTRL page-erase-write that suspends CPU execution for ~3.4 ms.  Triggered by Modbus writes the firmware schedules so the halt lands in the master's silence window before our response, but a DALI frame in flight at that exact moment will be corrupted.  Avoid changing config during heavy DALI traffic.

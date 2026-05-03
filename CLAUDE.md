@@ -19,3 +19,14 @@ Enum fields in `cmd_entry_t` use `__attribute__((packed))` to force 1-byte stora
 ## Diagnostics
 
 Clang (macOS) will report false-positive errors for AVR-specific attributes (`__progmem__`, `__AVR_TINY_PM_BASE_ADDRESS__`, ISR attributes, EEPROM macros). These are harmless - the code targets avr-gcc, not clang.
+
+
+## Tasks
+
+- the user will format tasks for claude to execute in the `tasks` directrory
+- When executing tasks, create an agent team to process them more effectively
+- Tear down team member agents and explicitly kill them when they are no longer needed
+- For every coder team member, also fire up a reviewer, who works with the coder to review changes and make suggestions.  The reviewer's job is to make sure that what they write works, is in line with the task, and doesn't drift too far from what the main intent of the system is
+- Tasks are performed on a git branch.  your team may check work into this branch at sensible checkpoints. For examle, if the work is broken down into sub-tasks, check in as each subtask is completed, with description.
+- When tasks are completed and signed off by the user, move the task to a `done` subdirectory of the tasks directy.  Mark the work as done, and make sure the document is updated with what was changed during the change.  Check any changes into git, and make sure the comment includes informaiton on what was done.  The branch should be ready for a pull request at this time.
+ 

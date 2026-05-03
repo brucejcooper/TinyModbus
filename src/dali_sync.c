@@ -58,11 +58,12 @@ volatile uint8_t scan_full_step;
 // PIT round-robin cursor — advances at most one slot per fired tick.
 static volatile uint8_t scan_cursor;
 
-// Rotating cursors for write/read priority walks.  Static so they
-// persist across start_next_dali_work calls and prevent starvation of
-// high-numbered ballasts when there's continuous low-numbered work.
-static uint8_t write_cursor;
-static uint8_t read_cursor;
+// Rotating cursor for the work-selector ballast walk.  Same cursor for
+// SYNC_WRITE_* (priority 3) and SYNC_READ_LEVEL (priority 4) — they
+// share the fairness property: each issued command (write or read)
+// advances the cursor so high-numbered ballasts can't be starved by
+// continuous low-numbered work.
+static uint8_t work_cursor;
 
 // ---- Init ------------------------------------------------------------
 
@@ -82,8 +83,7 @@ void dali_sync_init(void) {
     scan_full_addr = 0xFF;
     scan_full_step = 0;
     scan_cursor    = 0;
-    write_cursor   = 0;
-    read_cursor    = 0;
+    work_cursor    = 0;
 }
 
 // ---- Cache-invalidation classification ------------------------------
@@ -373,26 +373,27 @@ try_writes:
 
     // 3. Pending write on any ballast (rotating cursor).
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
-        uint8_t idx = (uint8_t)((write_cursor + i) & 0x3Fu);
+        uint8_t idx = (uint8_t)((work_cursor + i) & 0x3Fu);
         uint8_t f = sync_flags[idx];
         dali_op_t op = write_op_from_flags(f);
         if (op != OP_NONE) {
             current_op.op   = op;
             current_op.addr = idx;
             current_op.step = 0;
-            write_cursor = (uint8_t)((idx + 1u) & 0x3Fu);
+            work_cursor = (uint8_t)((idx + 1u) & 0x3Fu);
             return true;
         }
     }
 
-    // 4. Pending level read (rotating cursor).
+    // 4. Pending level read (same rotating cursor — fairness across
+    // both writes and reads on every issued command).
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
-        uint8_t idx = (uint8_t)((read_cursor + i) & 0x3Fu);
+        uint8_t idx = (uint8_t)((work_cursor + i) & 0x3Fu);
         if (sync_flags[idx] & SYNC_READ_LEVEL) {
             current_op.op   = OP_LEVEL_READ;
             current_op.addr = idx;
             current_op.step = 0;
-            read_cursor = (uint8_t)((idx + 1u) & 0x3Fu);
+            work_cursor = (uint8_t)((idx + 1u) & 0x3Fu);
             return true;
         }
     }

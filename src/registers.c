@@ -225,29 +225,34 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
     }
     // Group masks 0x0110-0x014F: validate, snapshot old value, compute
     // pending_adds = new & ~old, pending_removes = old & ~new, update
-    // cache, arm group_write state machine.  Caller (modbus.c) is
-    // expected to have pre-checked dali_sync_group_busy() and returned
-    // SLAVE_DEVICE_BUSY upstream — we still re-check arm() result.
+    // cache, arm group_write state machine.  Master writes that don't
+    // change any bits (changed == 0) need no DALI work and return
+    // success WITHOUT consulting the group_write state — even if a
+    // group write is in flight.  Only a write that actually requires
+    // ADD/REMOVE commands needs to fence against an existing in-flight.
     if (addr >= 0x0110u && addr <= 0x014Fu) {
         uint8_t group_idx = (uint8_t)((addr - 0x0110u) >> 2);
         uint8_t word_idx  = (uint8_t)((addr - 0x0110u) & 0x03u);
         uint16_t old_val, new_val = val;
         old_val  = ((uint16_t)g_regs.group_mask[group_idx][word_idx * 2u]      << 8)
                  |  (uint16_t)g_regs.group_mask[group_idx][word_idx * 2u + 1u];
-        uint16_t changed         = (uint16_t)(old_val ^ new_val);
+        uint16_t changed = (uint16_t)(old_val ^ new_val);
+        if (changed == 0) {
+            // No-op write: nothing to send to ballasts, just ACK.
+            return true;
+        }
         uint16_t pending_adds    = (uint16_t)(new_val & changed);
         uint16_t pending_removes = (uint16_t)(old_val & changed);
         // Predictive cache update.
         g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(new_val >> 8);
         g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)new_val;
-        if (changed != 0) {
-            if (!dali_sync_arm_group_write(addr, pending_adds, pending_removes)) {
-                // Race: another group write became armed between caller's
-                // pre-check and now.  Rollback cache and refuse.
-                g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(old_val >> 8);
-                g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)old_val;
-                return false;
-            }
+        if (!dali_sync_arm_group_write(addr, pending_adds, pending_removes)) {
+            // Race: another group write became armed between caller's
+            // pre-check and now (or no pre-check happened at all).
+            // Rollback cache and refuse.
+            g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(old_val >> 8);
+            g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)old_val;
+            return false;
         }
         return true;
     }

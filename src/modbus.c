@@ -396,21 +396,24 @@ static void note_runtime_config_write(uint16_t mb_reg) {
 }
 
 // Handle FC06 (Write Single Register): validate, update register map, dispatch DALI action.
+//
+// Group register writes go through regs_write_holding which transparently
+// handles three cases: (1) no-change write -> ACK without DALI work; (2)
+// actual change with group channel idle -> arm + ACK; (3) actual change
+// with group channel busy -> rollback + return false.  The downstream
+// busy check distinguishes case (3) from a genuine ILLEGAL_ADDRESS.
 static void process_fc06(void) {
     uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t val  = ((uint16_t)buf[4] << 8) | buf[5];
 
-    // Group register writes need their own busy check because the
-    // backing state machine in dali_sync only accepts one in flight.
-    // Doing this BEFORE the cache update keeps regs_write_holding's
-    // contract simple (it returns false only on illegal address / value).
-    if (addr >= 0x0110u && addr <= 0x014Fu && dali_sync_group_busy()) {
-        send_error(MB_ERR_DEVICE_BUSY);
-        return;
-    }
-
     if (!regs_write_holding(addr, val)) {
-        send_error(MB_ERR_ILLEGAL_ADDRESS);
+        // BUSY race only for group-register writes where the arming
+        // failed against an in-flight write; everything else is genuine
+        // ILLEGAL_ADDRESS.
+        if (addr >= 0x0110u && addr <= 0x014Fu && dali_sync_group_busy())
+            send_error(MB_ERR_DEVICE_BUSY);
+        else
+            send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
     note_runtime_config_write(addr);
@@ -431,18 +434,19 @@ static void process_fc10(void) {
         return;
     }
 
-    // Group register write rules: only one in-flight at a time, and only
-    // one group register per FC10 (matches the spec's "restrict FC10 group
-    // writes to a single register at a time" option).  Multi-group bunches
-    // get DEVICE_BUSY so the master retries.
+    // Group register write rules: only one DALI-actionable group write
+    // per FC10 (matches the spec's "restrict FC10 group writes to a
+    // single register at a time" option).  Multi-group bunches get
+    // DEVICE_BUSY pre-flight; the in-flight busy check happens inside
+    // regs_write_holding (so a no-op write doesn't get rejected when
+    // another group write is in flight).
     {
         uint8_t group_targets = 0;
         for (uint16_t i = 0; i < count; i++) {
             uint16_t r = addr + i;
             if (r >= 0x0110u && r <= 0x014Fu) group_targets++;
         }
-        if (group_targets > 1u
-            || (group_targets == 1u && dali_sync_group_busy())) {
+        if (group_targets > 1u) {
             send_error(MB_ERR_DEVICE_BUSY);
             return;
         }
@@ -470,13 +474,18 @@ static void process_fc10(void) {
     uint8_t *payload_ptr = buf + 7;
     for (uint16_t i = 0; i < count; i++) {
         uint16_t reg_value = ((uint16_t)payload_ptr[0] << 8) | payload_ptr[1];
+        uint16_t r         = addr + i;
         payload_ptr += 2;
-        if (!regs_write_holding(addr + i, reg_value)) {
-            send_error(MB_ERR_ILLEGAL_ADDRESS);
+        if (!regs_write_holding(r, reg_value)) {
+            // Same BUSY-vs-ILLEGAL distinction as FC06.
+            if (r >= 0x0110u && r <= 0x014Fu && dali_sync_group_busy())
+                send_error(MB_ERR_DEVICE_BUSY);
+            else
+                send_error(MB_ERR_ILLEGAL_ADDRESS);
             return;
         }
-        note_runtime_config_write(addr + i);
-        mb_err_t err = dispatch_action_reg(addr + i, reg_value);
+        note_runtime_config_write(r);
+        mb_err_t err = dispatch_action_reg(r, reg_value);
         if (err) { send_error(err); return; }
     }
     // Standard FC10 response: slave addr, FC, start addr (2), count (2)

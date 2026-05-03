@@ -10,6 +10,7 @@
 #include "cmd_queue.h"
 #include "tick.h"
 #include "dali.h"
+#include "dali_sync.h"
 #include "modbus.h"
 #include "bg_tasks.h"
 
@@ -42,6 +43,7 @@ int main(void) {
     // Initialise subsystems
     regs_init();
     cmdq_init();
+    dali_sync_init();                     // sync_flags[], current_op, group_write
     tick_init();                          // starts TCA0 - ticks begin here
     modbus_init(userrow_get_slave_addr());
     dali_init();

@@ -13,6 +13,7 @@
 #include "cmd_queue.h"
 #include "dali.h"
 #include "bg_tasks.h"
+#include "dali_sync.h"
 
 // ---- Modbus constants -----------------------------------------------
 
@@ -434,7 +435,15 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         return 0;
     }
     if (mb_reg == MBREG_SCAN_TRIGGER) {
-        if (val == 0x0001) bgtasks_trigger_scan();
+        // Set SYNC_READ_FULL on all 64 ballasts.  Subtask 4's work selector
+        // will service them one at a time via the unified DALI issuance
+        // path; until then the bits queue up but go unconsumed (the legacy
+        // queue/bg_tasks scan path is gone from this register).
+        if (val == 0x0001) {
+            for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
+                sync_flags_set(i, SYNC_READ_FULL);
+            }
+        }
         return 0;
     }
     if (mb_reg == MBREG_SET_DTR0 || mb_reg == MBREG_SET_DTR1 || mb_reg == MBREG_SET_DTR2) {

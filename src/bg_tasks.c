@@ -9,10 +9,15 @@
 #include "tick.h"
 
 // ---- RTC / periodic rescan ----------------------------------------
-// Period is set by holding register MBREG_RESCAN_INTERVAL (default 64 s, 0 = disabled).
-// RTC PIT fires at 1 Hz (CYC1024 on 1 kHz internal osc).
-
-static volatile uint16_t rescan_counter  = 64u;  // matches default MBREG_RESCAN_INTERVAL
+//
+// SUBTASK 3 NOTE: RTC_PIT_vect has moved to dali_sync.c with new
+// per-ballast round-robin semantics.  scan_trigger is now only set by
+// main.c's initial boot scan; MBREG_SCAN_TRIGGER (0x1010) writes go
+// through dali_sync's sync_flags[] (see modbus.c dispatch_action_reg).
+// The bg_tasks scan path is dormant after the boot pass until subtask 5
+// deletes it entirely.  rescan_counter is no longer touched by anything
+// — left in place as temporary dead code.
+static volatile uint16_t rescan_counter  __attribute__((unused)) = 64u;
 static volatile bool     scan_trigger    = false;
 
 // ---- Fade chain state ---------------------------------------------
@@ -194,14 +199,10 @@ void bgtasks_run(void) {
     }
 }
 
-// ---- RTC PIT - periodic rescan (same cadence as original) ----------
-
-ISR(RTC_PIT_vect) {
-    uint16_t interval = userrow_get_rescan_interval();
-    if (rescan_counter > interval) rescan_counter = interval;
-    if (interval > 0 && --rescan_counter == 0) {
-        rescan_counter = interval;
-        scan_trigger   = true;
-    }
-    RTC.PITINTFLAGS = RTC_PI_bm;
-}
+// ---- RTC PIT - periodic rescan ------------------------------------
+//
+// SUBTASK 3: RTC_PIT_vect moved to dali_sync.c with new per-ballast
+// round-robin semantics.  MBREG_SCAN_TRIGGER (0x1010) now drives
+// dali_sync's sync_flags[] directly from modbus.c (no longer routed
+// through bgtasks_trigger_scan).  The bg_tasks scan path is dormant
+// after main.c's initial boot scan and gets deleted in subtask 5.

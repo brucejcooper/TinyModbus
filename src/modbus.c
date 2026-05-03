@@ -292,6 +292,30 @@ static void raw_cmd_twice_done(dali_response_type_t type, uint8_t ballast_idx, u
 
 // ---- FC04 - read input registers ----------------------------------------
 
+// FC04 input registers (read-only) after subtask 2:
+//   0x0100-0x010F  group_status                     (16 regs)
+//   0x0150         scan_status
+//   0x0151-0x0154  present bitmap                   (4 regs)
+//   0x0155-0x0158  fading bitmap                    (4 regs)
+//   0x0159-0x015C  dirty bitmap (read-clears)       (4 regs)
+//   0x015D         async raw command result
+//   0x0200         version block (special-cased above; count must be 16)
+//
+// The per-ballast banks (0x0000-0x00FF) and group membership masks
+// (0x0110-0x014F) used to live here but have moved to FC03/FC06/FC10 holding
+// registers - this is an intentional breaking change confirmed by the user.
+// Reads of those addresses via FC04 now return ILLEGAL_ADDRESS.
+//
+// addr and count come off the wire as 16-bit values; promoting the sum to
+// uint32_t prevents wrap (e.g. addr=0xFFFF, count=1 -> 0) from sneaking
+// through the upper-bound check.
+static bool fc04_range_allowed(uint16_t addr, uint8_t count) {
+    uint32_t end = (uint32_t)addr + count;  // exclusive
+    if (addr >= 0x0100u && end <= 0x0110u) return true;  // group_status
+    if (addr >= 0x0150u && end <= 0x015Eu) return true;  // scan/present/fading/dirty/raw_result
+    return false;
+}
+
 // Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
 // at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.
 static void process_fc04(void) {
@@ -317,10 +341,7 @@ static void process_fc04(void) {
         send_error(MB_ERR_ILLEGAL_VALUE);
         return;
     }
-    // addr and count come straight off the wire as 16-bit values; the addition can
-    // wrap inside uint16_t (e.g. addr=0xFFFF, count=1 → sum=0) and pass the bound
-    // check.  Cast to uint32_t so the comparison happens at full precision.
-    if ((uint32_t)addr + count > (uint32_t)FC04_MAX_ADDR + 1u) {
+    if (!fc04_range_allowed(addr, (uint8_t)count)) {
         send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }

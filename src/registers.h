@@ -13,19 +13,26 @@ typedef struct { uint8_t power_on;  uint8_t sys_fail;   } ballast_pf_t;
 typedef struct { uint8_t fade_rate; uint8_t fade_time;  } ballast_fade_t;
 typedef struct { uint8_t status;    uint8_t brightness; } group_status_t;
 
-// FC04 input register layout (total 351 registers = 0x015D max):
-//   0x0000-0x003F  block0[64]       status | brightness
+// register_map_t backs both FC03 (holding) and FC04 (input) addressing.  The
+// in-memory byte order matches the Modbus wire (big-endian per register), so
+// the bulk-read paths can memcpy a contiguous slice straight into the response.
+//
+// FC03/FC06/FC10 holding registers (read-write):
+//   0x0000-0x003F  block0[64]       status | brightness   (write low byte = DAPC level)
 //   0x0040-0x007F  block1[64]       min    | max
 //   0x0080-0x00BF  block2[64]       power_on | sys_fail
 //   0x00C0-0x00FF  block3[64]       fade_rate | fade_time
-//   0x0100-0x010F  group_status[16] ORed member status | last cmd level
 //   0x0110-0x014F  group_mask[16][8] 64-bit per-group membership bitmask
+//
+// FC04 input registers (read-only):
+//   0x0100-0x010F  group_status[16] ORed member status | last cmd level
 //   0x0150         scan_status      0=idle 1=scanning 2=complete
 //   0x0151-0x0154  present[4]       64-bit ballast-present bitmask
 //   0x0155-0x0158  fading[4]        64-bit active-fade bitmask
 //   0x0159-0x015C  dirty[4]         set on block0 change, cleared on FC04 read
 //   0x015D         raw_cmd_result   high=0x00 idle, 0xFF pending, 0x01 nak, 0x02 ok, 0x03 err
 //                                   low byte: DALI response (when ok) or error subtype (when err)
+//   0x0200         version block    16-register special case (see process_fc04)
 typedef struct {
     ballast_bs_t   block0[64];
     ballast_mm_t   block1[64];
@@ -47,7 +54,6 @@ extern register_map_t g_regs;
 #define FC04_DIRTY_BASE     0x0159u  // first dirty word register (4 words: 0x0159-0x015C)
 #define FC04_DIRTY_END      0x015Cu  // last dirty word register
 #define FC04_RAW_RESULT     0x015Du  // async raw DALI command result (see RAW_RESULT_*)
-#define FC04_MAX_ADDR       FC04_RAW_RESULT
 
 // ---- FC04 / FC03 special block addresses ----------------------------------
 

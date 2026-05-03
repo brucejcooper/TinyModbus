@@ -343,16 +343,11 @@ Coil N maps to ballast N (0–63).
 
 ### FC04 — Input Register Map
 
-All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-bit, addressed from 0x0000.
+Read-only state derived from DALI traffic. Registers are 16-bit, addressed from 0x0000.
 
 | Address range | Width | Content |
 |---------------|-------|---------|
-| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness (high byte = DALI status bits, low byte = arc level) |
-| 0x0040–0x007F | 64 regs | Per-ballast min \| max level |
-| 0x0080–0x00BF | 64 regs | Per-ballast power-on \| sys-fail level |
-| 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time |
 | 0x0100–0x010F | 16 regs | Group status — OR of all member ballast status bytes |
-| 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group) |
 | 0x0150 | 1 reg | Scan status: 0 = idle, 1 = scanning, 2 = complete |
 | 0x0151–0x0154 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
 | 0x0155–0x0158 | 4 regs | Fading bitmask — set when DALI status fade-running bit is active |
@@ -360,7 +355,21 @@ All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-
 | 0x015D | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
 | 0x0200–0x020F | 16 regs | Version string: `DALI v<maj>.<min> <10-byte-serial-as-20-hex-chars>` — read exactly 16 registers |
 
+FC04 reads outside these ranges return `ILLEGAL_ADDRESS`. The per-ballast banks formerly at 0x0000–0x00FF and the group membership masks formerly at 0x0110–0x014F have moved to the holding-register map below — this is a breaking change from earlier firmware revisions.
+
 ### FC03/FC06/FC10 — Holding Register Map
+
+Per-ballast cached DALI state (read-write) and gateway control registers.
+
+| Address range | Width | Content |
+|---------------|-------|---------|
+| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness. FC03 returns the cached `[status:brightness]` pair. FC06/FC10 write: low byte = DAPC level (0–254 valid; 255 = "no change" per DALI), high byte ignored. |
+| 0x0040–0x007F | 64 regs | Per-ballast min \| max level. Both bytes consumed on write. |
+| 0x0080–0x00BF | 64 regs | Per-ballast power-on \| sys-fail level. Both bytes consumed on write. |
+| 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time. Both bytes consumed on write. |
+| 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group). Writes are predictively cached; the per-bit ADD_TO_GROUP / REMOVE_FROM_GROUP DALI propagation is added in a later subtask. |
+
+Writes to the per-ballast banks update the local cache immediately and ACK at the Modbus layer; the actual DALI command that pushes the change to the ballast is dispatched asynchronously by the work-selection loop (subtask 4). Master code should poll the dirty bitmap (FC04 0x0159–0x015C) to detect when reconciliation has completed.
 
 | Address | Name | Read | Write |
 |---------|------|------|-------|

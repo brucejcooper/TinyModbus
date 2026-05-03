@@ -29,7 +29,7 @@ prepare:
 	
 build: prepare $(OBJECTS)
 	$(COMPILE) -o build/$(FILENAME).elf $(OBJECTS)
-	avr-objcopy -R .eeprom -R .fuse -R .lock -R .signature -R .user_signatures -O ihex build/$(FILENAME).elf build/$(FILENAME).hex
+	avr-objcopy -R .eeprom -R .lock -R .signature -R .user_signatures -O ihex build/$(FILENAME).elf build/$(FILENAME).hex
 	avr-size --format=avr --mcu=$(DEVICE) build/$(FILENAME).elf
 
 erase:

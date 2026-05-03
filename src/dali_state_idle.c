@@ -71,6 +71,11 @@ void cmdq_result_received(dali_response_type_t type, uint8_t value) {
 // ---- dali_idle_state_enter ---------------------------------------------
 
 void dali_idle_state_enter(void) {
+    // Belt-and-braces: ensure the DALI TX line is released before entering idle.
+    // If a glitched code path left the bus driven active, this releases it
+    // immediately rather than waiting for the next transmission cycle.
+    DALI_PORT.OUTCLR = DALI_TX_bm;
+
     if (!cmdq_empty()) {
         cleanup();
         if (dali_is_bus_active()) {

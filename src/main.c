@@ -1,5 +1,6 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
+#include <avr/fuse.h>
 #include <avr/sleep.h>
 #include <avr/wdt.h>
 #include <stdbool.h>
@@ -11,6 +12,22 @@
 #include "dali.h"
 #include "modbus.h"
 #include "bg_tasks.h"
+
+// Fuse configuration.  Emits a `.fuse` section in the ELF; the Makefile's
+// avr-objcopy invocation passes this through into main.hex so pymcuprog
+// programs it on flash.  Brown-out detection is enabled at 2.6 V in active
+// mode - this is the highest-leverage protection against the bus-stuck
+// symptom seen when Vcc dips during DALI activity.  All other fuse bytes
+// are left at their factory defaults.
+FUSES = {
+    .WDTCFG  = FUSE_WDTCFG_DEFAULT,
+    .BODCFG  = ACTIVE_ENABLED_gc | LVL_BODLEVEL2_gc,
+    .OSCCFG  = FUSE_OSCCFG_DEFAULT,
+    .SYSCFG0 = FUSE_SYSCFG0_DEFAULT,
+    .SYSCFG1 = FUSE_SYSCFG1_DEFAULT,
+    .APPEND  = FUSE_APPEND_DEFAULT,
+    .BOOTEND = FUSE_BOOTEND_DEFAULT,
+};
 
 int main(void) {
     // Drive DE low immediately - prevents floating pin from enabling RS-485 TX

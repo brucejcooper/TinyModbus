@@ -503,7 +503,7 @@ If during implementation any of the following come up, raise them rather than pi
 
 **Date completed:** 2026-05-03
 **Branch:** `task-1-flag-driven`
-**Commit range:** `9de0ecc..task-1-complete` (subtasks 1–6 plus two subtask-4 fix-ups, plus a subtask-7 polish pass landed after the user's post-merge review). The `task-1-complete` git tag tracks the final commit and was moved forward when subtask 7 landed.
+**Commit range:** `9de0ecc..task-1-complete` (subtasks 1–6 plus two subtask-4 fix-ups, plus subtask-7 and subtask-8 polish passes landed after the user's post-merge review). The `task-1-complete` git tag tracks the final commit and is moved forward on every accepted commit.
 
 ### Sub-task summary
 
@@ -517,16 +517,17 @@ If during implementation any of the following come up, raise them rather than pi
 | 4-fix-2 | `759b82c` | Reviewer P1: collapse SYNC_WRITE_* and SYNC_READ_LEVEL onto a single rotating cursor; relax group-write BUSY contract. |
 | 5 | `e83688d` | Physical deletion of `cmd_queue.{c,h}` and `bg_tasks.{c,h}`. Coil FCs (FC01/05/0F) and action holding regs (0x1002–0x100A) retired with `ILLEGAL_FUNCTION` / `ILLEGAL_ADDRESS` replies. `dali_result_received` rename. |
 | 6 | `d1c7ed2` | Final README pass, verification, hand-trace, task move to `done/`. |
-| 7 | `task-1-complete` | Post-merge polish: collapse `classify_invalidation` to 4 branches; atomic helpers in `note_present_on_ok` / `apply_retry_pending`; `OP_FULL_SCAN` short-circuits on NAK (move to next ballast); `(void)reg_off;` dead-code removed; README documents `0x015D` no-decrement-mid-twice-send and `frame_is_valid` coil-FC retention as a future-removal candidate; `noinline, noclone` attributes verified still needed (removing them costs +480 B flash on avr-gcc 7.3, well above the 200 B threshold). |
+| 7 | `ae30a84` | Post-merge polish: collapse `classify_invalidation` to 4 branches; atomic helpers in `note_present_on_ok` / `apply_retry_pending`; `OP_FULL_SCAN` short-circuits on NAK (move to next ballast); `(void)reg_off;` dead-code removed; README documents `0x015D` no-decrement-mid-twice-send and `frame_is_valid` coil-FC retention as a future-removal candidate; `noinline, noclone` attributes verified still needed (removing them costs +480 B flash on avr-gcc 7.3, well above the 200 B threshold). |
+| 8 | `task-1-complete` | FC04 input-register trim: removed `fading[4]` (redundant with status bit 4), `group_status[16]` (derivable + already stale w.r.t. status changes), and `scan_status` (vestigial from the bg_tasks era); moved `present[4]` / `dirty[4]` / `raw_cmd_result` to a contiguous 0x0100-0x0108 ladder so masters can read presence + dirty in one FC04 request; deleted `regs_rebuild_group_status`; preserved `group_mask` at FC03 0x0110 via a 7-register padding hole rather than introduce a second breaking change. |
 
 ### Final binary sizes (subtask-0 baseline → final)
 
-| Section | Baseline (`4c2888b`) | Subtask 6 (`d1c7ed2`) | Final (`task-1-complete` = `ae30a84`) | Delta vs baseline |
-|---------|---------------------|------------------------|-----------------------------------------|-------------------|
-| Program | 14316 B | 13734 B | **13754 B** | **−562 B** |
-| Data    |   849 B |   851 B | **  851 B** | **+2 B** |
+| Section | Baseline (`4c2888b`) | Subtask 6 (`d1c7ed2`) | Subtask 7 (`ae30a84`) | Final (`task-1-complete` = `719b8f8`) | Delta vs baseline |
+|---------|---------------------|------------------------|------------------------|-----------------------------------------|-------------------|
+| Program | 14316 B | 13734 B | 13754 B | **13252 B** | **−1064 B (−7.4%)** |
+| Data    |   849 B |   851 B |   851 B | **  823 B** | **−26 B (−3.1%)** |
 
-The Program-side reduction is well beyond the spec's "essentially RAM-neutral" prediction — credit goes to deleting the queue + bg_tasks subsystems plus enabling `-ffunction-sections / -fdata-sections / --gc-sections` in subtask 4. Data-side delta of +2 B vs baseline is within the RAM-neutral target (spec predicted ~−14 B; the +2 B is a single 16-bit `raw_cmd_result` register that wasn't accounted for in the spec's bookkeeping). The +20 B Program from subtask 6 → 7 is the cost of replacing naked `sync_flags[idx] |=` / `&=` in `note_present_on_ok` and `apply_retry_pending` with the `ATOMIC_BLOCK`-wrapped helpers — worth it because the safety becomes locally provable instead of relying on subtle ISR-priority invariants. Stack high-water mark is unchanged: `modbus_process` reports 49 B `dynamic,bounded` (the FC04 version-string `snprintf` path) and no other function exceeds 50 B static.
+The Program-side reduction is well beyond the spec's "essentially RAM-neutral" prediction — credit goes to deleting the queue + bg_tasks subsystems plus enabling `-ffunction-sections / -fdata-sections / --gc-sections` in subtask 4 (large drop), and to deleting `regs_rebuild_group_status` in subtask 8 (a 64-iteration loop that the compiler had inlined into multiple call sites — surprise −502 B). Data-side delta of −26 B vs baseline comes from subtask 8's removal of `group_status[16]` (−32), `fading[4]` (−8), and `scan_status` (−2), partly offset by a 14 B padding hole that anchors `group_mask` at its existing FC03 wire address. The +20 B Program from subtask 6 → 7 is the cost of replacing naked `sync_flags[idx] |=` / `&=` in `note_present_on_ok` and `apply_retry_pending` with the `ATOMIC_BLOCK`-wrapped helpers — worth it because the safety becomes locally provable instead of relying on subtle ISR-priority invariants. Stack high-water mark is unchanged throughout: `modbus_process` reports 49 B `dynamic,bounded` (the FC04 version-string `snprintf` path) and no other function exceeds 50 B static.
 
 ### Hand-trace verification (master writes brightness on ballast 5 → DALI propagation → dirty-bit confirmation)
 
@@ -558,6 +559,7 @@ Atomicity: the PIT ISR firing during this sequence and setting `SYNC_READ_LEVEL`
 - **`OP_FULL_SCAN` short-circuits on NAK** (subtask 7). The spec's "cache result (zero on NAK)" semantics were replaced with "abort the scan for this ballast and let the work selector pick the next one." Cuts SCAN_TRIGGER runtime on sparse buses roughly in half (~6.4 s vs ~11.2 s for 32-of-64-present). Edge case: a present ballast that NAKs at step 4 of 7 leaves cache fields 4-6 at their previous values rather than zeroes — accepted because the periodic level-poll catches presence flips eventually, and SCAN_TRIGGER can be re-issued by the master.
 - **Every brightness write to a per-ballast bank triggers a follow-up `SYNC_READ_LEVEL`** (i.e. QUERY_STATUS + QUERY_ACTUAL_LEVEL after the DAPC). This is intentional: ballasts may clip the written level (e.g. master writes `0xBE` but ballast max is `0xB0`), and step/up/down style commands have no closed-form predictive cache value. The readback ensures the cache reflects what the ballast actually did. User explicitly chose this behaviour over an optimisation that would skip the readback for plain DAPC writes.
 - **Broadcast/group writes intentionally generate per-ballast readback storms.** A broadcast DAPC sets `SYNC_READ_LEVEL` on all 64 ballasts; the work selector then queues 64 QUERY_STATUS + QUERY_ACTUAL_LEVEL pairs (~3.2 s of bus traffic). Group writes scale with group size. User explicitly accepts this — "that is the nature of this."
+- **FC04 input-register surface trimmed beyond the spec** (subtask 8). The spec preserved `fading[4]`, `group_status[16]`, and `scan_status` from the pre-refactor firmware. User-driven review noted that fading is redundant with the status byte (bit 4 of every block0[i].status), group_status is derivable from `group_mask` + statuses (and was already stale w.r.t. status changes in the pre-refactor code), and scan_status is vestigial in the flag-driven model (no producer). All three are now removed; `present` / `dirty` / `raw_cmd_result` moved up to a contiguous 0x0100-0x0108 ladder so a single FC04 read covers presence + dirty. Master-visible breaking change: every old FC04 address from 0x0150-0x015D moved.
 
 ### Open questions resolved
 
@@ -572,10 +574,10 @@ Atomicity: the PIT ISR firing during this sequence and setting `SYNC_READ_LEVEL`
 ### Verification status
 
 - [x] `make build` clean against the project-local `avr/bin/avr-gcc` toolchain.
-- [x] `avr/bin/avr-size --mcu=attiny1604 -C build/main.elf` reports Program 13754 / Data 851 (well under the 1 KB SRAM budget; ~150 B stack headroom).
+- [x] `avr/bin/avr-size --mcu=attiny1604 -C build/main.elf` reports Program 13252 / Data 823 (well under the 1 KB SRAM budget; ~175 B stack headroom).
 - [x] `.su` files sweep — no function exceeds 50 B; `modbus_process` at 49 B `dynamic,bounded` (FC04 version-string `snprintf` path) is the high-water mark.
 - [x] Hand-trace from FC06 brightness write → DAPC dispatch → dirty-bit confirmation walked end-to-end against the actual code.
 - [x] README integrated final pass: function-code table FC03/04/06/10 only; coils section retired; per-ballast banks documented under FC03 (writable); 0x015D encoding accurate to implementation; Fade Tracking restructured around the flag-driven model; RESCAN_INTERVAL semantic redefined; Known Limitations pruned of fixed entries (group readback, set_dtr0 race, bus duty cycle during scan, double-fire receive timeout) and augmented with refactor-specific entries; new "Behavioural Changes" subsection lists every wire-protocol-visible breaking change; new "Architectural Model" top-level section gives the one-paragraph orientation.
 - [x] Task file moved from `tasks/` to `tasks/done/` with this Outcome section appended.
 
-Branch is in a clean, mergeable state. Tag `task-1-complete` points to the subtask-7 commit (`ae30a84`); the eventual PR description can reference it.
+Branch is in a clean, mergeable state. Tag `task-1-complete` points to the latest accepted commit and is updated on every new commit; the eventual PR description can reference it.

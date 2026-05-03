@@ -3,26 +3,22 @@
 #include <stdbool.h>
 
 #include "dali.h"
+#include "dali_sync.h"
 #include "tick.h"
 #include "types.h"
 
 static volatile uint16_t shift_reg;
 static volatile uint8_t  bits_left;
 
-// Last cmd_type_t handed to dali_transmitting_state_enter.  finished_transmission
-// reads this to decide whether to arm a backward-frame window (CMD_QUERY,
-// CMD_SEND_TWICE) or signal completion immediately (CMD_DIRECT_ARC, CMD_SEND).
-// Subtask 4 retired the cmd_queue so we can no longer peek the queue head;
-// stashing a single byte per in-flight command is sufficient.
-static volatile cmd_type_t last_type;
-
-// Last stop bit has been sent.
-// CMD_QUERY: arm the backward frame window (response or 22 TE timeout).
-// CMD_SEND_TWICE: must hold the 22 TE inter-send gap, so also goes through the response window.
-// CMD_SEND / CMD_DIRECT_ARC: no response expected; call cmdq_result_received directly so the
-// caller can advance state before the mandatory 22 TE idle gap (saves one full response-window wait).
+// Last stop bit has been sent.  Read s_active.type (populated by
+// issue_dali_command) to decide:
+//   CMD_QUERY: arm the backward frame window (response or 22 TE timeout).
+//   CMD_SEND_TWICE: hold the 22 TE inter-send gap via the response window.
+//   CMD_SEND / CMD_DIRECT_ARC: no response expected; complete immediately
+//   so the caller can advance state before the 22 TE idle gap.
 static void finished_transmission(void) {
-    if (last_type == CMD_QUERY || last_type == CMD_SEND_TWICE)
+    cmd_type_t t = s_active.type;
+    if (t == CMD_QUERY || t == CMD_SEND_TWICE)
         dali_wait_for_response_state_enter();
     else
         cmdq_result_received(DALI_RESPONSE_NAK, 0);
@@ -64,12 +60,11 @@ static void half_bit_toggle(void) {
 }
 
 void dali_transmitting_state_enter(const cmd_entry_t *cmd) {
-    // Build the 16-bit DALI forward frame from the entry.  Stash the
-    // type so finished_transmission knows whether to arm the backward-
-    // frame window after the last stop bit clears.
+    // Build the 16-bit DALI forward frame from the entry.  s_active.type
+    // is already set by issue_dali_command; finished_transmission reads
+    // it after the last stop bit clears.
     shift_reg = ((uint16_t)cmd->dali_addr << 8) | cmd->dali_cmd;
     bits_left = 17;  // 16 data bits + 1 extra for the stop-bit transition
-    last_type = cmd->type;
     dali_timer_cb = send_one;
     dali_timer    = 1;
 }

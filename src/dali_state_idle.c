@@ -30,11 +30,28 @@ static void external_message_started(void) {
 // The function name is preserved for compatibility with the bit-level
 // state-machine callers (dali_state_transmitting.c,
 // dali_state_receiving.c, dali_state_wait_for_response.c); subtask 5
-// renames it.  When dali_busy is somehow false on entry, that's a
-// no-op: just re-arm idle.
+// renames it.
+//
+// Two intercepts before dispatch:
+//
+//   1. s_active.repeat > 1: this is a SEND_TWICE (raw twice, group bit,
+//      SET commands within multi-step writes).  Decrement the repeat
+//      counter and re-fire dali_transmitting_state_enter immediately —
+//      no inter-frame gap, matching the legacy queue mechanism.  This
+//      keeps the bit-level state machine semantics identical to the
+//      pre-refactor code (the 22 TE inter-send window is provided by
+//      wait_for_response between the two sends).
+//
+//   2. otherwise: dispatch to dali_sync_completion which advances the
+//      logical step or releases the channel.
 
 void cmdq_result_received(dali_response_type_t type, uint8_t value) {
     if (dali_busy) {
+        if (s_active.repeat > 1u) {
+            s_active.repeat--;
+            dali_transmitting_state_enter((const cmd_entry_t *)&s_active);
+            return;
+        }
         dali_sync_completion(type, value);
         return;
     }

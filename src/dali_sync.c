@@ -47,6 +47,7 @@ volatile uint8_t           sync_flags[DALI_MAX_DEVICES];
 volatile bool              dali_busy;
 volatile dali_current_op_t current_op;
 volatile dali_group_write_t group_write;
+volatile cmd_entry_t       s_active;
 
 volatile uint8_t raw_cmd_addr;
 volatile uint8_t raw_cmd_data;
@@ -151,51 +152,47 @@ static void apply_invalidation(uint8_t addr_byte, uint8_t inv_mask) {
 
 // ---- Unified DALI issuance ------------------------------------------
 
-void issue_dali_command(uint8_t addr_byte, uint8_t data_byte, dali_kind_t kind) {
+__attribute__((noinline, noclone))
+void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
+                         dali_kind_t kind, uint8_t repeat) {
     // Cache invalidation runs BEFORE the command bytes hit the wire.
     uint8_t inv = classify_invalidation(addr_byte, data_byte);
     apply_invalidation(addr_byte, inv);
 
-    cmd_entry_t entry;
+    cmd_type_t t;
     switch (kind) {
-        case DALI_KIND_DAPC:  entry.type = CMD_DIRECT_ARC; entry.repeat = 1; break;
-        case DALI_KIND_CMD:   entry.type = CMD_SEND;       entry.repeat = 1; break;
-        case DALI_KIND_TWICE: entry.type = CMD_SEND_TWICE; entry.repeat = 1; break;
-        case DALI_KIND_QUERY: entry.type = CMD_QUERY;      entry.repeat = 1; break;
-        default:              entry.type = CMD_SEND;       entry.repeat = 1; break;
+        case DALI_KIND_DAPC:  t = CMD_DIRECT_ARC; break;
+        case DALI_KIND_CMD:   t = CMD_SEND;       break;
+        case DALI_KIND_TWICE: t = CMD_SEND_TWICE; break;
+        case DALI_KIND_QUERY: t = CMD_QUERY;      break;
+        default:              t = CMD_SEND;       break;
     }
-    entry.dali_addr   = addr_byte;
-    entry.dali_cmd    = data_byte;
-    entry.ballast_idx = 0xFF;
-    entry.reg_target  = REG_NONE;
-    entry.on_result   = NULL;
+    s_active.type        = t;
+    s_active.dali_addr   = addr_byte;
+    s_active.dali_cmd    = data_byte;
+    s_active.repeat      = repeat;
+    s_active.ballast_idx = 0xFF;
+    s_active.reg_target  = REG_NONE;
+    s_active.on_result   = NULL;
 
-    dali_transmitting_state_enter(&entry);
+    dali_transmitting_state_enter((const cmd_entry_t *)&s_active);
 }
 
 // ---- Multi-step write helpers ---------------------------------------
 //
-// Each multi-step write sequence has 6 hardware sends (steps 0..5):
-//   step 0: DTR0 = low_byte
-//   step 1: SET_X first  (twice-send, first half)
-//   step 2: SET_X second
-//   step 3: DTR0 = high_byte
-//   step 4: SET_Y first
-//   step 5: SET_Y second
+// Each multi-step write is 4 LOGICAL steps (= 6 hardware sends, with
+// the SET twice-sends handled by the repeat-decrement re-fire in
+// cmdq_result_received — same mechanism the legacy queue used):
+//   step 0: DTR0 = low_byte               (CMD_SEND, repeat=1)
+//   step 1: SET_X                          (CMD_SEND_TWICE, repeat=2)
+//   step 2: DTR0 = high_byte               (CMD_SEND, repeat=1)
+//   step 3: SET_Y                          (CMD_SEND_TWICE, repeat=2)
 //
-// The DTR0 sends use type CMD_SEND (no response, no inter-frame wait).
-// The SET sends use CMD_SEND_TWICE (no response, but the 22 TE
-// inter-frame gap is enforced by wait_for_response window).
+// The whole 4-step sequence runs without yielding because DTR0 is
+// shared across all ballasts (an interleaving raw command or another
+// write could clobber DTR0).
 
-typedef struct {
-    uint8_t set_x;     // first SET command (e.g. SET_MIN_LEVEL)
-    uint8_t set_y;     // second SET command (e.g. SET_MAX_LEVEL)
-    // For block reads: which two cache bytes feed step 0 and step 3.
-    // (block1: min/max -> low=min, high=max; block2: power_on/sys_fail
-    // -> low=power_on, high=sys_fail; block3: fade_rate/fade_time
-    // -> low=fade_rate, high=fade_time)
-} write_seq_t;
-
+__attribute__((noinline, noclone))
 static void issue_write_step(uint8_t op, uint8_t addr, uint8_t step) {
     uint8_t bidx = addr & 0x3Fu;
     uint8_t set_x, set_y, low_val, high_val;
@@ -224,12 +221,10 @@ static void issue_write_step(uint8_t op, uint8_t addr, uint8_t step) {
 
     uint8_t short_addr = DALI_SHORT_ADDR(bidx) | DALI_CMD_FLAG;
     switch (step) {
-        case 0: issue_dali_command(DALI_ADDR_SET_DTR0, low_val,  DALI_KIND_CMD);   break;
-        case 1: issue_dali_command(short_addr,         set_x,    DALI_KIND_TWICE); break;
-        case 2: issue_dali_command(short_addr,         set_x,    DALI_KIND_TWICE); break;
-        case 3: issue_dali_command(DALI_ADDR_SET_DTR0, high_val, DALI_KIND_CMD);   break;
-        case 4: issue_dali_command(short_addr,         set_y,    DALI_KIND_TWICE); break;
-        case 5: issue_dali_command(short_addr,         set_y,    DALI_KIND_TWICE); break;
+        case 0: issue_dali_command(DALI_ADDR_SET_DTR0, low_val,  DALI_KIND_CMD,   1u); break;
+        case 1: issue_dali_command(short_addr,         set_x,    DALI_KIND_TWICE, 2u); break;
+        case 2: issue_dali_command(DALI_ADDR_SET_DTR0, high_val, DALI_KIND_CMD,   1u); break;
+        case 3: issue_dali_command(short_addr,         set_y,    DALI_KIND_TWICE, 2u); break;
         default: break;
     }
 }
@@ -261,7 +256,7 @@ void dali_sync_dispatch_current(void) {
             // Single DAPC.  Address byte: short addr without bit0 (DAPC).
             uint8_t dapc_addr = DALI_SHORT_ADDR(addr & 0x3Fu);
             uint8_t level     = g_regs.block0[addr & 0x3Fu].brightness;
-            issue_dali_command(dapc_addr, level, DALI_KIND_DAPC);
+            issue_dali_command(dapc_addr, level, DALI_KIND_DAPC, 1u);
             break;
         }
         case OP_WRITE_MINMAX:
@@ -271,29 +266,32 @@ void dali_sync_dispatch_current(void) {
             break;
         case OP_LEVEL_READ:
             if (step == 0)
-                issue_dali_command(short_addr, DALI_CMD_QUERY_STATUS,       DALI_KIND_QUERY);
+                issue_dali_command(short_addr, DALI_CMD_QUERY_STATUS,       DALI_KIND_QUERY, 1u);
             else
-                issue_dali_command(short_addr, DALI_CMD_QUERY_ACTUAL_LEVEL, DALI_KIND_QUERY);
+                issue_dali_command(short_addr, DALI_CMD_QUERY_ACTUAL_LEVEL, DALI_KIND_QUERY, 1u);
             break;
         case OP_FULL_SCAN: {
             uint8_t s = scan_full_step;
-            issue_dali_command(short_addr, scan_steps[s].cmd, DALI_KIND_QUERY);
+            issue_dali_command(short_addr, scan_steps[s].cmd, DALI_KIND_QUERY, 1u);
             break;
         }
         case OP_GROUP_BIT:
             // current_op.addr = ballast; current_op.step = data byte (0x60+g or 0x70+g).
-            issue_dali_command(short_addr, step, DALI_KIND_TWICE);
+            // ADD_TO_GROUP / REMOVE_FROM_GROUP are SET-class commands: send twice.
+            issue_dali_command(short_addr, step, DALI_KIND_TWICE, 2u);
             break;
         case OP_RAW: {
             // raw_cmd_addr / raw_cmd_data hold the staged bytes.
-            // The low byte of g_regs.raw_cmd_result tracks sends remaining.
+            // sends_remaining encoded in the low byte of raw_cmd_result.
+            // For a single send: KIND_QUERY (backward frame may arrive).
+            // For twice: KIND_TWICE with repeat=2 (cmdq_result_received's
+            // re-fire handles the second send within the 22 TE window).
             uint8_t  rc_lo;
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rc_lo = (uint8_t)g_regs.raw_cmd_result; }
-            // For a final send with a possible backward frame, use QUERY.
-            // For an intermediate send (more remaining), use TWICE so the
-            // 22 TE inter-send window is enforced.
-            dali_kind_t kind = (rc_lo > 1u) ? DALI_KIND_TWICE : DALI_KIND_QUERY;
-            issue_dali_command(raw_cmd_addr, raw_cmd_data, kind);
+            if (rc_lo >= 2u)
+                issue_dali_command(raw_cmd_addr, raw_cmd_data, DALI_KIND_TWICE, 2u);
+            else
+                issue_dali_command(raw_cmd_addr, raw_cmd_data, DALI_KIND_QUERY, 1u);
             break;
         }
         default:
@@ -560,32 +558,25 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         case OP_WRITE_MINMAX:
         case OP_WRITE_POWER:
         case OP_WRITE_FADE: {
-            uint8_t idx = addr & 0x3Fu;
+            uint8_t idx  = addr & 0x3Fu;
             uint8_t flag = write_flag_for_op(op);
-            // Intermediate steps (0..4): advance unless NAK on a SET (steps
-            // 1,2,4,5 are CMD_SEND_TWICE which can NAK if the ballast is gone;
-            // DTR0 broadcast steps 0,3 don't address a ballast).
-            bool intermediate_nak = false;
-            if ((step == 1 || step == 2 || step == 4 || step == 5)
-                && type != DALI_RESPONSE_OK && type != DALI_RESPONSE_NAK) {
-                // Bus error on a SET send: abort sequence.
-                intermediate_nak = true;
-            }
-            // SET commands produce no backward frame; NAK is the
-            // expected outcome.  Treat NAK as success for advancing
-            // through the sequence.  Genuine "ballast gone" detection
-            // happens via subsequent SYNC_READ_LEVEL.
-            if (intermediate_nak) {
-                // Abort: clear write bit, set read flag for reconfirm,
-                // apply retry-pending.
+            // 4 logical steps (0..3): DTR0_low / SET_X(twice) / DTR0_high
+            // / SET_Y(twice).  SET commands produce no backward frame, so
+            // NAK is the expected outcome and is treated as "step done".
+            // Bus errors (anything other than OK/NAK) on a SET step abort
+            // the sequence; the cache will be reconfirmed by a follow-up
+            // SYNC_READ_FULL.  DTR0 steps (0, 2) are broadcast-style and
+            // cannot meaningfully NAK, but a bus error there also aborts.
+            if (type != DALI_RESPONSE_OK && type != DALI_RESPONSE_NAK) {
+                // Bus error: abort sequence.
                 sync_flags_clear(idx, flag);
                 apply_retry_pending(idx, SYNC_READ_FULL);
-            } else if (step >= 5) {
-                // Final step done.
+            } else if (step >= 3u) {
+                // Final SET twice-pair done.
                 sync_flags_clear(idx, flag);
                 mark_dirty(idx);
             } else {
-                // Advance to next step.
+                // Advance to next logical step.
                 current_op.step = step + 1u;
                 more = true;
             }
@@ -625,21 +616,24 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             uint8_t idx = addr & 0x3Fu;
             uint8_t s   = scan_full_step;
             uint8_t recv = (type == DALI_RESPONSE_OK) ? value : 0;
-            // Note: NAK -> zero the field (matches spec: "cache result
-            // (zero on NAK)").  Bus error: also zero, advance.
+            // Presence transition: SCAN_TRIGGER seeds SYNC_READ_FULL on
+            // every ballast, so the FIRST OK in a scan of a previously-
+            // absent ballast must flip its present bit.  This complements
+            // the level-read presence transition (OP_LEVEL_READ step 0).
+            if (type == DALI_RESPONSE_OK)
+                note_present_on_ok(idx);
+            // Spec: "cache result (zero on NAK)".  Bus error also zeros
+            // and advances — the loss is bounded to one config field.
             regs_apply_result(idx, scan_steps[s].target, recv);
             scan_full_step = s + 1u;
             if (scan_full_step >= 7u) {
-                // Done with this ballast.
                 sync_flags_clear(idx, SYNC_READ_FULL | SYNC_RETRY_PENDING);
                 scan_full_addr = 0xFFu;
                 scan_full_step = 0;
             }
-            // Yield between steps: dali_busy will be cleared below.
-            // (more = false means we release; main picks the next step
-            // via start_next_dali_work, where priority 5 (continue
-            // in-progress full scan) catches it if scan_full_addr stayed
-            // set, and other higher-priority work can preempt.)
+            // Yield between steps: dali_busy cleared below.  Main picks
+            // the next step via priority 5 (continue in-progress full
+            // scan) unless higher-priority work arrives.
             break;
         }
 
@@ -669,32 +663,21 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         }
 
         case OP_RAW: {
-            // Decrement sends remaining; on terminal, write outcome.
-            uint8_t  rc_lo;
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                rc_lo = (uint8_t)g_regs.raw_cmd_result;
-                if (rc_lo > 0u) rc_lo--;
-                // Update high byte: still 0xFF while sends remain.
-                g_regs.raw_cmd_result = (uint16_t)(0xFF00u | rc_lo);
-            }
-            if (rc_lo > 0u) {
-                // More sends to go.
-                more = true;
+            // Each call here is one terminated logical command (twice-
+            // sends are coalesced by cmdq_result_received's repeat
+            // re-fire).  So this path always writes a terminal value to
+            // 0x015D and releases the channel.
+            uint16_t terminal;
+            if (type == DALI_RESPONSE_OK) {
+                terminal = RAW_RESULT_OK(value);
+            } else if (type == DALI_RESPONSE_NAK) {
+                terminal = RAW_RESULT_NAK;
             } else {
-                // Final send: write terminal value based on response.
-                uint16_t terminal;
-                if (type == DALI_RESPONSE_OK) {
-                    terminal = RAW_RESULT_OK(value);
-                } else if (type == DALI_RESPONSE_NAK) {
-                    terminal = RAW_RESULT_NAK;
-                } else {
-                    // Subtract DALI_RESPONSE_MALFORMED to compute subtype.
-                    uint8_t sub = (uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u;
-                    terminal = RAW_RESULT_ERR(sub);
-                }
-                ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                    g_regs.raw_cmd_result = terminal;
-                }
+                uint8_t sub = (uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u;
+                terminal = RAW_RESULT_ERR(sub);
+            }
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                g_regs.raw_cmd_result = terminal;
             }
             break;
         }

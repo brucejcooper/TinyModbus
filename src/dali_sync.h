@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <avr/io.h>
 #include <util/atomic.h>
 
 #include "dali.h"
@@ -115,20 +116,30 @@ void dali_sync_init(void);
 bool start_next_dali_work(void);
 
 // Issue a single DALI command.  Internal to dali_sync; called by
-// start_next_dali_work and by dali_idle_state_enter when servicing a
-// multi-step continuation.  Performs cache-invalidation as a property of
+// start_next_dali_work and by dali_sync_completion when advancing to
+// the next logical step.  Performs cache-invalidation as a property of
 // the command bytes (address-byte -> affected ballasts; cmd-byte ->
-// INV_LEVEL/CONFIG/BOTH/NONE).  expects_response selects the cmd_type_t:
-// CMD_QUERY when a backward frame is expected, CMD_SEND_TWICE when the
-// 22 TE inter-send window is required without a response, CMD_DIRECT_ARC
-// for DAPC, CMD_SEND otherwise.
+// INV_LEVEL/CONFIG/BOTH/NONE).  kind selects cmd_type_t.  repeat
+// selects how many hardware sends comprise this logical command (1
+// for one-shot, 2 for SET / ADD_TO_GROUP / REMOVE_FROM_GROUP / raw
+// twice).  The bit-level state machine handles the second send via
+// cmdq_result_received's repeat-decrement re-fire (matching the
+// legacy queue mechanism, kept for inter-send timing fidelity).
 typedef enum __attribute__((packed)) {
     DALI_KIND_DAPC = 0,        // CMD_DIRECT_ARC; bit0 of addr clear
     DALI_KIND_CMD,             // CMD_SEND; no response
     DALI_KIND_TWICE,           // CMD_SEND_TWICE; no response, but 22 TE wait
     DALI_KIND_QUERY,           // CMD_QUERY; backward frame expected
 } dali_kind_t;
-void issue_dali_command(uint8_t addr_byte, uint8_t data_byte, dali_kind_t kind);
+void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
+                         dali_kind_t kind, uint8_t repeat);
+
+// In-flight command stash.  Populated by issue_dali_command and consumed
+// by dali_transmitting_state_enter (for the bytes), by finished_transmission
+// (for the type, to decide whether to arm a backward-frame window), and
+// by cmdq_result_received in dali_state_idle.c (for the repeat-decrement
+// re-fire that handles SEND_TWICE without an extra inter-frame gap).
+extern volatile cmd_entry_t s_active;
 
 // Completion handler — called from cmdq_result_received (in dali_state_idle.c)
 // when dali_busy is true.  Dispatches on current_op.op to advance the
@@ -156,11 +167,19 @@ bool dali_sync_arm_group_write(uint16_t reg_addr,
 
 // True if a group write is currently in flight (caller uses this to
 // decide whether to return SLAVE_DEVICE_BUSY before starting a new one).
+// reg_addr is uint16_t = 2 bytes = non-atomic read on AVR; the
+// completion ISR (cmdq_result_received -> dali_sync_completion's
+// OP_GROUP_BIT path) can write 0xFFFF between the high-byte and low-
+// byte read.  TCB0.INTCTRL=0 fences out LVL1; ATOMIC_BLOCK fences out
+// LVL0 — same pattern as cmdq_kick / process_fc04 raw-result clearing.
 static inline bool dali_sync_group_busy(void) {
     bool busy;
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         busy = (group_write.reg_addr != 0xFFFFu);
     }
+    TCB0.INTCTRL = old_tcb;
     return busy;
 }
 

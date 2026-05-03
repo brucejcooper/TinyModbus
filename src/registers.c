@@ -2,6 +2,7 @@
 #include <avr/io.h>
 #include <util/atomic.h>
 #include "registers.h"
+#include "dali_sync.h"
 
 register_map_t g_regs;
 
@@ -181,41 +182,73 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
 // ---- FC06/FC10 holding write -------------------------------------------
 
 bool regs_write_holding(uint16_t addr, uint16_t val) {
-    // Per-ballast bank writes (subtask 2 stub): predictive cache update only.
-    // The SYNC_WRITE_* flag-setting that pushes the change to the ballast via
-    // DALI is added in subtask 4.
+    // Per-ballast bank writes: predictive cache update + SYNC_WRITE_*
+    // arming.  The work selector services the flag and calls
+    // issue_dali_command, which in turn handles cache-invalidation
+    // uniformly for all DALI command sources.
     if (addr <= 0x003Fu) {
         // Brightness bank: low byte = DAPC level; high byte (status) ignored.
         // Status is owned by DALI query responses, not master writes.
+        // 8-bit store is atomic on AVR; no ATOMIC needed for this byte.
         g_regs.block0[addr].brightness = (uint8_t)val;
+        sync_flags_set((uint8_t)addr, SYNC_WRITE_LEVEL);
         return true;
     }
     if (addr >= 0x0040u && addr <= 0x007Fu) {
         uint8_t idx = (uint8_t)(addr - 0x0040u);
-        g_regs.block1[idx].min = (uint8_t)(val >> 8);
-        g_regs.block1[idx].max = (uint8_t)val;
+        // Two byte stores; not touched by ISR cache writers (regs_apply_result
+        // runs at LVL1 and writes block1.min/max during scan, so wrap to be safe).
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_regs.block1[idx].min = (uint8_t)(val >> 8);
+            g_regs.block1[idx].max = (uint8_t)val;
+        }
+        sync_flags_set(idx, SYNC_WRITE_MINMAX);
         return true;
     }
     if (addr >= 0x0080u && addr <= 0x00BFu) {
         uint8_t idx = (uint8_t)(addr - 0x0080u);
-        g_regs.block2[idx].power_on = (uint8_t)(val >> 8);
-        g_regs.block2[idx].sys_fail = (uint8_t)val;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_regs.block2[idx].power_on = (uint8_t)(val >> 8);
+            g_regs.block2[idx].sys_fail = (uint8_t)val;
+        }
+        sync_flags_set(idx, SYNC_WRITE_POWER);
         return true;
     }
     if (addr >= 0x00C0u && addr <= 0x00FFu) {
         uint8_t idx = (uint8_t)(addr - 0x00C0u);
-        g_regs.block3[idx].fade_rate = (uint8_t)(val >> 8);
-        g_regs.block3[idx].fade_time = (uint8_t)val;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_regs.block3[idx].fade_rate = (uint8_t)(val >> 8);
+            g_regs.block3[idx].fade_time = (uint8_t)val;
+        }
+        sync_flags_set(idx, SYNC_WRITE_FADE);
         return true;
     }
-    // Group masks 0x0110-0x014F (subtask 2 stub): direct cache update.
-    // Subtask 4 adds the per-bit ADD_TO_GROUP / REMOVE_FROM_GROUP dispatch
-    // and the pending-work bookkeeping described in the spec.
+    // Group masks 0x0110-0x014F: validate, snapshot old value, compute
+    // pending_adds = new & ~old, pending_removes = old & ~new, update
+    // cache, arm group_write state machine.  Caller (modbus.c) is
+    // expected to have pre-checked dali_sync_group_busy() and returned
+    // SLAVE_DEVICE_BUSY upstream — we still re-check arm() result.
     if (addr >= 0x0110u && addr <= 0x014Fu) {
         uint8_t group_idx = (uint8_t)((addr - 0x0110u) >> 2);
         uint8_t word_idx  = (uint8_t)((addr - 0x0110u) & 0x03u);
-        g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(val >> 8);
-        g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)val;
+        uint16_t old_val, new_val = val;
+        old_val  = ((uint16_t)g_regs.group_mask[group_idx][word_idx * 2u]      << 8)
+                 |  (uint16_t)g_regs.group_mask[group_idx][word_idx * 2u + 1u];
+        uint16_t changed         = (uint16_t)(old_val ^ new_val);
+        uint16_t pending_adds    = (uint16_t)(new_val & changed);
+        uint16_t pending_removes = (uint16_t)(old_val & changed);
+        // Predictive cache update.
+        g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(new_val >> 8);
+        g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)new_val;
+        if (changed != 0) {
+            if (!dali_sync_arm_group_write(addr, pending_adds, pending_removes)) {
+                // Race: another group write became armed between caller's
+                // pre-check and now.  Rollback cache and refuse.
+                g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(old_val >> 8);
+                g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)old_val;
+                return false;
+            }
+        }
         return true;
     }
 

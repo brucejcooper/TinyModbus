@@ -5,7 +5,7 @@
 
 #include "dali.h"
 #include "registers.h"
-#include "cmd_queue.h"
+#include "dali_sync.h"
 
 volatile bool dali_idle = false;
 
@@ -25,70 +25,46 @@ static void external_message_started(void) {
 }
 
 // ---- cmdq_result_received - called from ISR context --------------------
-
-// Processes the result of the head-of-queue command:
-//   - updates the target register (if any)
-//   - fires the optional callback
-//   - for CMD_SEND_TWICE: decrements repeat and re-dispatches without popping
-//   - otherwise: pops the queue and enters idle to dispatch the next command
+//
+// All DALI completions in subtask 4+ flow through dali_sync_completion.
+// The function name is preserved for compatibility with the bit-level
+// state-machine callers (dali_state_transmitting.c,
+// dali_state_receiving.c, dali_state_wait_for_response.c); subtask 5
+// renames it.  When dali_busy is somehow false on entry, that's a
+// no-op: just re-arm idle.
 
 void cmdq_result_received(dali_response_type_t type, uint8_t value) {
-    if (cmdq_empty()) {
-        dali_idle_state_enter();
+    if (dali_busy) {
+        dali_sync_completion(type, value);
         return;
     }
-
-    cmd_entry_t cmd;
-    cmdq_peek(&cmd);
-
-    // Handle repeat: CMD_SEND_TWICE sends twice before processing the result
-    if (cmd.repeat > 1) {
-        // Write back the decremented repeat counter into the queue head
-        g_cmd_queue.entries[g_cmd_queue.head].repeat--;
-        // Re-dispatch the same command (second send)
-        dali_transmitting_state_enter(&g_cmd_queue.entries[g_cmd_queue.head]);
-        return;
-    }
-
-    // Apply result to register map
-    if (cmd.reg_target != REG_NONE && type == DALI_RESPONSE_OK)
-        regs_apply_result(cmd.ballast_idx, cmd.reg_target, value);
-
-    // Fire optional callback (used by scan and fade tracking)
-    if (cmd.on_result)
-        cmd.on_result(type, cmd.ballast_idx, value);
-
-    cmdq_pop();
-    // After any completed command, wait for the bus to settle (22 TE) before
-    // dispatching the next one.  When the queue is now empty, enter idle
-    // immediately so we can listen for external traffic without the extra wait.
-    if (cmdq_empty())
-        dali_idle_state_enter();
-    else
-        dali_wait_for_idle_state_enter();
+    dali_idle_state_enter();
 }
 
 // ---- dali_idle_state_enter ---------------------------------------------
+//
+// Two branches:
+//   1. dali_busy is true: a sync op is in flight and we just finished
+//      the inter-frame gap.  Dispatch the next step via
+//      dali_sync_dispatch_current (which calls dali_transmitting_state_enter).
+//   2. Otherwise: arm the bus monitor and set dali_idle so main can
+//      kick start_next_dali_work.
 
 void dali_idle_state_enter(void) {
     // Belt-and-braces: ensure the DALI TX line is released before entering idle.
-    // If a glitched code path left the bus driven active, this releases it
-    // immediately rather than waiting for the next transmission cycle.
     DALI_PORT.OUTCLR = DALI_TX_bm;
 
-    if (!cmdq_empty()) {
+    if (dali_busy) {
         cleanup();
         if (dali_is_bus_active()) {
-            // Bus became active between the idle check and now - wait for it to clear.
             dali_wait_for_idle_state_enter();
         } else {
-            cmd_entry_t cmd;
-            cmdq_peek(&cmd);
-            dali_transmitting_state_enter(&cmd);
+            dali_sync_dispatch_current();
         }
-    } else {
-        dali_idle = true;
-        dali_state_receiving_prepare();
-        dali_call_on_rising_once(external_message_started);
+        return;
     }
+
+    dali_idle = true;
+    dali_state_receiving_prepare();
+    dali_call_on_rising_once(external_message_started);
 }

@@ -10,7 +10,7 @@
 //     (raw -> group bit -> SYNC_WRITE_* -> SYNC_READ_LEVEL ->
 //     full-scan continue -> full-scan new) and kicks off the first send.
 //   - The bit-level state machine drives the send to completion.  When
-//     it returns to idle, cmdq_result_received fires.  If dali_busy is
+//     it returns to idle, dali_result_received fires.  If dali_busy is
 //     true, that routes to dali_sync_completion (here), which advances
 //     the multi-step sequence or releases the channel.
 //   - Multi-step writes (DTR0 -> SET_X x2 -> DTR0 -> SET_Y x2) run as
@@ -27,7 +27,7 @@
 //     read by dispatch (main when starting work).
 //   - group_write: same pattern as raw_cmd_*.
 //   - g_regs.raw_cmd_result: 16-bit; ALL RMW under ATOMIC + TCB0 disable
-//     (cmdq_result_received runs at LVL1).
+//     (dali_result_received runs at LVL1).
 //   - g_regs.dirty[]: ISR-set, main-cleared via regs_read_clear_dirty
 //     (already atomic).
 
@@ -167,13 +167,10 @@ void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
         case DALI_KIND_QUERY: t = CMD_QUERY;      break;
         default:              t = CMD_SEND;       break;
     }
-    s_active.type        = t;
-    s_active.dali_addr   = addr_byte;
-    s_active.dali_cmd    = data_byte;
-    s_active.repeat      = repeat;
-    s_active.ballast_idx = 0xFF;
-    s_active.reg_target  = REG_NONE;
-    s_active.on_result   = NULL;
+    s_active.type      = t;
+    s_active.dali_addr = addr_byte;
+    s_active.dali_cmd  = data_byte;
+    s_active.repeat    = repeat;
 
     dali_transmitting_state_enter((const cmd_entry_t *)&s_active);
 }
@@ -182,7 +179,7 @@ void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
 //
 // Each multi-step write is 4 LOGICAL steps (= 6 hardware sends, with
 // the SET twice-sends handled by the repeat-decrement re-fire in
-// cmdq_result_received — same mechanism the legacy queue used):
+// dali_result_received — same mechanism the legacy queue used):
 //   step 0: DTR0 = low_byte               (CMD_SEND, repeat=1)
 //   step 1: SET_X                          (CMD_SEND_TWICE, repeat=2)
 //   step 2: DTR0 = high_byte               (CMD_SEND, repeat=1)
@@ -284,7 +281,7 @@ void dali_sync_dispatch_current(void) {
             // raw_cmd_addr / raw_cmd_data hold the staged bytes.
             // sends_remaining encoded in the low byte of raw_cmd_result.
             // For a single send: KIND_QUERY (backward frame may arrive).
-            // For twice: KIND_TWICE with repeat=2 (cmdq_result_received's
+            // For twice: KIND_TWICE with repeat=2 (dali_result_received's
             // re-fire handles the second send within the 22 TE window).
             uint8_t  rc_lo;
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rc_lo = (uint8_t)g_regs.raw_cmd_result; }
@@ -489,7 +486,7 @@ bool dali_sync_arm_group_write(uint16_t reg_addr,
 
 // ---- Completion handler ---------------------------------------------
 //
-// Runs in ISR context (called from cmdq_result_received in
+// Runs in ISR context (called from dali_result_received in
 // dali_state_idle.c when dali_busy is true).  Updates cache, advances
 // step, decides whether to release dali_busy.  Either path tail-calls
 // dali_wait_for_idle_state_enter which falls through to
@@ -665,7 +662,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 
         case OP_RAW: {
             // Each call here is one terminated logical command (twice-
-            // sends are coalesced by cmdq_result_received's repeat
+            // sends are coalesced by dali_result_received's repeat
             // re-fire).  So this path always writes a terminal value to
             // 0x015D and releases the channel.
             uint16_t terminal;
@@ -715,12 +712,17 @@ ISR(RTC_PIT_vect) {
         tick++;
         if (tick >= interval) {
             tick = 0;
-            // ISR-context: sync_flags[i] |= ... is non-atomic on AVR
-            // (LDS/OR/STS) but we are already at the highest-priority
-            // context that touches this byte; only main can race with us,
-            // and main's writes are wrapped in ATOMIC_BLOCK via
-            // sync_flags_set.  Disabling interrupts here would be redundant.
-            sync_flags[scan_cursor] |= SYNC_READ_LEVEL;
+            // RTC PIT runs at LVL0; TCB0 (LVL1) preempts it and
+            // dali_sync_completion (called from TCB0 context via
+            // dali_result_received) writes sync_flags[idx] for any
+            // ballast — including possibly the same index this PIT
+            // tick is targeting.  A naked sync_flags[i] |= ... here
+            // is a non-atomic LDS/OR/STS triple, so a TCB0 preemption
+            // between the load and the store can lose the LVL1 update.
+            // Use sync_flags_set (ATOMIC_RESTORESTATE) — it disables
+            // I for a few cycles and restores SREG; safe from any
+            // context.
+            sync_flags_set(scan_cursor, SYNC_READ_LEVEL);
             scan_cursor++;
             if (scan_cursor >= DALI_MAX_DEVICES) scan_cursor = 0;
         }

@@ -123,7 +123,7 @@ bool start_next_dali_work(void);
 // selects how many hardware sends comprise this logical command (1
 // for one-shot, 2 for SET / ADD_TO_GROUP / REMOVE_FROM_GROUP / raw
 // twice).  The bit-level state machine handles the second send via
-// cmdq_result_received's repeat-decrement re-fire (matching the
+// dali_result_received's repeat-decrement re-fire (matching the
 // legacy queue mechanism, kept for inter-send timing fidelity).
 typedef enum __attribute__((packed)) {
     DALI_KIND_DAPC = 0,        // CMD_DIRECT_ARC; bit0 of addr clear
@@ -137,11 +137,11 @@ void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
 // In-flight command stash.  Populated by issue_dali_command and consumed
 // by dali_transmitting_state_enter (for the bytes), by finished_transmission
 // (for the type, to decide whether to arm a backward-frame window), and
-// by cmdq_result_received in dali_state_idle.c (for the repeat-decrement
+// by dali_result_received in dali_state_idle.c (for the repeat-decrement
 // re-fire that handles SEND_TWICE without an extra inter-frame gap).
 extern volatile cmd_entry_t s_active;
 
-// Completion handler — called from cmdq_result_received (in dali_state_idle.c)
+// Completion handler — called from dali_result_received (in dali_state_idle.c)
 // when dali_busy is true.  Dispatches on current_op.op to advance the
 // in-flight sequence or release dali_busy.  Runs in ISR context.
 void dali_sync_completion(dali_response_type_t type, uint8_t value);
@@ -168,10 +168,10 @@ bool dali_sync_arm_group_write(uint16_t reg_addr,
 // True if a group write is currently in flight (caller uses this to
 // decide whether to return SLAVE_DEVICE_BUSY before starting a new one).
 // reg_addr is uint16_t = 2 bytes = non-atomic read on AVR; the
-// completion ISR (cmdq_result_received -> dali_sync_completion's
+// completion ISR (dali_result_received -> dali_sync_completion's
 // OP_GROUP_BIT path) can write 0xFFFF between the high-byte and low-
 // byte read.  TCB0.INTCTRL=0 fences out LVL1; ATOMIC_BLOCK fences out
-// LVL0 — same pattern as cmdq_kick / process_fc04 raw-result clearing.
+// LVL0 — same pattern as start_next_dali_work / process_fc04 raw-result clearing.
 static inline bool dali_sync_group_busy(void) {
     bool busy;
     uint8_t old_tcb = TCB0.INTCTRL;

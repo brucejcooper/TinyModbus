@@ -24,7 +24,7 @@ static void external_message_started(void) {
     dali_wait_for_idle_state_enter();
 }
 
-// ---- cmdq_result_received - called from ISR context --------------------
+// ---- dali_result_received - called from ISR context --------------------
 //
 // All DALI completions in subtask 4+ flow through dali_sync_completion.
 // The function name is preserved for compatibility with the bit-level
@@ -45,7 +45,7 @@ static void external_message_started(void) {
 //   2. otherwise: dispatch to dali_sync_completion which advances the
 //      logical step or releases the channel.
 
-void cmdq_result_received(dali_response_type_t type, uint8_t value) {
+void dali_result_received(dali_response_type_t type, uint8_t value) {
     if (dali_busy) {
         if (s_active.repeat > 1u) {
             s_active.repeat--;

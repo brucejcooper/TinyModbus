@@ -114,6 +114,6 @@ void dali_state_receiving_enter(void);
 // Single authority for post-command state transitions - called from ISR context.
 // Updates the target register (if any), fires the optional callback, decrements
 // repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
-void cmdq_result_received(dali_response_type_t type, uint8_t value);
+void dali_result_received(dali_response_type_t type, uint8_t value);
 
 #endif

@@ -162,13 +162,9 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
     }
 
     switch (addr) {
-        // Action registers read as 0 (write-only by convention)
-        case MBREG_RAW_CMD:       case MBREG_RAW_CMD_TWICE:
-        case MBREG_DAPC:
-        case MBREG_GOTO_LAST_ACTIVE: case MBREG_OFF:          case MBREG_UP:
-        case MBREG_DOWN:          case MBREG_STEP_UP:         case MBREG_STEP_DOWN:
-        case MBREG_RECALL_MAX:    case MBREG_RECALL_MIN:
-        case MBREG_SET_DTR0:      case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
+        // Action / control registers read as 0 (write-only by convention)
+        case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
+        case MBREG_SET_DTR0:   case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
         case MBREG_SCAN_TRIGGER:
             *val = 0;
             return true;
@@ -264,13 +260,9 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
             return userrow_set_slave_addr((uint8_t)val);
         case MBREG_BAUD_INDEX:
             return userrow_set_baud_index((uint8_t)val);
-        // Action registers: caller handles DALI dispatch
-        case MBREG_RAW_CMD:       case MBREG_RAW_CMD_TWICE:
-        case MBREG_DAPC:
-        case MBREG_GOTO_LAST_ACTIVE: case MBREG_OFF:          case MBREG_UP:
-        case MBREG_DOWN:          case MBREG_STEP_UP:         case MBREG_STEP_DOWN:
-        case MBREG_RECALL_MAX:    case MBREG_RECALL_MIN:
-        case MBREG_SET_DTR0:      case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
+        // Raw / DTR / scan-trigger: caller (dispatch_action_reg) handles DALI dispatch
+        case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
+        case MBREG_SET_DTR0:   case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
         case MBREG_SCAN_TRIGGER:
             return true;
         default:
@@ -280,15 +272,12 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
 
 // ---- result application ------------------------------------------------
 
+// Apply a single full-scan query response to the appropriate cache field.
+// Only called from dali_sync.c's OP_FULL_SCAN completion path; the
+// per-step targets (REG_MIN/MAX/POWER_ON/SYS_FAIL/FADE_RATE/GROUP_0_7/GROUP_8_15)
+// match the scan_steps[] table.
 void regs_apply_result(uint8_t idx, reg_target_t target, uint8_t value) {
     switch (target) {
-        case REG_BRIGHTNESS:
-            g_regs.block0[idx].brightness = value;
-            bm_set(g_regs.dirty, idx, true);
-            break;
-        case REG_STATUS:
-            regs_apply_status(idx, value);
-            break;
         case REG_MIN:
             g_regs.block1[idx].min = value;
             break;

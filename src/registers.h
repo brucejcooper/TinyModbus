@@ -62,23 +62,19 @@ extern register_map_t g_regs;
 // ---- Modbus holding register (FC03/FC06) addresses ------------------------
 
 // Raw DALI forward frame - [15:8]=frame byte 0, [7:0]=frame byte 1
+//
+// All other DALI commands the master might want to issue (DAPC,
+// GOTO_LAST_ACTIVE, OFF, UP, DOWN, STEP_*, RECALL_*, etc.) go through
+// these raw registers — there is no per-command holding-register facade
+// after subtask 5.  Per-ballast level changes are simpler done via the
+// per-ballast brightness bank (0x0000-0x003F) which arms SYNC_WRITE_LEVEL
+// and ACKs immediately.
 #define MBREG_RAW_CMD           0x1000u  // single send, waits for response
 #define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
 
-// Direct arc power control - [15:8]=DALI address byte, [7:0]=arc level
-#define MBREG_DAPC              0x1002u
-
-// Per-ballast action commands - write low byte = DALI address byte
-#define MBREG_GOTO_LAST_ACTIVE  0x1003u
-#define MBREG_OFF               0x1004u
-#define MBREG_UP                0x1005u
-#define MBREG_DOWN              0x1006u
-#define MBREG_STEP_UP           0x1007u
-#define MBREG_STEP_DOWN         0x1008u
-#define MBREG_RECALL_MAX        0x1009u
-#define MBREG_RECALL_MIN        0x100Au
-
-// DTR set commands - write low byte = value to load into DTR
+// DTR set commands - write low byte = value to load into DTR.  These are
+// control registers per spec (the master orchestrates SET-sequence
+// handshakes via raw commands and expects DTR setters as their primitive).
 #define MBREG_SET_DTR0          0x100Bu
 #define MBREG_SET_DTR1          0x100Cu
 #define MBREG_SET_DTR2          0x100Du
@@ -143,7 +139,7 @@ bool     regs_read_holding(uint16_t addr, uint16_t *val);
 bool     regs_write_holding(uint16_t addr, uint16_t val);
 
 // Store one field from a DALI query response into the appropriate register block.
-// Called from ISR context via cmdq_result_received; must be short.
+// Called from ISR context via dali_result_received; must be short.
 void     regs_apply_result(uint8_t ballast_idx, reg_target_t target, uint8_t value);
 
 // Apply a DALI status byte: updates block0.status, the fading bitmask, and the dirty bit.

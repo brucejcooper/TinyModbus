@@ -21,7 +21,7 @@ static void finished_transmission(void) {
     if (t == CMD_QUERY || t == CMD_SEND_TWICE)
         dali_wait_for_response_state_enter();
     else
-        cmdq_result_received(DALI_RESPONSE_NAK, 0);
+        dali_result_received(DALI_RESPONSE_NAK, 0);
 }
 
 static void half_bit_toggle(void);

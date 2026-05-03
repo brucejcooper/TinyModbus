@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <util/atomic.h>
-#include <util/delay.h>
 
 #include "modbus.h"
 #include "registers.h"
@@ -166,32 +165,11 @@ static void send_error(mb_err_t err) {
     start_tx(3);
 }
 
-// Action-register dispatch table: maps each legacy action holding
-// register (0x1003-0x100A) to the DALI command byte to send.  The
-// address byte comes from the low byte of the master's write value.
-//
-// In subtask 4 these all funnel through dali_sync_arm_raw so the
-// queue/bg_tasks legacy path is unreachable.  Subtask 5 will retire
-// these registers entirely.
-typedef struct { uint16_t mb_reg; uint8_t dali_cmd; } action_reg_t;
-
-static const action_reg_t action_regs[] PROGMEM = {
-    { MBREG_GOTO_LAST_ACTIVE, DALI_CMD_GOTO_LAST_ACTIVE },
-    { MBREG_OFF,              DALI_CMD_OFF              },
-    { MBREG_UP,               DALI_CMD_UP               },
-    { MBREG_DOWN,             DALI_CMD_DOWN             },
-    { MBREG_STEP_UP,          DALI_CMD_STEP_UP          },
-    { MBREG_STEP_DOWN,        DALI_CMD_STEP_DOWN        },
-    { MBREG_RECALL_MAX,       DALI_CMD_RECALL_MAX       },
-    { MBREG_RECALL_MIN,       DALI_CMD_RECALL_MIN       },
-};
-#define NUM_ACTION_REGS (sizeof(action_regs) / sizeof(action_regs[0]))
-
-// Raw-command staging now lives in dali_sync.c (raw_cmd_addr / raw_cmd_data
-// and the 0x015D state machine in g_regs.raw_cmd_result).  Cache invalidation
-// is handled by issue_dali_command — there is no separate classify_raw_cmd
-// step.  Fade tracking is a natural consequence of SYNC_READ_LEVEL being set
-// by the unified invalidation path.
+// Raw-command staging lives in dali_sync.c (raw_cmd_addr / raw_cmd_data and
+// the 0x015D state machine in g_regs.raw_cmd_result).  Cache invalidation is
+// handled centrally in issue_dali_command for every DALI source — there is
+// no separate classify_raw_cmd step.  Fade tracking is a natural consequence
+// of SYNC_READ_LEVEL being set by the unified invalidation path.
 
 // ---- FC04 - read input registers ----------------------------------------
 
@@ -328,27 +306,23 @@ static void process_fc03(void) {
 // ---- FC06 / FC10 - write register(s) -----------------------------------
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
+//
+// After subtask 5 the only registers that map to a DALI command issued from
+// here are: MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel),
+// MBREG_SET_DTR0/1/2 (control regs that load DTR0..2 with master-supplied
+// values), and MBREG_SCAN_TRIGGER (sets SYNC_READ_FULL on all ballasts).
+// Per-ballast bank writes (0x0000-0x00FF) and group register writes
+// (0x0110-0x014F) are handled directly by regs_write_holding via the
+// SYNC_WRITE_* / group_write paths and do not reach this function.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
     if (mb_reg == MBREG_RAW_CMD || mb_reg == MBREG_RAW_CMD_TWICE) {
         // Raw DALI: [15:8]=first frame byte, [7:0]=second frame byte.
         // The two bytes are sent as-is; they can encode any valid DALI forward
-        // frame (addressed, group, broadcast, or special command).
-        //
-        // The new staging path lives in dali_sync.c.  We arm raw_cmd_addr /
-        // raw_cmd_data and transition g_regs.raw_cmd_result to 0xFF02 (twice)
-        // or 0xFF01 (single).  start_next_dali_work picks it up; cache
-        // invalidation is handled centrally in issue_dali_command, so no
-        // separate classify_raw_cmd / fade_poll dance is needed.
+        // frame (addressed, group, broadcast, or special command).  The
+        // unified issue_dali_command performs cache invalidation as a
+        // property of the command bytes — no separate classification here.
         uint8_t sends = (mb_reg == MBREG_RAW_CMD_TWICE) ? 2u : 1u;
         if (!dali_sync_arm_raw((uint8_t)(val >> 8), (uint8_t)val, sends))
-            return MB_ERR_DEVICE_BUSY;
-        return 0;
-    }
-    if (mb_reg == MBREG_DAPC) {
-        // DAPC: [15:8]=DALI addr byte (DAPC, bit0=0), [7:0]=arc level.
-        // Issue as a single raw send; cache invalidation is handled by
-        // issue_dali_command (DAPC -> SYNC_READ_LEVEL on affected ballasts).
-        if (!dali_sync_arm_raw((uint8_t)(val >> 8), (uint8_t)val, 1u))
             return MB_ERR_DEVICE_BUSY;
         return 0;
     }
@@ -370,18 +344,6 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         if (!dali_sync_arm_raw(dtr_addr, (uint8_t)val, 1u))
             return MB_ERR_DEVICE_BUSY;
         return 0;
-    }
-    // Action registers 0x1003-0x100A: low byte of val is the DALI
-    // address byte; the table above gives the corresponding DALI cmd byte.
-    for (uint8_t i = 0; i < NUM_ACTION_REGS; i++) {
-        uint16_t reg = pgm_read_word(&action_regs[i].mb_reg);
-        if (reg == mb_reg) {
-            uint8_t dali_cmd_byte  = pgm_read_byte(&action_regs[i].dali_cmd);
-            uint8_t dali_addr_byte = (uint8_t)val;
-            if (!dali_sync_arm_raw(dali_addr_byte, dali_cmd_byte, 1u))
-                return MB_ERR_DEVICE_BUSY;
-            return 0;
-        }
     }
     return 0;
 }
@@ -489,103 +451,6 @@ static void process_fc10(void) {
         if (err) { send_error(err); return; }
     }
     // Standard FC10 response: slave addr, FC, start addr (2), count (2)
-    start_tx(6);
-}
-
-// ---- FC01 / FC05 / FC0F - coils (ballast on/off state) ------------------
-//
-// Coil N maps to ballast N (0-63).  A coil reads as 1 when the ballast is
-// present (per present bitmask) and brightness > 0.
-// Write ON  → GOTO_LAST_ACTIVE; Write OFF → OFF; both start fade polling.
-// Write 0x5500 (non-normative toggle) checks the current brightness and
-// inverts the state.
-
-static void process_fc01(void) {
-    uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
-    uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
-
-    if (count == 0) { send_error(MB_ERR_ILLEGAL_VALUE);   return; }
-    // (uint32_t) cast prevents wrap when addr is near 0xFFFF.
-    if (addr >= 64u || (uint32_t)addr + count > 64u) {
-        send_error(MB_ERR_ILLEGAL_ADDRESS);
-        return;
-    }
-
-    uint8_t nbytes = (uint8_t)((count + 7u) >> 3);
-    buf[2] = nbytes;
-    memset(buf + 3, 0, nbytes);
-    for (uint16_t i = 0; i < count; i++) {
-        uint8_t bidx   = (uint8_t)(addr + i);
-        bool    present = (g_regs.present[bidx >> 4] >> (bidx & 0x0Fu)) & 1u;
-        if (present && g_regs.block0[bidx].brightness > 0)
-            buf[3 + (i >> 3)] |= (uint8_t)(1u << (i & 7u));
-    }
-    start_tx(3 + nbytes);
-}
-
-static void process_fc05(void) {
-    uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
-    uint16_t val  = ((uint16_t)buf[4] << 8) | buf[5];
-
-    if (addr >= 64u) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
-    if (val != 0xFF00u && val != 0x0000u && val != 0x5500u) {
-        send_error(MB_ERR_ILLEGAL_VALUE);
-        return;
-    }
-
-    bool on;
-    if (val == 0x5500u) {
-        on = (g_regs.block0[addr].brightness == 0);
-    } else {
-        on = (val == 0xFF00u);
-    }
-
-    // Route through raw arming so cache invalidation runs in
-    // issue_dali_command and the queue/bg_tasks path stays unreachable.
-    uint8_t dali_addr = DALI_SHORT_ADDR((uint8_t)addr) | DALI_CMD_FLAG;
-    if (!dali_sync_arm_raw(dali_addr,
-                            on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF,
-                            1u)) {
-        send_error(MB_ERR_DEVICE_BUSY);
-        return;
-    }
-    start_tx(6);  // echo request
-}
-
-// FC0F (write multiple coils): subtask 5 retires this entirely.  The
-// raw command channel can only carry one DALI command at a time, so a
-// genuine multi-coil write would either need queueing (which we just
-// removed) or per-bit arming (which would only ACK the first coil).
-// For subtask 4 we accept single-coil writes only and reject the rest
-// as DEVICE_BUSY so existing masters hitting one coil at a time still
-// work.  Multi-coil masters: switch to per-ballast brightness writes.
-static void process_fc0f(void) {
-    uint16_t addr   = ((uint16_t)buf[2] << 8) | buf[3];
-    uint16_t count  = ((uint16_t)buf[4] << 8) | buf[5];
-    uint8_t  nbytes = buf[6];
-
-    if (count == 0 || nbytes != (uint8_t)((count + 7u) >> 3)) {
-        send_error(MB_ERR_ILLEGAL_VALUE);
-        return;
-    }
-    if (addr >= 64u || (uint32_t)addr + count > 64u) {
-        send_error(MB_ERR_ILLEGAL_ADDRESS);
-        return;
-    }
-    if (count != 1u) {
-        // Subtask 5 will replace the coil interface entirely.
-        send_error(MB_ERR_DEVICE_BUSY);
-        return;
-    }
-
-    bool on = (buf[7] & 0x01u);
-    uint8_t dali_addr = DALI_SHORT_ADDR((uint8_t)addr) | DALI_CMD_FLAG;
-    if (!dali_sync_arm_raw(dali_addr,
-                            on ? DALI_CMD_GOTO_LAST_ACTIVE : DALI_CMD_OFF,
-                            1u)) {
-        send_error(MB_ERR_DEVICE_BUSY);
-        return;
-    }
     start_tx(6);
 }
 
@@ -726,21 +591,22 @@ void modbus_tick(void) {
 void modbus_process(void) {
     if (!frame_ready) return;
 
-    // Modbus RTU requires at least 3.5 char times of silence (~3.65 ms at 9600
-    // baud) between request and response so masters relying on inter-frame
-    // timing can separate the two and so the master's TX-to-RX transceiver
-    // switch-over completes before our first response byte hits the wire.
-    _delay_ms(4);
+    // No explicit response delay needed.  modbus_tick gates frame_ready on
+    // silence_ticks reaching 0, which is sized to ≥3.5 char-times per
+    // Modbus §2.5.1.1.  By the time we get here the inter-frame silence
+    // has already elapsed since the master's last byte; the response can
+    // go on the wire immediately.
 
     no_response = (buf[0] == 0);
 
+    // FC01/FC05/FC0F (coils) were retired in subtask 5.  Frames using those
+    // function codes survive frame_is_valid (size check still recognises
+    // them) and reach this switch, where the default branch returns
+    // ILLEGAL_FUNCTION — the standard Modbus reply for unsupported FCs.
     switch (buf[1]) {
-        case FC_READ_COILS:        process_fc01(); break;
         case FC_READ_INPUT:        process_fc04(); break;
         case FC_READ_HOLDING:      process_fc03(); break;
-        case FC_WRITE_SINGLE_COIL: process_fc05(); break;
         case FC_WRITE_SINGLE_REG:  process_fc06(); break;
-        case FC_WRITE_COILS:       process_fc0f(); break;
         case FC_WRITE_MULTI_REG:   process_fc10(); break;
         default:                   send_error(MB_ERR_ILLEGAL_FUNCTION); break;
     }

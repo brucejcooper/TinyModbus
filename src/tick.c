@@ -4,7 +4,6 @@
 #include "tick.h"
 #include "dali.h"
 #include "modbus.h"
-#include "bg_tasks.h"
 
 volatile uint8_t   dali_timer    = 0;
 volatile tick_cb_t dali_timer_cb = NULL;
@@ -24,7 +23,7 @@ void tick_init(void) {
 // Decrement dali_timer and fire dali_timer_cb when it reaches zero.
 // Called from the TCA0_OVF ISR every ~416 µs.
 //
-// dali_timer_cb is a 16-bit pointer that TCB0 (LVL1) can rewrite via cmdq_result_received
+// dali_timer_cb is a 16-bit pointer that TCB0 (LVL1) can rewrite via dali_result_received
 // → dali_idle_state_enter / dali_wait_for_idle_state_enter.  Snapshot the pointer inside
 // ATOMIC_BLOCK so a TCB0 preemption between the two LDS instructions cannot tear the load.
 void dali_tick(void) {
@@ -46,5 +45,4 @@ ISR(TCA0_OVF_vect) {
     TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm;
     dali_tick();
     modbus_tick();
-    bgtasks_tick();
 }

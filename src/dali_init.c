@@ -11,7 +11,7 @@
 //
 // PORTB_PORT_vect runs at LVL0 and reads this pointer with two LDS instructions; TCB0
 // (LVL1) can preempt during the read and rewrite the pointer through the
-// cmdq_result_received chain (which calls dali_idle_state_enter / dali_call_on_rising_once).
+// dali_result_received chain (which calls dali_idle_state_enter / dali_call_on_rising_once).
 // Both reads and LVL0 writes are wrapped in ATOMIC_BLOCK to keep the 16-bit access
 // uninterruptible.
 void (*dali_rx_callback)(void) = NULL;
@@ -76,7 +76,7 @@ ISR(PORTB_PORT_vect) {
         DALI_PORT.DALI_RX_PINCTRL = 0;
 
         // Snapshot the 16-bit pointer atomically: TCB0 (LVL1) can preempt this LVL0 ISR
-        // and rewrite dali_rx_callback through the cmdq_result_received chain.
+        // and rewrite dali_rx_callback through the dali_result_received chain.
         void (*cb)(void);
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             cb = dali_rx_callback;

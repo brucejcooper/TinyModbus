@@ -17,7 +17,7 @@ static void timeout_waiting_for_response(void) {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     cleanup();
     dali_cancel_edge_detect();
-    cmdq_result_received(DALI_RESPONSE_NAK, 0);
+    dali_result_received(DALI_RESPONSE_NAK, 0);
 }
 
 static void start_receiving_response(void) {

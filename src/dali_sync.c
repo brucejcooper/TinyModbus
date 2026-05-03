@@ -89,29 +89,26 @@ void dali_sync_init(void) {
 // ---- Cache-invalidation classification ------------------------------
 //
 // Every DALI command leaving issue_dali_command runs through this.
-// Returns the SYNC_READ_* mask to set on the affected ballasts.
+// Returns the SYNC_READ_* mask to set on the affected ballasts.  The
+// table is collapsed to four coarse ranges; the user accepted that a
+// few reserved opcodes (notably 0x21 STORE_CURRENT_LEVEL_DTR0 and the
+// gaps in the 0x22..0x29 / 0x30..0x3F / 0x81..0x8F bands) now over-
+// invalidate by triggering a SYNC_READ_FULL.  The cost is one extra
+// 7-step background scan per spurious match, which is well within the
+// existing rescan budget — and the simpler classifier is easier to
+// maintain than an exhaustive opcode table.
 //
 //  - DAPC (bit0 of addr clear)              -> SYNC_READ_LEVEL
-//  - 0x00..0x08, 0x0A, 0x10..0x1F           -> SYNC_READ_LEVEL
+//  - 0x00..0x1F (level / scene / step / etc) -> SYNC_READ_LEVEL
 //  - 0x20 RESET                             -> SYNC_READ_LEVEL | SYNC_READ_FULL
-//  - 0x21 STORE_CURRENT_LEVEL_DTR0          -> 0
-//  - 0x2A..0x2F SET_*                       -> SYNC_READ_FULL
-//  - 0x40..0x7F SET_SCENE/REMOVE_SCENE/
-//    ADD_TO_GROUP/REMOVE_FROM_GROUP         -> SYNC_READ_FULL
-//  - 0x80 STORE_DTR_AS_SHORT_ADDRESS        -> SYNC_READ_FULL
+//  - 0x21..0x8F (config + special)          -> SYNC_READ_FULL  [over-invalidates a handful of reserved opcodes]
 //  - 0x90..0xFF queries / specials          -> 0
 static uint8_t classify_invalidation(uint8_t addr_byte, uint8_t data_byte) {
     // DAPC: address bit 0 clear -> arc level command.
     if ((addr_byte & DALI_CMD_FLAG) == 0) return SYNC_READ_LEVEL;
-
-    if (data_byte <= 0x08u)                 return SYNC_READ_LEVEL;
-    if (data_byte == 0x0Au)                 return SYNC_READ_LEVEL;
-    if (data_byte >= 0x10u && data_byte <= 0x1Fu) return SYNC_READ_LEVEL;
-    if (data_byte == 0x20u)                 return SYNC_READ_LEVEL | SYNC_READ_FULL;
-    if (data_byte == 0x21u)                 return 0;
-    if (data_byte >= 0x2Au && data_byte <= 0x2Fu) return SYNC_READ_FULL;
-    if (data_byte >= 0x40u && data_byte <= 0x7Fu) return SYNC_READ_FULL;
-    if (data_byte == 0x80u)                 return SYNC_READ_FULL;
+    if (data_byte <  0x20u)               return SYNC_READ_LEVEL;
+    if (data_byte == 0x20u)               return SYNC_READ_LEVEL | SYNC_READ_FULL;
+    if (data_byte <  0x90u)               return SYNC_READ_FULL;
     return 0;
 }
 
@@ -502,16 +499,17 @@ static void mark_dirty(uint8_t idx) {
 
 // Helper for level read / write-final completion: apply retry-pending
 // logic on NAK.  retry_flag is the SYNC_READ_* flag to leave set on
-// first NAK.
+// first NAK.  Both branches go through the atomic helpers so the
+// safety against an interleaving sync_flags update is obvious from the
+// call site rather than relying on the caller's ISR-context invariants.
 static void apply_retry_pending(uint8_t idx, uint8_t retry_flag) {
-    uint8_t f = sync_flags[idx];
-    if (f & SYNC_RETRY_PENDING) {
+    if (sync_flags[idx] & SYNC_RETRY_PENDING) {
         // Second consecutive NAK -> mark absent.
         regs_clear_ballast(idx);
-        sync_flags[idx] = 0;
+        sync_flags_clear(idx, 0xFFu);
     } else {
         // First NAK -> set retry pending, leave the read flag set.
-        sync_flags[idx] = (uint8_t)((f | SYNC_RETRY_PENDING | retry_flag) & 0xFFu);
+        sync_flags_set(idx, SYNC_RETRY_PENDING | retry_flag);
     }
 }
 
@@ -524,12 +522,12 @@ static bool note_present_on_ok(uint8_t idx) {
     if (!(bm & bit)) {
         regs_set_present(idx, true);
         // Re-fetch all config on presence transition.
-        sync_flags[idx] |= SYNC_READ_FULL;
+        sync_flags_set(idx, SYNC_READ_FULL);
         mark_dirty(idx);
         return true;
     }
     // Clear retry-pending on any successful response.
-    sync_flags[idx] &= (uint8_t)~SYNC_RETRY_PENDING;
+    sync_flags_clear(idx, SYNC_RETRY_PENDING);
     return false;
 }
 
@@ -613,34 +611,43 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         case OP_FULL_SCAN: {
             uint8_t idx = addr & 0x3Fu;
             uint8_t s   = scan_full_step;
-            uint8_t recv = (type == DALI_RESPONSE_OK) ? value : 0;
-            // Presence transition: SCAN_TRIGGER seeds SYNC_READ_FULL on
-            // every ballast, so the FIRST OK in a scan of a previously-
-            // absent ballast must flip its present bit.  This complements
-            // the level-read presence transition (OP_LEVEL_READ step 0).
-            if (type == DALI_RESPONSE_OK)
+            // Short-circuit on any non-OK response: abort this ballast's
+            // scan and let the work selector pick the next ballast on the
+            // next pass.  Absent ballasts cost 1 query per scan cycle
+            // instead of 7, dropping the SCAN_TRIGGER all-absent worst
+            // case from ~22 s to ~3 s.
+            //
+            // User-accepted trade: a transient NAK at step k of 7 leaves
+            // fields k..6 holding their previous value (or zero from
+            // regs_init).  The next SCAN_TRIGGER, presence transition, or
+            // a subsequent OK on the level-poll cursor will retry.  Net
+            // simpler completion semantics — no more "advance through
+            // junk on NAK" walk that the queued path used to do.
+            if (type == DALI_RESPONSE_OK) {
                 note_present_on_ok(idx);
-            // Spec: "cache result (zero on NAK)".  Bus error also zeros
-            // and advances — the loss is bounded to one config field.
-            regs_apply_result(idx, scan_steps[s].target, recv);
-            scan_full_step = s + 1u;
-            if (scan_full_step >= 7u) {
+                regs_apply_result(idx, scan_steps[s].target, value);
+                scan_full_step = s + 1u;
+                if (scan_full_step >= 7u) {
+                    sync_flags_clear(idx, SYNC_READ_FULL | SYNC_RETRY_PENDING);
+                    scan_full_addr = 0xFFu;
+                    scan_full_step = 0;
+                }
+                // Yield between steps: dali_busy cleared below.  Main
+                // picks the next step via priority 5 (continue in-progress
+                // full scan) unless higher-priority work arrives.
+            } else {
+                // NAK or bus error: abort this ballast's scan.
                 sync_flags_clear(idx, SYNC_READ_FULL | SYNC_RETRY_PENDING);
                 scan_full_addr = 0xFFu;
                 scan_full_step = 0;
             }
-            // Yield between steps: dali_busy cleared below.  Main picks
-            // the next step via priority 5 (continue in-progress full
-            // scan) unless higher-priority work arrives.
             break;
         }
 
         case OP_GROUP_BIT: {
             uint8_t idx = addr & 0x3Fu;
             uint8_t data = step;  // we stashed data byte in step
-            uint16_t reg_off = (group_write.reg_addr - 0x0110u) & 0x03u;
             uint16_t bit_in_reg = (uint16_t)1u << (idx % 16u);
-            (void)reg_off;
             // SET commands produce no backward frame; treat OK and NAK
             // as success.  Bus error: leave bit set for retry next pass.
             if (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK) {

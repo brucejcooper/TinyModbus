@@ -166,34 +166,33 @@ static void send_error(mb_err_t err) {
 }
 
 // Raw-command staging lives in dali_sync.c (raw_cmd_addr / raw_cmd_data and
-// the 0x015D state machine in g_regs.raw_cmd_result).  Cache invalidation is
+// the 0x0108 state machine in g_regs.raw_cmd_result).  Cache invalidation is
 // handled centrally in issue_dali_command for every DALI source — there is
 // no separate classify_raw_cmd step.  Fade tracking is a natural consequence
 // of SYNC_READ_LEVEL being set by the unified invalidation path.
 
 // ---- FC04 - read input registers ----------------------------------------
 
-// FC04 input registers (read-only) after subtask 2:
-//   0x0100-0x010F  group_status                     (16 regs)
-//   0x0150         scan_status
-//   0x0151-0x0154  present bitmap                   (4 regs)
-//   0x0155-0x0158  fading bitmap                    (4 regs)
-//   0x0159-0x015C  dirty bitmap (read-clears)       (4 regs)
-//   0x015D         async raw command result
+// FC04 input registers (read-only) after subtask 8:
+//   0x0100-0x0103  present bitmap                   (4 regs)
+//   0x0104-0x0107  dirty bitmap (read-clears)       (4 regs)
+//   0x0108         async raw command result         (1 reg, terminal-state read-clears)
 //   0x0200         version block (special-cased above; count must be 16)
 //
 // The per-ballast banks (0x0000-0x00FF) and group membership masks
-// (0x0110-0x014F) used to live here but have moved to FC03/FC06/FC10 holding
-// registers - this is an intentional breaking change confirmed by the user.
-// Reads of those addresses via FC04 now return ILLEGAL_ADDRESS.
+// (0x0110-0x014F) live in FC03/FC06/FC10 holding-register space; reads via
+// FC04 return ILLEGAL_ADDRESS.  Subtask 8 removed group_status, fading, and
+// scan_status (derivable / vestigial) and packed present/dirty/raw_cmd_result
+// down to 0x0100-0x0108 so a master can read presence + dirty in a single
+// 8-register FC04 request.
 //
 // addr and count come off the wire as 16-bit values; promoting the sum to
 // uint32_t prevents wrap (e.g. addr=0xFFFF, count=1 -> 0) from sneaking
 // through the upper-bound check.
 static bool fc04_range_allowed(uint16_t addr, uint8_t count) {
     uint32_t end = (uint32_t)addr + count;  // exclusive
-    if (addr >= 0x0100u && end <= 0x0110u) return true;  // group_status
-    if (addr >= 0x0150u && end <= 0x015Eu) return true;  // scan/present/fading/dirty/raw_result
+    // Single contiguous FC04 ladder: present[4] | dirty[4] | raw_cmd_result.
+    if (addr >= FC04_PRESENT_BASE && end <= (uint32_t)FC04_INPUT_END + 1u) return true;
     return false;
 }
 
@@ -249,7 +248,7 @@ static void process_fc04(void) {
         }
     }
 
-    // 0x015D raw-cmd-result: read-clears semantics on TERMINAL values
+    // 0x0108 raw-cmd-result: read-clears semantics on TERMINAL values
     // (high byte 0x01 NAK / 0x02 OK / 0x03 ERR).  Pending (0xFF) and idle
     // (0x00) stay put so the master can poll without losing state.  The
     // capture must be atomic w.r.t. the ISR completion handler that writes

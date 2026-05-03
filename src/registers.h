@@ -11,7 +11,6 @@ typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
 typedef struct { uint8_t min;       uint8_t max;        } ballast_mm_t;
 typedef struct { uint8_t power_on;  uint8_t sys_fail;   } ballast_pf_t;
 typedef struct { uint8_t fade_rate; uint8_t fade_time;  } ballast_fade_t;
-typedef struct { uint8_t status;    uint8_t brightness; } group_status_t;
 
 // register_map_t backs both FC03 (holding) and FC04 (input) addressing.  The
 // in-memory byte order matches the Modbus wire (big-endian per register), so
@@ -25,35 +24,38 @@ typedef struct { uint8_t status;    uint8_t brightness; } group_status_t;
 //   0x0110-0x014F  group_mask[16][8] 64-bit per-group membership bitmask
 //
 // FC04 input registers (read-only):
-//   0x0100-0x010F  group_status[16] ORed member status | last cmd level
-//   0x0150         scan_status      0=idle 1=scanning 2=complete
-//   0x0151-0x0154  present[4]       64-bit ballast-present bitmask
-//   0x0155-0x0158  fading[4]        64-bit active-fade bitmask
-//   0x0159-0x015C  dirty[4]         set on block0 change, cleared on FC04 read
-//   0x015D         raw_cmd_result   high=0x00 idle, 0xFF pending, 0x01 nak, 0x02 ok, 0x03 err
-//                                   low byte: DALI response (when ok) or error subtype (when err)
-//   0x0200         version block    16-register special case (see process_fc04)
+//   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
+//   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
+//   0x0108         raw_cmd_result    high=0x00 idle, 0xFF pending, 0x01 nak, 0x02 ok, 0x03 err
+//                                    low byte: DALI response (when ok) or error subtype (when err)
+//   0x0109-0x010F  (reserved hole)   keeps group_mask anchored at 0x0110 — read returns zeroes
+//   0x0200         version block     16-register special case (see process_fc04)
+//
+// Layout note: present/dirty/raw_cmd_result sit at 0x0100-0x0108 with a 7-register
+// padding hole (_reserved) at 0x0109-0x010F so that group_mask's wire address
+// (0x0110) is preserved across this trim.  The 14-byte cost is intentional: it
+// avoids a second master-visible breaking change to FC03 group-mask reads.
 typedef struct {
-    ballast_bs_t   block0[64];
-    ballast_mm_t   block1[64];
-    ballast_pf_t   block2[64];
-    ballast_fade_t block3[64];
-    group_status_t group_status[16];
-    uint8_t        group_mask[16][8];
-    uint16_t       scan_status;
-    uint16_t       present[4];
-    uint16_t       fading[4];
-    uint16_t       dirty[4];
-    uint16_t       raw_cmd_result;   // FC04 0x015D, see RAW_RESULT_* below
+    ballast_bs_t   block0[64];          // 0x0000
+    ballast_mm_t   block1[64];          // 0x0040
+    ballast_pf_t   block2[64];          // 0x0080
+    ballast_fade_t block3[64];          // 0x00C0
+    uint16_t       present[4];          // 0x0100
+    uint16_t       dirty[4];            // 0x0104
+    uint16_t       raw_cmd_result;      // 0x0108, see RAW_RESULT_* below
+    uint16_t       _reserved[7];        // 0x0109-0x010F (anchor group_mask at 0x0110)
+    uint8_t        group_mask[16][8];   // 0x0110-0x014F (FC03 wire address unchanged)
 } register_map_t;
 
 extern register_map_t g_regs;
 
 // ---- FC04 input register addresses ----------------------------------------
 
-#define FC04_DIRTY_BASE     0x0159u  // first dirty word register (4 words: 0x0159-0x015C)
-#define FC04_DIRTY_END      0x015Cu  // last dirty word register
-#define FC04_RAW_RESULT     0x015Du  // async raw DALI command result (see RAW_RESULT_*)
+#define FC04_PRESENT_BASE   0x0100u  // first FC04 input register (start of contiguous ladder)
+#define FC04_DIRTY_BASE     0x0104u  // first dirty word register (4 words: 0x0104-0x0107)
+#define FC04_DIRTY_END      0x0107u  // last dirty word register
+#define FC04_RAW_RESULT     0x0108u  // async raw DALI command result (see RAW_RESULT_*)
+#define FC04_INPUT_END      0x0108u  // inclusive end of the contiguous FC04 ladder
 
 // ---- FC04 / FC03 special block addresses ----------------------------------
 
@@ -90,13 +92,9 @@ extern register_map_t g_regs;
 #define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
 #define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400
 
-#define SCAN_IDLE       0
-#define SCAN_SCANNING   1
-#define SCAN_COMPLETE   2
-
 #define DALI_STATUS_FADE_RUNNING 0x10
 
-// raw_cmd_result high-byte status codes (FC04 0x015D)
+// raw_cmd_result high-byte status codes (FC04 0x0108)
 #define RAW_RESULT_IDLE    0x0000u  // no command in progress
 #define RAW_RESULT_PENDING 0xFF00u  // command sent, awaiting response
 #define RAW_RESULT_NAK     0x0100u  // completed, no response (normal for send-twice)
@@ -142,7 +140,9 @@ bool     regs_write_holding(uint16_t addr, uint16_t val);
 // Called from ISR context via dali_result_received; must be short.
 void     regs_apply_result(uint8_t ballast_idx, reg_target_t target, uint8_t value);
 
-// Apply a DALI status byte: updates block0.status, the fading bitmask, and the dirty bit.
+// Apply a DALI status byte: updates block0.status and sets the dirty bit.
+// The FADE_RUNNING bit is observable directly via the status byte (bit 4) — there
+// is no separate fading bitmap to maintain.
 void     regs_apply_status(uint8_t ballast_idx, uint8_t dali_status);
 
 // Set or clear the present bit for ballast_idx in the present bitmask.
@@ -157,10 +157,6 @@ uint16_t regs_read_clear_dirty(uint8_t word_idx);
 
 // Recompute group membership for ballast_idx from a QUERY_GROUP response byte.
 // high_groups=false → groups 0-7; high_groups=true → groups 8-15.
-// Rebuilds the 8 group_status entries for the affected half only.
 void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups);
-
-// Recompute group_status[group_idx].status by ORing the status of all member ballasts.
-void     regs_rebuild_group_status(uint8_t group_idx);
 
 #endif

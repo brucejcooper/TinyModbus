@@ -181,7 +181,7 @@ The firmware is a **flag-driven state-reconciliation loop**. Every per-ballast c
 
 The main loop kicks `start_next_dali_work()` whenever DALI is idle. The work selector walks a fixed priority chain — raw command → pending group bit → SYNC_WRITE_* (rotating cursor) → SYNC_READ_LEVEL (same cursor) → continue in-progress full scan → start new full scan — and issues exactly one DALI command via `issue_dali_command()`. Cache invalidation is handled inside `issue_dali_command` as a uniform property of the command bytes — every DALI command from every source (per-ballast bank write, raw command, internal full-scan step) goes through the same chokepoint, so the invalidation logic lives once and the per-source handlers stay trivial.
 
-Completion runs in ISR context (`dali_sync_completion`) and either advances a multi-step sequence (level read = QUERY_STATUS + GET_LEVEL; multi-step write = DTR0 + SET twice + DTR0 + SET twice) or releases `dali_busy` for the next pick. Periodic level re-polls are spread evenly via the RTC-PIT cursor (one ballast per `RESCAN_INTERVAL` seconds, round-robin across all 64 slots) instead of bursting. Masters detect when reads have caught up by polling the dirty bitmap (FC04 0x0159–0x015C, read-clears).
+Completion runs in ISR context (`dali_sync_completion`) and either advances a multi-step sequence (level read = QUERY_STATUS + GET_LEVEL; multi-step write = DTR0 + SET twice + DTR0 + SET twice) or releases `dali_busy` for the next pick. Periodic level re-polls are spread evenly via the RTC-PIT cursor (one ballast per `RESCAN_INTERVAL` seconds, round-robin across all 64 slots) instead of bursting. Masters detect when reads have caught up by polling the dirty bitmap (FC04 0x0104–0x0107, read-clears).
 
 There is no command queue, no event-callback chain, and no synchronous DALI work in the main loop. State *is* the protocol; events are derived from state changes; ISRs only set/clear flags or update cache cells.
 
@@ -316,7 +316,7 @@ Settings:
 
 - `RESCAN_INTERVAL = 0` — disabled (cursor never advances, no automatic polls).
 - `RESCAN_INTERVAL = 1` — 1 ballast/s, full cycle in 64 s. Equivalent per-ballast polling rate to the old default 64 s burst, but spread evenly. Recommended for installations that need fast drift detection.
-- `RESCAN_INTERVAL = 64` (default) — 1 ballast/min, full cycle ≈ 68 min. Recommended when masters rely on the dirty bitmap (FC04 0x0159–0x015C) for change notification rather than firmware-driven polls.
+- `RESCAN_INTERVAL = 64` (default) — 1 ballast/min, full cycle ≈ 68 min. Recommended when masters rely on the dirty bitmap (FC04 0x0104–0x0107) for change notification rather than firmware-driven polls.
 - Larger values trade slower drift detection for even lower bus load.
 
 The default is intentionally conservative; the firmware does not change it. Tune via `make configure RESCAN_INTERVAL=...` as needed.
@@ -340,7 +340,7 @@ The slave address (1–247) is stored in EEPROM (holding register 0x1012, persis
 | Code | Name | Description |
 |------|------|-------------|
 | 0x03 | Read Holding Registers | Read per-ballast cache, group masks, and gateway config (max 16 regs per request) |
-| 0x04 | Read Input Registers | Read scan/presence/fading/dirty bitmaps, raw-command result, version block |
+| 0x04 | Read Input Registers | Read presence + dirty bitmaps, raw-command result, version block |
 | 0x06 | Write Single Holding Register | Update per-ballast cache, group mask, raw command, or gateway config |
 | 0x10 | Write Multiple Holding Registers | Write a contiguous block of holding registers |
 
@@ -352,15 +352,12 @@ Read-only state derived from DALI traffic. Registers are 16-bit, addressed from 
 
 | Address range | Width | Content |
 |---------------|-------|---------|
-| 0x0100–0x010F | 16 regs | Group status — OR of all member ballast status bytes |
-| 0x0150 | 1 reg | Scan status: 0 = idle, 1 = scanning, 2 = complete |
-| 0x0151–0x0154 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
-| 0x0155–0x0158 | 4 regs | Fading bitmask — set when DALI status fade-running bit is active |
-| 0x0159–0x015C | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
-| 0x015D | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
+| 0x0100–0x0103 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
+| 0x0104–0x0107 | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
+| 0x0108 | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
 | 0x0200–0x020F | 16 regs | Version string: `DALI v<maj>.<min> <10-byte-serial-as-20-hex-chars>` — read exactly 16 registers |
 
-FC04 reads outside these ranges return `ILLEGAL_ADDRESS`. The per-ballast banks formerly at 0x0000–0x00FF and the group membership masks formerly at 0x0110–0x014F have moved to the holding-register map below — this is a breaking change from earlier firmware revisions.
+A master can fetch presence + dirty in a single 8-register FC04 read at 0x0100. FC04 reads outside these ranges return `ILLEGAL_ADDRESS`. The per-ballast banks formerly at 0x0000–0x00FF and the group membership masks formerly at 0x0110–0x014F have moved to the holding-register map below — this is a breaking change from earlier firmware revisions.
 
 ### FC03/FC06/FC10 — Holding Register Map
 
@@ -374,11 +371,11 @@ Per-ballast cached DALI state (read-write) and gateway control registers.
 | 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time. Both bytes consumed on write. |
 | 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group). Writes are predictively cached and propagate per-bit via ADD_TO_GROUP / REMOVE_FROM_GROUP DALI commands by the work selector. |
 
-**Per-ballast bank writes ACK immediately at the Modbus layer.**  The actual DALI command that pushes the change to the ballast is dispatched asynchronously by the sync-flag work selector — the master no longer blocks waiting for DALI propagation.  To detect when reconciliation has completed, poll the dirty bitmap (FC04 0x0159-0x015C, read-clears semantics).  This is a behavioural change vs pre-refactor firmware where writes blocked until DALI completion.
+**Per-ballast bank writes ACK immediately at the Modbus layer.**  The actual DALI command that pushes the change to the ballast is dispatched asynchronously by the sync-flag work selector — the master no longer blocks waiting for DALI propagation.  To detect when reconciliation has completed, poll the dirty bitmap (FC04 0x0104-0x0107, read-clears semantics).  This is a behavioural change vs pre-refactor firmware where writes blocked until DALI completion.
 
 | Address | Name | Read | Write |
 |---------|------|------|-------|
-| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x015D. Returns DEVICE_BUSY if previous result not yet read. |
+| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x0108. Returns DEVICE_BUSY if previous result not yet read. |
 | 0x1001 | RAW_CMD_TWICE | 0 | Same frame format as 0x1000 but sent twice within the DALI 100 ms re-send window (used for SET / INITIALISE / RANDOMISE). |
 | 0x100B | SET_DTR0 | 0 | Low byte = value to load into DALI DTR0. |
 | 0x100C | SET_DTR1 | 0 | Low byte = value to load into DALI DTR1. |
@@ -390,9 +387,9 @@ Per-ballast cached DALI state (read-write) and gateway control registers.
 
 The DALI address byte for raw command registers (0x1000, 0x1001) can be any valid DALI address byte — short address, group address, broadcast (0xFE), or special command (e.g. 0xA3 SET_DTR0).  Cache invalidation runs uniformly on every issued command via `issue_dali_command`, regardless of the master's choice between the per-ballast bank shortcut and a raw command — neither path needs explicit invalidation logic at the call site.
 
-### Async Raw Command Result (FC04 0x015D)
+### Async Raw Command Result (FC04 0x0108)
 
-After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 0x015D for the result.  Reading the register at a terminal state (high byte 0x01 / 0x02 / 0x03) returns the value AND clears it back to 0x0000 atomically — so the master can detect completion in a single FC04 read without a follow-up clear write.
+After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 0x0108 for the result.  Reading the register at a terminal state (high byte 0x01 / 0x02 / 0x03) returns the value AND clears it back to 0x0000 atomically — so the master can detect completion in a single FC04 read without a follow-up clear write.
 
 | High byte | Low byte | Meaning |
 |-----------|----------|---------|
@@ -406,11 +403,11 @@ After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 
 
 Brightness register writes are **predictive**: the master writes a new level to the per-ballast brightness register (0x0000–0x003F low byte), the firmware updates the cached value immediately, sets `SYNC_WRITE_LEVEL` on that ballast, and ACKs the Modbus write at the wire layer. The DALI DAPC command that pushes the level to the ballast is dispatched asynchronously by the work selector when DALI is next idle — typically within a few milliseconds, but the master is no longer blocked. Once the DAPC completes, the per-ballast dirty bit is set; on the next master read of the brightness bank, the dirty bit clears.
 
-There is no separate fade-polling chain. When a DALI status query reports the FADE_RUNNING bit set, the level cache stays "stale" via the rotating `SYNC_READ_LEVEL` cursor until the next periodic re-poll (round-robin via `RESCAN_INTERVAL`) finds the level settled. The FC04 fading bitmask (0x0155–0x0158) reflects the most recent DALI status byte's FADE_RUNNING bit. Masters that need fast fade visibility should lower `RESCAN_INTERVAL` toward 1 (cycle in 64 s) or trigger explicit re-reads, and poll the dirty bitmap (0x0159–0x015C) for change notification.
+There is no separate fade-polling chain. The fade-running indicator is bit 4 of the per-ballast status byte (FC03 0x0000–0x003F high byte), updated whenever a `SYNC_READ_LEVEL` pass issues `QUERY_STATUS` against that ballast. The work selector visits each ballast on the round-robin cursor (one per `RESCAN_INTERVAL` seconds), so a fade in progress is detected the next time the cursor reaches it; the dirty bit (0x0104–0x0107) flips on every status-byte change and notifies the master that a fresh read of block0 is worth doing. Masters that need fast fade visibility should lower `RESCAN_INTERVAL` toward 1 (full cycle in 64 s) or trigger an explicit `SCAN_TRIGGER` re-discovery, then watch the dirty bitmap and re-read block0 to observe FADE_RUNNING clearing.
 
 ### Multi-Master Operation
 
-The firmware is designed to operate as the sole DALI master on its bus. It can detect when another master is transmitting (rising edge on the RX pin) and will yield rather than collide — but it does not decode traffic it did not initiate. If another DALI master changes ballast levels, the FC04 register data will remain stale until the next round-robin level re-poll visits the affected ballast (full cycle = `RESCAN_INTERVAL × 64` seconds) or a `SCAN_TRIGGER` re-discovery. For reliable register state, use this device as the exclusive DALI master, lower `RESCAN_INTERVAL` toward 1, or have the master poll the dirty bitmap (FC04 0x0159-0x015C) for change notification.
+The firmware is designed to operate as the sole DALI master on its bus. It can detect when another master is transmitting (rising edge on the RX pin) and will yield rather than collide — but it does not decode traffic it did not initiate. If another DALI master changes ballast levels, the FC04 register data will remain stale until the next round-robin level re-poll visits the affected ballast (full cycle = `RESCAN_INTERVAL × 64` seconds) or a `SCAN_TRIGGER` re-discovery. For reliable register state, use this device as the exclusive DALI master, lower `RESCAN_INTERVAL` toward 1, or have the master poll the dirty bitmap (FC04 0x0104-0x0107) for change notification.
 
 ---
 
@@ -464,12 +461,13 @@ make configure SLAVE_ADDR=42 BAUD_INDEX=2 RESCAN_INTERVAL=30
 
 The flag-driven refactor (branch `task-1-flag-driven`) introduces several wire-protocol-visible changes. Masters built against earlier firmware revisions need the following adjustments:
 
-- **Writes ACK at the Modbus wire layer, not at DALI completion.** Per-ballast bank writes (0x0000–0x00FF), group-mask writes (0x0110–0x014F), and raw command writes (0x1000 / 0x1001) all return their normal echo-style ACK as soon as the cache is updated and the work is armed. The DALI command that pushes the change to the ballast is dispatched asynchronously by the work selector. Masters that previously took the write-ACK as "ballast confirmed" must switch to **dirty-bit polling** (FC04 0x0159–0x015C, read-clears) to detect when the change has propagated.
+- **Writes ACK at the Modbus wire layer, not at DALI completion.** Per-ballast bank writes (0x0000–0x00FF), group-mask writes (0x0110–0x014F), and raw command writes (0x1000 / 0x1001) all return their normal echo-style ACK as soon as the cache is updated and the work is armed. The DALI command that pushes the change to the ballast is dispatched asynchronously by the work selector. Masters that previously took the write-ACK as "ballast confirmed" must switch to **dirty-bit polling** (FC04 0x0104–0x0107, read-clears) to detect when the change has propagated.
 - **Per-ballast cache addresses moved from FC04 (input regs) to FC03 (holding regs).** Addresses 0x0000–0x00FF (status/brightness, min/max, power-on/sys-fail, fade rate/time) and 0x0110–0x014F (group masks) are now read via FC03 and written via FC06/FC10. Reading them via FC04 returns `ILLEGAL_ADDRESS`.
 - **Coil function codes (FC01 / FC05 / FC0F) removed.** All three return `ILLEGAL_FUNCTION`. Masters that used FC05 / FC0F to drive ON/OFF should write the brightness register low byte (0 = off, ≥1 = on / proportional). FC01 (read coils) likewise has no replacement; read the brightness bank via FC03 instead.
 - **Action holding registers 0x1002–0x100A removed.** DAPC at 0x1002, GOTO_LAST_ACTIVE at 0x1003, OFF/UP/DOWN/STEP_UP/STEP_DOWN/RECALL_MAX/RECALL_MIN at 0x1004–0x100A all return `ILLEGAL_ADDRESS`. DAPC is now done via the brightness register (0x0000–0x003F); the rest are issued via the raw command channel (0x1000 / 0x1001).
 - **`RESCAN_INTERVAL` (0x1011) semantic change.** Previously "seconds between full-bus burst rescans"; now "seconds between single-ballast level polls" via the round-robin cursor. Same address, same units, very different cycle time at the same numeric value. See the *Periodic Rescan* section above.
-- **Async raw command pending state uses `0xFFnn` with non-zero low byte.** The 0x015D pending encoding is `0xFF02` (after writing 0x1001 RAW_CMD_TWICE) or `0xFF01` (after writing 0x1000 RAW_CMD); the low byte does NOT decrement mid-twice-send (the firmware transitions directly from `0xFF02` to the terminal value once both sends complete). Masters that strict-equal `value == 0xFF00` for "still pending" will miss both initial arming states; match the high byte instead (`(value & 0xFF00) == 0xFF00`).
+- **Async raw command pending state uses `0xFFnn` with non-zero low byte.** The 0x0108 pending encoding is `0xFF02` (after writing 0x1001 RAW_CMD_TWICE) or `0xFF01` (after writing 0x1000 RAW_CMD); the low byte does NOT decrement mid-twice-send (the firmware transitions directly from `0xFF02` to the terminal value once both sends complete). Masters that strict-equal `value == 0xFF00` for "still pending" will miss both initial arming states; match the high byte instead (`(value & 0xFF00) == 0xFF00`).
+- **FC04 input register layout cleaned up (subtask 8).** Present, dirty, and raw-command-result moved down to a contiguous block at 0x0100–0x0108: present[4] at 0x0100–0x0103, dirty[4] at 0x0104–0x0107, raw_cmd_result at 0x0108. The fading bitmap (formerly 0x0155–0x0158), group_status array (formerly 0x0100–0x010F), and scan_status (formerly 0x0150) are removed entirely — they were derivable from the per-ballast status byte / group_mask, or vestigial from the pre-flag-driven era. Masters that read presence/dirty/raw_result must update their addresses; the master-visible group_mask range at FC03 0x0110–0x014F is intentionally preserved by a 14-byte padding hole inside `register_map_t`. Fade-running detection switches from the removed bitmap to bit 4 of the per-ballast status byte at FC03 0x0000–0x003F (high byte).
 
 ## Known Limitations
 

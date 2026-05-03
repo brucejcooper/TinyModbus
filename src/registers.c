@@ -153,8 +153,9 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         return true;
     }
     // Group membership masks 0x0110-0x014F: 16 groups × 4 registers (8 bytes
-    // each).  Same direct-offset trick — group_mask[16][8] sits right after
-    // group_status[16] in register_map_t.
+    // each).  Same direct-offset trick — group_mask[16][8] is anchored at
+    // struct offset 0x0220 (= 0x0110 * 2) by the present/dirty/raw + 14-byte
+    // _reserved padding hole that precedes it in register_map_t.
     if (addr >= 0x0110u && addr <= 0x014Fu) {
         const uint8_t *p = (const uint8_t *)&g_regs + (uint16_t)addr * 2u;
         *val = ((uint16_t)p[0] << 8) | p[1];
@@ -310,7 +311,6 @@ void regs_apply_result(uint8_t idx, reg_target_t target, uint8_t value) {
 
 void regs_apply_status(uint8_t idx, uint8_t dali_status) {
     g_regs.block0[idx].status = dali_status;
-    bm_set(g_regs.fading, idx, (dali_status & DALI_STATUS_FADE_RUNNING) != 0);
     bm_set(g_regs.dirty,  idx, true);
 }
 
@@ -325,13 +325,6 @@ void regs_clear_ballast(uint8_t idx) {
     memset(&g_regs.block2[idx], 0, sizeof(ballast_pf_t));
     memset(&g_regs.block3[idx], 0, sizeof(ballast_fade_t));
     regs_set_present(idx, false);
-    bm_set(g_regs.fading, idx, false);
-    uint8_t byte_idx = idx >> 3;
-    uint8_t bit_mask = (uint8_t)(1u << (idx & 7u));
-    for (uint8_t g = 0; g < 16; g++) {
-        if (g_regs.group_mask[g][byte_idx] & bit_mask)
-            regs_rebuild_group_status(g);
-    }
 }
 
 uint16_t regs_read_clear_dirty(uint8_t word_idx) {
@@ -354,16 +347,4 @@ void regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups)
         else
             g_regs.group_mask[base + group_idx][byte_idx] &= ~bit_mask;
     }
-
-    for (uint8_t group_idx = 0; group_idx < 8; group_idx++)
-        regs_rebuild_group_status(base + group_idx);
-}
-
-void regs_rebuild_group_status(uint8_t group_idx) {
-    uint8_t merged_status = 0;
-    for (uint8_t ballast_idx = 0; ballast_idx < 64; ballast_idx++) {
-        if (g_regs.group_mask[group_idx][ballast_idx >> 3] & (1u << (ballast_idx & 7u)))
-            merged_status |= g_regs.block0[ballast_idx].status;
-    }
-    g_regs.group_status[group_idx].status = merged_status;
 }

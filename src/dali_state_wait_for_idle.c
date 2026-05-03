@@ -1,75 +1,47 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
-#include <avr/sleep.h>
 #include <stdbool.h>
-#include <util/atomic.h>
-#include <util/delay.h>
 
 #include "dali.h"
-#include "timers.h"
+#include "tick.h"
 
-// The DALi Specification says that the bus must be idle for 22 Te (half byte periods) between commands.
-#define IDLE_THRESHOLD_TE 22
+#define IDLE_THRESHOLD_TE   22u   // minimum bus-idle period before next TX
+#define BUS_STUCK_TIMEOUT_TE 200u  // escape hatch (~83 ms) if bus never goes idle
 
-// If the bus stays active longer than this, something is wrong (ballast fault, wiring short, etc.).
-// Force the state machine out of WAIT_FOR_IDLE rather than hanging forever.
-// 200 Te x 416.67 µs ≈ 83 ms - well beyond any legitimate DALI frame.
-#define BUS_STUCK_TIMEOUT_TE 200
+static void on_bus_shorted(void);
 
-static void onBusShorted();
-
-
-/**
- * @brief Called when the timeout occurs (only enabled when line is released).
- * This is good. It means that the line has been idle for enough time.
- */
-static void idlePeriodExprired() {
+// The 22 TE quiet period has elapsed; the bus is clean - dispatch the next command.
+static void idle_period_expired(void) {
     dali_cancel_edge_detect();
     dali_idle_state_enter();
 }
 
-static void onIdleBus() {
-    // When entered from PORT_vect (LVL0) the previous state's daliTimer is still mid-countdown.
-    // Zero it BEFORE the callback rewrites - we have two non-atomic 16-bit pointer writes coming
-    // (dali_rx_callback inside dali_call_on_rising_once, then daliTimerCallback below). If the
-    // old daliTimerCallback fires from TCA0 LVL1 mid-write, both pointers can end up torn.
-    // Suppressing the dispatch up front closes both windows.
-    daliTimer = 0;
-    dali_call_on_rising_once(onBusShorted);
-    daliTimerCallback = idlePeriodExprired;
-    daliTimer = IDLE_THRESHOLD_TE;
+// Bus just went low (idle): start the 22 TE countdown and watch for collisions.
+static void on_idle_bus(void) {
+    dali_call_on_rising_once(on_bus_shorted);
+    dali_timer_cb = idle_period_expired;
+    dali_timer    = IDLE_THRESHOLD_TE;
 }
 
-/**
- * @brief Bus has been stuck active (low) for too long - escape the wait.
- * Releases our TX pin defensively, cancels edge detection, and returns to the
- * idle state. The state machine will attempt to transmit or wait for a new
- * command. If the external fault persists it will re-enter this path and keep
- * retrying rather than hanging indefinitely.
- */
-static void busStuckTimeout() {
+// Safety escape: bus held high for 200 TE without clearing.
+// Force TX low (release any stuck open-drain drive) and recover.
+static void bus_stuck_timeout(void) {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     dali_cancel_edge_detect();
     dali_idle_state_enter();
 }
 
-static void onBusShorted() {
-    // Suppress the previous state's daliTimerCallback dispatch up front so neither of the two
-    // non-atomic 16-bit pointer writes that follow (dali_rx_callback inside dali_call_on_low_once,
-    // then daliTimerCallback) can be torn by TCA0 LVL1 firing the old callback mid-write.
-    daliTimer = 0;
-    // Wait for the bus to return to idle (RX pin goes low).
-    dali_call_on_low_once(onIdleBus);
-    // Safety net: if the bus never recovers, escape after BUS_STUCK_TIMEOUT_TE.
-    daliTimerCallback = busStuckTimeout;
-    daliTimer = BUS_STUCK_TIMEOUT_TE;
+// Bus went high - another master is active, or a collision occurred.
+// Wait for it to release the bus (go low), then begin the idle countdown.
+static void on_bus_shorted(void) {
+    dali_call_on_low_once(on_idle_bus);
+    dali_timer_cb = bus_stuck_timeout;
+    dali_timer    = BUS_STUCK_TIMEOUT_TE;
 }
 
-extern void dali_wait_for_idle_state_enter() {
-    // Perform an initial inspection of the bus state.  If its shorted, we need to wait for it to go lower.
-    if (dali_is_bus_shorted()) {
-        onBusShorted();
-    } else {
-        onIdleBus();
-    }
+void dali_wait_for_idle_state_enter(void) {
+    if (dali_is_bus_active())
+        on_bus_shorted();
+    else
+        on_idle_bus();
 }

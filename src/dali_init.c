@@ -1,114 +1,87 @@
-
 #include <avr/interrupt.h>
 #include <avr/io.h>
-#include <avr/sleep.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <util/atomic.h>
-#include <util/delay.h>
 
 #include "dali.h"
+#include "tick.h"
 
-// Good documentation for Dali commands - https://www.nxp.com/files-static/microcontrollers/doc/ref_manual/DRM004.pdf
+// One-shot callback pointer armed by dali_call_on_rising_once / dali_call_on_low_once.
+// Cleared by the ISR immediately before firing so it cannot fire twice.
+//
+// PORTB_PORT_vect runs at LVL0 and reads this pointer with two LDS instructions; TCB0
+// (LVL1) can preempt during the read and rewrite the pointer through the
+// cmdq_result_received chain (which calls dali_idle_state_enter / dali_call_on_rising_once).
+// Both reads and LVL0 writes are wrapped in ATOMIC_BLOCK to keep the 16-bit access
+// uninterruptible.
+void (*dali_rx_callback)(void) = NULL;
 
-/**
- * @brief Current handler for the DALI RX pin interrupt - used for both rising-edge (start of
- * external transmission) and level-low (bus released) one-shot waits. May be NULL to do nothing.
- */
-void (*dali_rx_callback)() = NULL;
-
-// PIT fires once per second; trigger a full bus rescan every RESCAN_PERIOD seconds.
-#define RESCAN_PERIOD 64
-
-
-static volatile uint8_t rescan_counter = RESCAN_PERIOD;
-
-
-void dali_init() {
-    // Transmission set up
+void dali_init(void) {
+    // TX: output, initially low (open-drain, OUTCLR stays low - only DIR is toggled)
     DALI_PORT.OUTCLR = DALI_TX_bm;
     DALI_PORT.DIRSET = DALI_TX_bm;
 
-    // Receiving set up
+    // RX: input, no pull
     DALI_PORT.OUTCLR = DALI_RX_bm;
     DALI_PORT.DIRCLR = DALI_RX_bm;
 
-    // We use TCB0 to process inputs, using events
-    TCB0.CTRLB = TCB_CNTMODE_FRQ_gc;  // Put it in Capture Frequency Measurement mode.
-    // Set up event systemt to route DALI RX change events to channel 0.
-    EVSYS.ASYNCCH1 = EVSYS_ASYNCCH1_PORTB_PIN1_gc;    // Make BP2 send asyncch1 event.
-    EVSYS.ASYNCUSER0 = EVSYS_ASYNCUSER0_ASYNCCH1_gc;  // Set TCB0 to use ASYNCHCH1
+    // TCB0 in Frequency Measurement mode for RX edge capture
+    TCB0.CTRLB = TCB_CNTMODE_FRQ_gc;
+    EVSYS.ASYNCCH1    = EVSYS_ASYNCCH1_PORTB_PIN1_gc;
+    EVSYS.ASYNCUSER0  = EVSYS_ASYNCUSER0_ASYNCCH1_gc;
 
-    dali_state_init();  // Initialise the state machine.
-
-    // Set up the PIT to go off occasionally to scan the dali devices and feed the WDT
-
-    // Run off internal 1Khz clock;
+    // RTC PIT for periodic bus rescan (1 kHz internal osc, fires every ~1 s)
     RTC.CLKSEL = RTC_CLKSEL_INT1K_gc;
+    while (RTC.PITSTATUS & RTC_CTRLABUSY_bm) {}
+    RTC.PITCTRLA   = RTC_PERIOD_CYC1024_gc | RTC_PITEN_bm;
+    RTC.PITINTCTRL = RTC_PI_bm;
 
-    // Turn the PIT on, to execute every 8ish seconds.
-    while (RTC.PITSTATUS & RTC_CTRLABUSY_bm) {};
-    RTC.PITCTRLA = RTC_PERIOD_CYC1024_gc | RTC_PITEN_bm;
-    RTC.PITINTCTRL = RTC_PI_bm; // Enable PIT interrupts. 
-
-    // We start in the reset state (which we should exit in short order).
+    // Start in wait-for-idle to let the bus settle after reset
     dali_wait_for_idle_state_enter();
 }
 
-/**
- * @brief Reads the current DALI bus state.
- *
- * @return uint8_t 1 for shorted, 0 for released...
- */
-uint8_t dali_is_bus_shorted() {
-    return DALI_PORT.IN & DALI_RX_bm ? 1 : 0;
-    // return  AC0.STATUS & AC_STATE_bm ? 0 : 1;
+uint8_t dali_is_bus_active(void) {
+    return (DALI_PORT.IN & DALI_RX_bm) ? 1u : 0u;
 }
 
-void dali_call_on_rising_once(void (*callback)()) {
-    dali_rx_callback = callback;
-    DALI_PORT.INTFLAGS = DALI_RX_bm;                 // Clear any pending interrupts.
-    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_RISING_gc;  // Enable ISR 
+void dali_call_on_rising_once(void (*callback)(void)) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_rx_callback = callback;
+    }
+    DALI_PORT.INTFLAGS       = DALI_RX_bm;
+    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_RISING_gc;
 }
 
-void dali_call_on_low_once(void (*callback)()) {
-    dali_rx_callback = callback;
-    DALI_PORT.INTFLAGS = DALI_RX_bm;                // Clear any pending interrupts.
-    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_LEVEL_gc;  // Enable ISR 
+void dali_call_on_low_once(void (*callback)(void)) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_rx_callback = callback;
+    }
+    DALI_PORT.INTFLAGS       = DALI_RX_bm;
+    DALI_PORT.DALI_RX_PINCTRL = PORT_ISC_LEVEL_gc;
 }
 
-void dali_cancel_edge_detect() {
+void dali_cancel_edge_detect(void) {
     DALI_PORT.DALI_RX_PINCTRL = 0;
-    dali_rx_callback = NULL;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        dali_rx_callback = NULL;
+    }
 }
 
-// This controls the one-shot event on rising for detecting the start of data.
 ISR(PORTB_PORT_vect) {
+    // Clear INTFLAGS at the start of the ISR so an edge that arrives after the callback
+    // re-arms PINCTRL (e.g. start_receiving_response → dali_state_receiving_prepare)
+    // is not clobbered by a trailing flag-clear at the end of this handler.
     if (DALI_PORT.INTFLAGS & DALI_RX_bm) {
-        // Clear the flag for the edge that fired this ISR up front. If we cleared at the end,
-        // any new edge that arrived after the callback re-armed PINCTRL would have its flag
-        // wiped by the trailing clear, and we'd miss it.
         DALI_PORT.INTFLAGS = DALI_RX_bm;
-        DALI_PORT.DALI_RX_PINCTRL = 0;  // Disable until the callback re-arms.
-        // dali_rx_callback is a 16-bit function pointer; this ISR runs at LVL0 and can be
-        // preempted by TCA0 LVL1, whose callback chains rewrite dali_rx_callback. Snapshot
-        // the pointer atomically so we never call a torn (partly-old / partly-new) value.
-        void (*cb)();
+        DALI_PORT.DALI_RX_PINCTRL = 0;
+
+        // Snapshot the 16-bit pointer atomically: TCB0 (LVL1) can preempt this LVL0 ISR
+        // and rewrite dali_rx_callback through the cmdq_result_received chain.
+        void (*cb)(void);
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             cb = dali_rx_callback;
         }
-        if (cb) {
+        if (cb)
             cb();
-        }
     }
-}
-
-
-ISR(RTC_PIT_vect) {
-    if (--rescan_counter == 0) {
-        // pulse_led(2);
-        dali_start_background_scan(0);
-        rescan_counter = RESCAN_PERIOD;
-    }
-    RTC.PITINTFLAGS = RTC_PI_bm; // Clear the flag.
 }

@@ -1,160 +1,119 @@
-/* 
-  DALI master, useable as a multi-switch controller.  Programmed (via UPDI, or UART?) to respond to button presses
-  by sending out DALI commands to dim 
-*/
-
-#ifndef __DALI_H__
-#define __DALI_H__
+#ifndef DALI_H
+#define DALI_H
 
 #include <inttypes.h>
 #include <stdbool.h>
 #include <avr/io.h>
+#include "types.h"
+#include "tick.h"
 
-typedef enum { 
-    DALI_OK = 0, 
-    DALI_ERR_COLLISION_DETECTED,
-    DALI_ERR_INVALID_STATE,
-    DALI_ERR_NO_START_BIT,
-    DALI_ERR_NOT_FOR_ME,
-    DALI_ERR_CORRUPT_READ,
-    DALI_ERR_QUEUEFULL,
-} dali_result_t;
+// ---- Protocol constants ------------------------------------------------
 
-#define DALI_CMD_GET_LEVEL 0x1a0
-#define DALI_CMD_QUERY_STATUS 0x190
-#define DALI_CMD_GOTO_LAST_ACTIVE 0x10a
-#define DALI_CMD_GET_MIN 0x1a2
-#define DALI_CMD_SET_MIN 0x12b
-#define DALI_CMD_GET_MAX 0x1a1
-#define DALI_CMD_SET_MAX 0x12a
-#define DALI_CMD_GET_FADE 0x1a5
-#define DALI_CMD_SET_FADE_TIME 0x12e
-#define DALI_CMD_GET_EXT_FADE 0x1a8
-#define DALI_CMD_SET_FADE_RATE 0x12f
-#define DALI_CMD_GET_POWER_ON_LEVEL 0x1a3
-#define DALI_CMD_SET_POWER_ON_LEVEL 0x12d
-#define DALI_CMD_GET_POWER_FAIL_LEVEL 0x1a4
-#define DALI_CMD_SET_POWER_FAIL_LEVEL 0x12c
-#define DALI_CMD_GET_GROUPS0_7 0x1c0
-#define DALI_CMD_GET_GROUPS8_15 0x1c1
-#define DALI_CMD_ADD_TO_GROUP 0x160
-#define DALI_CMD_REMOVE_FROM_GROUP 0x170
-#define DALI_CMD_OFF 0x100
-#define DALI_CMD_SET_DTR0 0xa300
+#define DALI_BAUD             1200
+#define DALI_BIT_USECS        (1000000.0 / DALI_BAUD)
+#define DALI_HALF_BIT_USECS   (DALI_BIT_USECS / 2.0)
+#define DALI_MAX_DEVICES      64
 
+// ---- Address encoding --------------------------------------------------
 
+#define DALI_SHORT_ADDR(n)  ((uint8_t)(((n) & 0x3Fu) << 1u))
+#define DALI_GROUP_ADDR(n)  ((uint8_t)(0x80u | (((n) & 0x0Fu) << 1u)))
+#define DALI_BROADCAST      0xFEu
+#define DALI_CMD_FLAG       0x01u   // set bit 0 for command (vs DAPC)
 
-#define DALI_BAUD                   (1200)
-#define DALI_BIT_USECS              (1000000.0/DALI_BAUD)
-#define DALI_HALF_BIT_USECS         (DALI_BIT_USECS/2.0)
-#define DALI_MAX_DEVICES            (64)
-#define DALI_DECODE_ADDR(cmd)       (((cmd) >> 9) & 0x3F)
+// ---- DALI commands (low byte of 16-bit frame) --------------------------
 
+#define DALI_CMD_OFF                  0x00u
+#define DALI_CMD_UP                   0x01u
+#define DALI_CMD_DOWN                 0x02u
+#define DALI_CMD_STEP_UP              0x03u
+#define DALI_CMD_STEP_DOWN            0x04u
+#define DALI_CMD_RECALL_MAX           0x05u
+#define DALI_CMD_RECALL_MIN           0x06u
+#define DALI_CMD_GOTO_LAST_ACTIVE     0x0Au
+#define DALI_CMD_QUERY_STATUS         0x90u
+#define DALI_CMD_QUERY_ACTUAL_LEVEL   0xA0u
+#define DALI_CMD_QUERY_MIN_LEVEL      0xA1u
+#define DALI_CMD_QUERY_MAX_LEVEL      0xA2u
+#define DALI_CMD_QUERY_POWER_ON_LEVEL 0xA3u
+#define DALI_CMD_QUERY_FAIL_LEVEL     0xA4u
+// QUERY_FADE_TIME_FADE_RATE returns one byte: high nibble = fade time
+// (0..15), low nibble = fade rate (0..15).  Both fields refresh from this
+// single query.  (DALI opcode 0xA6 is reserved by IEC 62386-102 - never
+// issue it.)
+#define DALI_CMD_QUERY_FADE_TIME_FADE_RATE  0xA5u
+#define DALI_CMD_QUERY_GROUP_0_7      0xC0u
+#define DALI_CMD_QUERY_GROUP_8_15     0xC1u
 
-// The DALI configuration - PB3 for transmit - PB2 for receive.
-#define DALI_PORT PORTB
-#define DALI_TX_bm PIN0_bm
-#define DALI_RX_bm PIN1_bm
-#define DALI_RX_PINCTRL PIN1CTRL
+// Configuration commands - require SEND_TWICE; DTR0 loaded with new value first
+#define DALI_CMD_SET_MAX_LEVEL        0x2Au
+#define DALI_CMD_SET_MIN_LEVEL        0x2Bu
+#define DALI_CMD_SET_SYS_FAIL_LEVEL   0x2Cu
+#define DALI_CMD_SET_POWER_ON_LEVEL   0x2Du
+#define DALI_CMD_SET_FADE_TIME        0x2Eu
+#define DALI_CMD_SET_FADE_RATE        0x2Fu
 
-// All values fit in a uint8_t so the daliResponseType variable (declared as uint8_t in rs485.c)
-// can be read and written atomically from main and ISR contexts without ATOMIC_BLOCK.
-// dali_response_to_err in rs485.c relies on PULSE_TOO_SHORT..PULSE_TOO_LONG being sequential
-// after MALFORMED, and on the SHORT range covering 16 contiguous values.
-typedef enum {
-  DALI_RESPONSE_OK = 0,
-  DALI_RESPONSE_NAK = 1,
-  DALI_RESPONSE_COLLISION = 2,
-  DALI_RESPONSE_MALFORMED = 3,
-  DALI_RESPONSE_PULSE_TOO_SHORT = 4,
-  DALI_RESPONSE_PULSE_IN_MIDDLE = 5,
-  DALI_RESPONSE_PULSE_TOO_LONG = 6,
-  DALI_RESPONSE_SHORT = 16,        // base for 16 short-response sub-codes (16..31)
-  DALI_RESPONSE_PENDING = 0xFF,    // sentinel; distinct from every value above
-} dali_response_type_t;
+// DTR set commands: addr byte = opcode, cmd byte = value to load
+#define DALI_ADDR_SET_DTR0  0xA3u
+#define DALI_ADDR_SET_DTR1  0xC3u
+#define DALI_ADDR_SET_DTR2  0xC5u
 
+// ---- Hardware pins -----------------------------------------------------
 
-typedef union {
-    uint16_t shortVal;
-    struct {
-        // ATMEL is little endian
-        uint8_t low;
-        uint8_t high;
-    };
-} modbus_register_t;
+#define DALI_PORT         PORTB
+#define DALI_TX_bm        PIN0_bm
+#define DALI_RX_bm        PIN1_bm
+#define DALI_RX_PINCTRL   PIN1CTRL
 
-#define DALI_STATUS_BANK 0
-#define DALI_MINMAX_BANK 1
-#define DALI_FADE_BANK 2
-#define DALI_POWER_BANK 3
-#define DALI_GROUPS_BANK 4
-#define DALI_NUM_REG_BANKS 5
+// ---- Public interface --------------------------------------------------
 
-typedef struct {
-    modbus_register_t banks[DALI_NUM_REG_BANKS][DALI_MAX_DEVICES];
-} dali_all_holding_registers_t;
-
-struct dali_command_t;
-
-typedef void (*dali_callback_t)(dali_response_type_t responseType, uint16_t cmd, uint8_t lastResponse);
-typedef bool (*dali_callback_next_t)(struct dali_command_t *cmd, dali_response_type_t responseType, uint8_t response);
-
-
-typedef struct dali_command_t {
-    uint16_t cmd;
-    dali_callback_t callback;
-    uint8_t repeat;
-} dali_command_t;
-
-
-
-extern dali_all_holding_registers_t dali_holding_regs;
-#define DALI_MAX_HOLDING_REGISTER (sizeof(dali_holding_regs) / sizeof(uint16_t))
-
-extern void dali_init();
-uint8_t dali_is_bus_shorted();
-
-
-// State management - each of these functions lives in its own source file. 
-void dali_idle_state_enter();
-extern void dali_transmitting_state_enter(dali_command_t *cmd);
-void dali_wait_for_idle_state_enter();
-
-void dali_call_on_rising_once(void (*callback)());
-void dali_call_on_low_once(void (*callback)());
-void dali_cancel_edge_detect();
-
-
-// Receiving state.
-void dali_state_receiving_prepare();
-void dali_state_receiving_enter();
-
-
-void dali_wait_for_response_state_enter();
+// True while the state machine is idle and able to accept new commands.
 extern volatile bool dali_idle;
-void process_command_response(dali_response_type_t err, uint8_t res);
-void dali_state_init();
 
+// Initialise TX/RX pins, TCB0 edge-capture, RTC PIT for periodic rescan,
+// and enter wait-for-idle to let the bus settle after reset.
+void    dali_init(void);
 
-// Commmands
-extern void dali_start_background_scan(uint8_t addr);
-extern void dali_goto_last_active(uint8_t addr, dali_callback_t callback);
-extern void dali_off(uint8_t addr, dali_callback_t callback);
-extern void dali_toggle(uint8_t addr, dali_callback_t callback);
-extern void dali_set_level(uint8_t addr, uint8_t level, dali_callback_t callback);
-extern void dali_read_level_and_status(uint8_t addr, dali_callback_t callback);
-extern void dali_custom_command(uint16_t cmd, dali_callback_t responseCallback, uint8_t repeat);
+// Returns non-zero when another master is driving the bus (RX pin HIGH after optocoupler inversion).
+uint8_t dali_is_bus_active(void);
 
+// Arm a one-shot PORTB rising-edge interrupt; fires callback once then self-disarms.
+void dali_call_on_rising_once(void (*callback)(void));
 
+// Arm a one-shot PORTB low-level interrupt; fires callback once then self-disarms.
+void dali_call_on_low_once(void (*callback)(void));
 
-extern void dali_set_min_level(uint8_t addr, uint8_t val, dali_callback_t callback);
-extern void dali_set_max_level(uint8_t addr, uint8_t val, dali_callback_t callback);
-extern void dali_set_fade_rate(uint8_t addr, uint8_t val, dali_callback_t callback);
-extern void dali_set_fade_time(uint8_t addr, uint8_t val, dali_callback_t callback);
-extern void dali_set_power_on_level(uint8_t addr, uint8_t val, dali_callback_t callback);
-extern void dali_set_power_fail_level(uint8_t addr, uint8_t val, dali_callback_t callback);
-extern void dali_add_to_group(uint8_t addr, uint8_t group, dali_callback_t callback);
+// Disarm the PORTB edge/level interrupt and clear the pending callback pointer.
+void dali_cancel_edge_detect(void);
 
-extern void dali_remove_from_group(uint8_t addr, uint8_t group, dali_callback_t callback);
+// If the queue is non-empty, begin transmitting the head command immediately.
+// Otherwise arm the bus-monitor to detect external traffic.
+void dali_idle_state_enter(void);
+
+// Begin transmitting cmd as a DALI forward frame (Manchester-encoded, 1200 baud).
+// Returns immediately; the timer ISR drives the rest of the transmission.
+void dali_transmitting_state_enter(const cmd_entry_t *cmd);
+
+// Enforce the mandatory 22 TE (~9 ms) inter-frame gap before the next TX.
+// Handles bus-shorted (another master active) by waiting for it to release first.
+// Has a 200 TE safety escape in case the bus never becomes idle.
+void dali_wait_for_idle_state_enter(void);
+
+// Arm TCB0 and a no-response timeout for the backward frame window that follows TX.
+// Must be called immediately after the last stop bit is sent.
+void dali_wait_for_response_state_enter(void);
+
+// Configure TCB0 and the Manchester decoder without enabling the timer.
+// Call this before the rising edge that starts the backward frame.
+void dali_state_receiving_prepare(void);
+
+// Enable TCB0 and begin decoding the backward frame that has already started.
+// Assumes dali_state_receiving_prepare() was called first.
+void dali_state_receiving_enter(void);
+
+// Single authority for post-command state transitions - called from ISR context.
+// Updates the target register (if any), fires the optional callback, decrements
+// repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
+void cmdq_result_received(dali_response_type_t type, uint8_t value);
 
 #endif

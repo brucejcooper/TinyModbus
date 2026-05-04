@@ -306,10 +306,11 @@ static void process_fc03(void) {
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 //
-// After subtask 5 the only registers that map to a DALI command issued from
-// here are: MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel),
-// MBREG_SET_DTR0/1/2 (control regs that load DTR0..2 with master-supplied
-// values), and MBREG_SCAN_TRIGGER (sets SYNC_READ_FULL on all ballasts).
+// After subtask 9 the only registers that map to a DALI command issued from
+// here are: MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel)
+// and MBREG_SCAN_TRIGGER (sets SYNC_READ_FULL on all ballasts).  The DTR
+// setter convenience regs were removed — the master can issue the same
+// effect via the raw channel (e.g. write 0xA3VV to 0x1000 to load DTR0).
 // Per-ballast bank writes (0x0000-0x00FF) and group register writes
 // (0x0110-0x014F) are handled directly by regs_write_holding via the
 // SYNC_WRITE_* / group_write paths and do not reach this function.
@@ -332,16 +333,6 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
             for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
                 sync_flags_set(i, SYNC_READ_FULL);
         }
-        return 0;
-    }
-    if (mb_reg == MBREG_SET_DTR0 || mb_reg == MBREG_SET_DTR1 || mb_reg == MBREG_SET_DTR2) {
-        // SET_DTR0/1/2 = special DALI commands (no target ballast).
-        // Address byte is the DTR opcode; data byte is the value.
-        uint8_t dtr_addr = (mb_reg == MBREG_SET_DTR0) ? DALI_ADDR_SET_DTR0 :
-                           (mb_reg == MBREG_SET_DTR1) ? DALI_ADDR_SET_DTR1 :
-                                                        DALI_ADDR_SET_DTR2;
-        if (!dali_sync_arm_raw(dtr_addr, (uint8_t)val, 1u))
-            return MB_ERR_DEVICE_BUSY;
         return 0;
     }
     return 0;
@@ -414,16 +405,16 @@ static void process_fc10(void) {
     }
 
     // Pre-flight: refuse if more than one register in the FC10 range
-    // is a raw-arming target (raw / DAPC / action / DTR / coil) and the
-    // raw channel is busy.  dali_sync_arm_raw enforces single-command
+    // is a raw-arming target (MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE) and
+    // the raw channel is busy.  dali_sync_arm_raw enforces single-command
     // semantics, so we just need to refuse outright if the master
-    // bunched several action-style registers into one FC10 — only the
+    // bunched several raw-command registers into one FC10 — only the
     // first would be staged.
     {
         uint8_t arm_targets = 0;
         for (uint16_t i = 0; i < count; i++) {
             uint16_t r = addr + i;
-            if (r >= MBREG_RAW_CMD && r <= MBREG_SET_DTR2)
+            if (r == MBREG_RAW_CMD || r == MBREG_RAW_CMD_TWICE)
                 arm_targets++;
         }
         if (arm_targets > 1u) {

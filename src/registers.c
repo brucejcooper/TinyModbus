@@ -165,7 +165,6 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
     switch (addr) {
         // Action / control registers read as 0 (write-only by convention)
         case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
-        case MBREG_SET_DTR0:   case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
         case MBREG_SCAN_TRIGGER:
             *val = 0;
             return true;
@@ -261,9 +260,8 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
             return userrow_set_slave_addr((uint8_t)val);
         case MBREG_BAUD_INDEX:
             return userrow_set_baud_index((uint8_t)val);
-        // Raw / DTR / scan-trigger: caller (dispatch_action_reg) handles DALI dispatch
+        // Raw / scan-trigger: caller (dispatch_action_reg) handles DALI dispatch
         case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
-        case MBREG_SET_DTR0:   case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
         case MBREG_SCAN_TRIGGER:
             return true;
         default:

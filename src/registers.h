@@ -74,13 +74,6 @@ extern register_map_t g_regs;
 #define MBREG_RAW_CMD           0x1000u  // single send, waits for response
 #define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
 
-// DTR set commands - write low byte = value to load into DTR.  These are
-// control registers per spec (the master orchestrates SET-sequence
-// handshakes via raw commands and expects DTR setters as their primitive).
-#define MBREG_SET_DTR0          0x100Bu
-#define MBREG_SET_DTR1          0x100Cu
-#define MBREG_SET_DTR2          0x100Du
-
 // Bus scan - write 0x0001 to trigger a full bus scan
 #define MBREG_SCAN_TRIGGER      0x1010u
 

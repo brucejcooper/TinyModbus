@@ -53,10 +53,11 @@
 #define DALI_CMD_SET_FADE_TIME        0x2Eu
 #define DALI_CMD_SET_FADE_RATE        0x2Fu
 
-// DTR set commands: addr byte = opcode, cmd byte = value to load
+// DTR0 set: addr byte = opcode 0xA3, cmd byte = value to load.  Used by the
+// internal multi-step write sequences (DTR0 -> SET_X(twice) -> DTR0 ->
+// SET_Y(twice)) in dali_sync.c.  DTR1/DTR2 setters (0xC3 / 0xC5) are
+// reachable from the master via the MBREG_RAW_CMD raw channel.
 #define DALI_ADDR_SET_DTR0  0xA3u
-#define DALI_ADDR_SET_DTR1  0xC3u
-#define DALI_ADDR_SET_DTR2  0xC5u
 
 // ---- Hardware pins -----------------------------------------------------
 

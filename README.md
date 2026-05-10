@@ -82,7 +82,7 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 | 1  | group (0–15) | 1 | Command to group |
 | 1  | 1111111 | 1 | Broadcast command |
 
-The per-ballast query registers in this firmware use short addresses (0–63). The DAPC and raw command registers accept any valid DALI address byte, so group and broadcast commands are also supported.
+The per-ballast holding-register banks in this firmware use short addresses (0–63). The raw command registers (0x1000 / 0x1001) accept any valid DALI address byte, so group and broadcast commands are also supported through them.
 
 ### Command Types
 

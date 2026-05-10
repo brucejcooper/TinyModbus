@@ -173,7 +173,7 @@ static void send_error(mb_err_t err) {
 
 // ---- FC04 - read input registers ----------------------------------------
 
-// FC04 input registers (read-only) after subtask 8:
+// FC04 input registers (read-only):
 //   0x0100-0x0103  present bitmap                   (4 regs)
 //   0x0104-0x0107  dirty bitmap (read-clears)       (4 regs)
 //   0x0108         async raw command result         (1 reg, terminal-state read-clears)
@@ -181,10 +181,9 @@ static void send_error(mb_err_t err) {
 //
 // The per-ballast banks (0x0000-0x00FF) and group membership masks
 // (0x0110-0x014F) live in FC03/FC06/FC10 holding-register space; reads via
-// FC04 return ILLEGAL_ADDRESS.  Subtask 8 removed group_status, fading, and
-// scan_status (derivable / vestigial) and packed present/dirty/raw_cmd_result
-// down to 0x0100-0x0108 so a master can read presence + dirty in a single
-// 8-register FC04 request.
+// FC04 return ILLEGAL_ADDRESS.  present / dirty / raw_cmd_result are packed
+// into the contiguous 0x0100-0x0108 ladder so a master can read presence +
+// dirty in a single 8-register FC04 request.
 //
 // addr and count come off the wire as 16-bit values; promoting the sum to
 // uint32_t prevents wrap (e.g. addr=0xFFFF, count=1 -> 0) from sneaking
@@ -306,14 +305,14 @@ static void process_fc03(void) {
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 //
-// After subtask 9 the only registers that map to a DALI command issued from
-// here are: MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel)
-// and MBREG_SCAN_TRIGGER (sets SYNC_READ_FULL on all ballasts).  The DTR
-// setter convenience regs were removed — the master can issue the same
-// effect via the raw channel (e.g. write 0xA3VV to 0x1000 to load DTR0).
-// Per-ballast bank writes (0x0000-0x00FF) and group register writes
-// (0x0110-0x014F) are handled directly by regs_write_holding via the
-// SYNC_WRITE_* / group_write paths and do not reach this function.
+// The only registers that map to a DALI command issued from here are
+// MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel) and
+// MBREG_SCAN_TRIGGER (sets SYNC_READ_FULL on all ballasts).  DTR loads
+// have no convenience register — the master writes 0xA3VV to 0x1000 to
+// load DTR0 with VV (or 0xC3VV / 0xC5VV for DTR1 / DTR2).  Per-ballast
+// bank writes (0x0000-0x00FF) and group register writes (0x0110-0x014F)
+// are handled directly by regs_write_holding via the SYNC_WRITE_* /
+// group_write paths and do not reach this function.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
     if (mb_reg == MBREG_RAW_CMD || mb_reg == MBREG_RAW_CMD_TWICE) {
         // Raw DALI: [15:8]=first frame byte, [7:0]=second frame byte.
@@ -589,10 +588,10 @@ void modbus_process(void) {
 
     no_response = (buf[0] == 0);
 
-    // FC01/FC05/FC0F (coils) were retired in subtask 5.  Frames using those
-    // function codes survive frame_is_valid (size check still recognises
-    // them) and reach this switch, where the default branch returns
-    // ILLEGAL_FUNCTION — the standard Modbus reply for unsupported FCs.
+    // FC01/FC05/FC0F (coils) are not supported.  Well-formed coil frames
+    // survive frame_is_valid (size check still recognises them) and reach
+    // this switch, where the default branch returns ILLEGAL_FUNCTION —
+    // the standard Modbus reply for unsupported function codes.
     switch (buf[1]) {
         case FC_READ_INPUT:        process_fc04(); break;
         case FC_READ_HOLDING:      process_fc03(); break;

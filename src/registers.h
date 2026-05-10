@@ -65,12 +65,12 @@ extern register_map_t g_regs;
 
 // Raw DALI forward frame - [15:8]=frame byte 0, [7:0]=frame byte 1
 //
-// All other DALI commands the master might want to issue (DAPC,
-// GOTO_LAST_ACTIVE, OFF, UP, DOWN, STEP_*, RECALL_*, etc.) go through
-// these raw registers — there is no per-command holding-register facade
-// after subtask 5.  Per-ballast level changes are simpler done via the
-// per-ballast brightness bank (0x0000-0x003F) which arms SYNC_WRITE_LEVEL
-// and ACKs immediately.
+// All DALI commands the master might want to issue (GOTO_LAST_ACTIVE,
+// OFF, UP, DOWN, STEP_*, RECALL_*, ADD_TO_GROUP, RESET, etc.) go through
+// these raw registers — there is no per-command holding-register facade.
+// Per-ballast level changes are more easily done via the per-ballast
+// brightness bank (0x0000-0x003F) which arms SYNC_WRITE_LEVEL and ACKs
+// immediately.
 #define MBREG_RAW_CMD           0x1000u  // single send, waits for response
 #define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
 

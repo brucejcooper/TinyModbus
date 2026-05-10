@@ -4,7 +4,6 @@
 #include <util/atomic.h>
 
 #include "dali.h"
-#include "registers.h"
 #include "dali_sync.h"
 
 volatile bool dali_idle = false;
@@ -26,11 +25,10 @@ static void external_message_started(void) {
 
 // ---- dali_result_received - called from ISR context --------------------
 //
-// All DALI completions in subtask 4+ flow through dali_sync_completion.
-// The function name is preserved for compatibility with the bit-level
-// state-machine callers (dali_state_transmitting.c,
-// dali_state_receiving.c, dali_state_wait_for_response.c); subtask 5
-// renames it.
+// All DALI completions flow through dali_sync_completion.  This function
+// is the entry point from the bit-level state-machine callers
+// (dali_state_transmitting.c, dali_state_receiving.c,
+// dali_state_wait_for_response.c).
 //
 // Two intercepts before dispatch:
 //

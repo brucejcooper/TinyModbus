@@ -33,6 +33,7 @@
 
 #include <avr/interrupt.h>
 #include <avr/io.h>
+#include <avr/pgmspace.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <util/atomic.h>
@@ -48,6 +49,7 @@ volatile bool              dali_busy;
 volatile dali_current_op_t current_op;
 volatile dali_group_write_t group_write;
 volatile cmd_entry_t       s_active;
+volatile commission_state_t commission_state;
 
 volatile uint8_t raw_cmd_addr;
 volatile uint8_t raw_cmd_data;
@@ -84,6 +86,11 @@ void dali_sync_init(void) {
     scan_full_step = 0;
     scan_cursor    = 0;
     work_cursor    = 0;
+    // Commissioning state — idle.  All other fields populated by
+    // dali_sync_arm_commission when the master triggers a run.
+    commission_state.phase           = COM_IDLE;
+    commission_state.status          = COMM_STATUS_IDLE;
+    commission_state.abort_requested = false;
 }
 
 // ---- Cache-invalidation classification ------------------------------
@@ -145,6 +152,50 @@ static void apply_invalidation(uint8_t addr_byte, uint8_t inv_mask) {
         return;
     }
     // 0xA0-0xCF special command, or 0xD0-0xFD reserved: no-op.
+}
+
+// ---- Commissioning helpers ------------------------------------------
+//
+// 24-bit search address held as a 3-byte array (search[0]=L, [1]=M, [2]=H)
+// so `bit >> 3` indexes the byte directly — no per-range branching, and
+// avoids the big-endian shuffle if it were a packed uint32_t.
+//
+// com_set_bit / com_clear_bit each have a single effective call site
+// inside the COM_COMPARE handler — leave them inlinable.
+// com_reset_bisect / com_lowest_unused both have multiple call sites
+// (arm() and OP_COMMISSION completion), so they're tagged noinline +
+// noclone to keep them at one copy and avoid the avr-gcc constprop
+// cloning bloat that subtask 7 measured for the unified issue path.
+static void com_clear_bit(uint8_t bit) {
+    commission_state.search[bit >> 3] &= (uint8_t)~(1u << (bit & 7u));
+}
+
+static void com_set_bit(uint8_t bit) {
+    commission_state.search[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+}
+
+// Reset bisect state for the next ballast: search ← 0xFFFFFF, bisect_bit
+// ← 24 (sentinel "first COMPARE — any ballast?").  err_streak reset is
+// handled by the caller (only on VERIFY-yes; NAK keeps the streak).
+__attribute__((noinline, noclone))
+static void com_reset_bisect(void) {
+    commission_state.search[0]  = 0xFFu;
+    commission_state.search[1]  = 0xFFu;
+    commission_state.search[2]  = 0xFFu;
+    commission_state.bisect_bit = 24u;
+}
+
+// Find the lowest short address with `present` bit clear.  Used by
+// incremental mode and for advancing next_short_addr after a successful
+// VERIFY.  Returns DALI_MAX_DEVICES (64) when all 64 slots are taken.
+__attribute__((noinline, noclone))
+static uint8_t com_lowest_unused(void) {
+    for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
+        uint16_t bm  = g_regs.present[i >> 4];
+        uint16_t bit = (uint16_t)1u << (i & 0x0Fu);
+        if (!(bm & bit)) return i;
+    }
+    return DALI_MAX_DEVICES;
 }
 
 // ---- Unified DALI issuance ------------------------------------------
@@ -288,6 +339,66 @@ void dali_sync_dispatch_current(void) {
                 issue_dali_command(raw_cmd_addr, raw_cmd_data, DALI_KIND_QUERY, 1u);
             break;
         }
+        case OP_COMMISSION: {
+            // Abort flag is checked at every dispatch boundary — the
+            // master can write 0x0000 to MBREG_COMMISSION at any time
+            // and this is where the request takes effect.  Force phase
+            // to COM_TERMINATE and stamp the aborted-status word; the
+            // dispatch table below issues TERMINATE.
+            commission_phase_t p = commission_state.phase;
+            if (commission_state.abort_requested && p != COM_TERMINATE) {
+                commission_state.status = COMM_STATUS_ERR_ABORTED;
+                commission_state.phase  = COM_TERMINATE;
+                commission_state.abort_requested = false;
+                p = COM_TERMINATE;
+            }
+            // Per-phase dispatch table indexed by `phase - COM_INITIALISE`.
+            // PROGMEM keeps the 20 bytes out of RAM.  `repeat` is derived
+            // from `kind` (TWICE → 2, otherwise 1) so we don't pay for a
+            // third column.
+            //                          addr_byte                          kind
+            static const uint8_t dispatch_tbl[][2] PROGMEM = {
+                /*COM_INITIALISE  */ { DALI_ADDR_INITIALISE,            DALI_KIND_TWICE },
+                /*COM_RANDOMISE   */ { DALI_ADDR_RANDOMISE,             DALI_KIND_TWICE },
+                /*COM_SEARCH_H    */ { DALI_ADDR_SEARCHADDRH,           DALI_KIND_CMD   },
+                /*COM_SEARCH_M    */ { DALI_ADDR_SEARCHADDRM,           DALI_KIND_CMD   },
+                /*COM_SEARCH_L    */ { DALI_ADDR_SEARCHADDRL,           DALI_KIND_CMD   },
+                /*COM_COMPARE     */ { DALI_ADDR_COMPARE,               DALI_KIND_QUERY },
+                /*COM_PROGRAM_ADDR*/ { DALI_ADDR_PROGRAM_SHORT_ADDRESS, DALI_KIND_CMD   },
+                /*COM_VERIFY      */ { DALI_ADDR_VERIFY_SHORT_ADDRESS,  DALI_KIND_QUERY },
+                /*COM_WITHDRAW    */ { DALI_ADDR_WITHDRAW,              DALI_KIND_CMD   },
+                /*COM_TERMINATE   */ { DALI_ADDR_TERMINATE,             DALI_KIND_CMD   },
+            };
+            uint8_t idx       = (uint8_t)(p - COM_INITIALISE);
+            uint8_t addr_byte = pgm_read_byte(&dispatch_tbl[idx][0]);
+            uint8_t kind      = pgm_read_byte(&dispatch_tbl[idx][1]);
+            uint8_t repeat    = (kind == DALI_KIND_TWICE) ? 2u : 1u;
+            // Per-phase data byte.  Default 0x00 covers RANDOMISE /
+            // COMPARE / WITHDRAW / TERMINATE.  SEARCH_H/M/L collapsed
+            // to one indexed load: search[] is laid out [0]=L, [1]=M,
+            // [2]=H, so the byte for COM_SEARCH_x is search[COM_SEARCH_L - x].
+            uint8_t data_byte = 0x00u;
+            switch (p) {
+                case COM_INITIALISE:
+                    data_byte = (commission_state.mode == 1u)
+                                    ? DALI_INIT_DATA_ALL
+                                    : DALI_INIT_DATA_NO_SHORT;
+                    break;
+                case COM_SEARCH_H:
+                case COM_SEARCH_M:
+                case COM_SEARCH_L:
+                    data_byte = commission_state.search[COM_SEARCH_L - p];
+                    break;
+                case COM_PROGRAM_ADDR:
+                case COM_VERIFY:
+                    data_byte = DALI_PROG_SHORT(commission_state.next_short_addr);
+                    break;
+                default: break;
+            }
+            issue_dali_command(addr_byte, data_byte,
+                               (dali_kind_t)kind, repeat);
+            break;
+        }
         default:
             break;
     }
@@ -326,8 +437,30 @@ static uint8_t write_flag_for_op(dali_op_t op) {
 // start_next_dali_work.  Inspects the priority chain and, if work is
 // found, populates current_op and returns true.  Does NOT touch
 // dali_busy/dali_idle (the caller does).
+//
+// Priority order:
+//   1. OP_COMMISSION  — master is actively polling 0x1014, and the spec
+//                       (task 2 §"Edge cases") explicitly puts raw commands
+//                       behind commissioning so a master `0xA3VV` raw can't
+//                       clobber DTR0 mid-bisect.
+//   2. OP_RAW         — single-shot raw command (queues behind commissioning).
+//   3. OP_GROUP_BIT   — pending ADD/REMOVE_FROM_GROUP from a group-mask write.
+//   4. SYNC_WRITE_*   — per-ballast bank writes (rotating cursor for fairness).
+//   5. SYNC_READ_LEVEL- per-ballast level polls (same cursor).
+//   6. continue full-scan in progress.
+//   7. start a new full-scan from SYNC_READ_FULL.
 static bool pick_work(void) {
-    // 1. Raw command (high byte of raw_cmd_result == 0xFF).
+    // 1. Commissioning state machine (highest priority).  phase != IDLE
+    //    means a run is armed or mid-flight; OP_COMMISSION is sticky for
+    //    the entire run (each completion sets `more = true` until COM_TERMINATE).
+    if (commission_state.phase != COM_IDLE) {
+        current_op.op   = OP_COMMISSION;
+        current_op.addr = 0xFFu;
+        current_op.step = 0;
+        return true;
+    }
+
+    // 2. Raw command (high byte of raw_cmd_result == 0xFF).
     if ((uint8_t)(g_regs.raw_cmd_result >> 8) == 0xFFu) {
         current_op.op   = OP_RAW;
         current_op.addr = 0xFFu;
@@ -335,7 +468,7 @@ static bool pick_work(void) {
         return true;
     }
 
-    // 2. Group bit-change pending.
+    // 3. Group bit-change pending.
     if (group_write.reg_addr != 0xFFFFu) {
         // pending_adds first, then pending_removes.
         uint16_t adds    = group_write.pending_adds;
@@ -365,7 +498,7 @@ static bool pick_work(void) {
     }
 try_writes:
 
-    // 3. Pending write on any ballast (rotating cursor).
+    // 4. Pending write on any ballast (rotating cursor).
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
         uint8_t idx = (uint8_t)((work_cursor + i) & 0x3Fu);
         uint8_t f = sync_flags[idx];
@@ -379,7 +512,7 @@ try_writes:
         }
     }
 
-    // 4. Pending level read (same rotating cursor — fairness across
+    // 5. Pending level read (same rotating cursor — fairness across
     // both writes and reads on every issued command).
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
         uint8_t idx = (uint8_t)((work_cursor + i) & 0x3Fu);
@@ -392,7 +525,7 @@ try_writes:
         }
     }
 
-    // 5. Continue in-progress full scan.
+    // 6. Continue in-progress full scan.
     if (scan_full_addr != 0xFFu) {
         current_op.op   = OP_FULL_SCAN;
         current_op.addr = scan_full_addr;
@@ -400,7 +533,7 @@ try_writes:
         return true;
     }
 
-    // 6. Start a new full scan.
+    // 7. Start a new full scan.
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
         if (sync_flags[i] & SYNC_READ_FULL) {
             scan_full_addr  = i;
@@ -460,6 +593,79 @@ bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends) {
         }
     }
     TCB0.INTCTRL = old_tcb;
+    return armed;
+}
+
+bool dali_sync_arm_commission(uint8_t mode) {
+    bool armed   = false;
+    bool do_wipe = false;
+
+    // Header ATOMIC: refuse if a run is already in progress (status high
+    // byte 0x01), then commit the initial commission_state in one atomic
+    // burst.  TCB0 fence guards against an in-flight LVL1 OP_COMMISSION
+    // completion writing status while we read it.  mode out-of-range
+    // never reaches here — regs_write_holding rejects val > 2 first.
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if ((uint8_t)(commission_state.status >> 8) == 0x01u) {
+            // Already running — caller surfaces DEVICE_BUSY.
+            goto out;
+        }
+        uint8_t initial_addr = (mode == 2u) ? com_lowest_unused() : 0u;
+        if (mode == 2u && initial_addr >= DALI_MAX_DEVICES) {
+            // Incremental + bus already fully addressed: latch terminal
+            // status, no DALI work to do.
+            commission_state.status = COMM_STATUS_ERR_ADDR_EXHAUST;
+            commission_state.phase  = COM_IDLE;
+            armed = true;
+            goto out;
+        }
+        com_reset_bisect();
+        commission_state.next_short_addr = initial_addr;
+        commission_state.count           = 0;
+        commission_state.err_streak      = 0;
+        commission_state.mode            = mode;
+        commission_state.abort_requested = false;
+        commission_state.status          = COMM_STATUS_RUNNING(0);
+        commission_state.phase           = COM_INITIALISE;
+        do_wipe = (mode == 1u);
+        armed   = true;
+    out: ;
+    }
+    TCB0.INTCTRL = old_tcb;
+
+    // Per-ballast cache wipe for full mode.  One TCB0+ATOMIC for the
+    // entire 64-iteration sweep is ~32 µs at 20 MHz — well under one
+    // DALI bit time (833 µs at 1200 baud).  TCB0 *captures* edges in
+    // hardware regardless; only ISR delivery is delayed, and the
+    // pulse decoder reads the captured count rather than wall-clock-
+    // of-now, so no corruption.  status=0x0100 is already published
+    // (from the header ATOMIC above) so a concurrent arm() call would
+    // observe "running" and refuse — but no concurrent arm() can
+    // actually run during this ATOMIC anyway since LVL0 is fenced.
+    //
+    // Wipe-vs-in-flight-completion race (intentionally benign): when
+    // arm() is called, dali_busy may still be true for a previously
+    // armed op (e.g., a SCAN_TRIGGER full-scan in progress).  Its
+    // completion ISR's writes are serialised by the ATOMIC (LVL1 is
+    // fenced via TCB0.INTCTRL=0).  Either outcome — wipe-then-ISR or
+    // ISR-then-wipe — is harmless: each newly-programmed short address
+    // gets SYNC_READ_FULL after VERIFY-yes (re-fills the cache), and
+    // the master observes status=0x01XX while the run is in flight so
+    // transient gaps don't leak into a "completed" snapshot.
+    if (do_wipe) {
+        uint8_t ot = TCB0.INTCTRL;
+        TCB0.INTCTRL = 0;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
+                regs_clear_ballast(i);
+                sync_flags[i] = 0;
+            }
+        }
+        TCB0.INTCTRL = ot;
+    }
+
     return armed;
 }
 
@@ -664,6 +870,134 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 }
             }
             // If bus error, leave the bits set; retry on next pass.
+            break;
+        }
+
+        case OP_COMMISSION: {
+            // The phase machine: each completion advances exactly one
+            // step.  Bisect bookkeeping (search bytes, bisect_bit) lives
+            // in commission_state, NOT in current_op.step.  `more = true`
+            // keeps dali_busy held for the full run; the only release
+            // is through COM_TERMINATE → COM_IDLE.
+            //
+            // Trivial linear advances (INITIALISE → RANDOMISE, RANDOMISE
+            // → SEARCH_H, SEARCH_H → SEARCH_M, SEARCH_M → SEARCH_L,
+            // SEARCH_L → COMPARE, PROGRAM_ADDR → VERIFY) all collapse
+            // into the default branch via `phase + 1` thanks to the
+            // consecutive enum ordering.  Only COMPARE / VERIFY /
+            // WITHDRAW / TERMINATE need explicit cases.
+            commission_phase_t p = commission_state.phase;
+            switch (p) {
+                case COM_COMPARE: {
+                    // bisect_bit==24 is the "first COMPARE at 0xFFFFFF"
+                    // probe (search is still 0xFF/0xFF/0xFF).  Otherwise
+                    // search has bit `bb` cleared from the prior
+                    // SEARCHADDR round; "yes" keeps it cleared, "no"
+                    // restores.  COMPARE is anyone-pulls-low — any
+                    // decoded edges (OK / MALFORMED / pulse-*) mean
+                    // "match"; only DALI_RESPONSE_NAK means "no".
+                    bool yes = (type != DALI_RESPONSE_NAK);
+                    uint8_t bb = commission_state.bisect_bit;
+                    if (!yes) {
+                        if (bb == 24u) {
+                            // First-COMPARE "no": no responders left in
+                            // the comparison set.  If count==0 this is
+                            // an empty bus → 0x0302; otherwise it's
+                            // natural completion (we've programmed
+                            // everything).  COM_TERMINATE's stamp logic
+                            // handles natural-complete (high byte 0x01
+                            // → 0x02XX with count) so we don't override
+                            // status here in that branch.
+                            if (commission_state.count == 0u)
+                                commission_state.status = COMM_STATUS_ERR_NO_BALLASTS;
+                            commission_state.phase = COM_TERMINATE;
+                            more = true;
+                            break;
+                        }
+                        com_set_bit(bb);
+                    } else if (bb == 24u
+                               && commission_state.next_short_addr >= DALI_MAX_DEVICES) {
+                        commission_state.status = COMM_STATUS_ERR_ADDR_EXHAUST;
+                        commission_state.phase  = COM_TERMINATE;
+                        more = true;
+                        break;
+                    }
+                    // Common bisect advance: bb=24 → 23, bb>0 → bb-1,
+                    // bb==0 → bisect done (search holds the random_addr).
+                    if (bb == 0u) {
+                        commission_state.phase = COM_PROGRAM_ADDR;
+                    } else {
+                        commission_state.bisect_bit = bb - 1u;
+                        com_clear_bit(bb - 1u);
+                        commission_state.phase = COM_SEARCH_H;
+                    }
+                    more = true;
+                    break;
+                }
+                case COM_VERIFY: {
+                    // Strict OK + 0xFF: only the just-programmed gear
+                    // should respond.  Anything else (NAK / OK-wrong-
+                    // value / decoder errors including MALFORMED) is
+                    // verify-fail.  A MALFORMED here would mean two
+                    // gears collided at the same address — definitely
+                    // not OK.
+                    bool ok = (type == DALI_RESPONSE_OK && value == 0xFFu);
+                    if (ok) {
+                        // Mark presence + queue background SYNC_READ_FULL
+                        // so the cache fills without manual SCAN_TRIGGER.
+                        // next_short_addr advance MUST happen here (not
+                        // after WITHDRAW) — otherwise incremental's
+                        // lowest-unused re-picks this slot.
+                        uint8_t sa = commission_state.next_short_addr;
+                        regs_set_present(sa, true);
+                        sync_flags_set(sa, SYNC_READ_FULL);
+                        commission_state.count++;
+                        commission_state.err_streak = 0;
+                        commission_state.status     = COMM_STATUS_RUNNING(commission_state.count);
+                        commission_state.next_short_addr =
+                            (commission_state.mode == 1u)
+                                ? (uint8_t)(sa + 1u)
+                                : com_lowest_unused();
+                    } else {
+                        commission_state.err_streak++;
+                        if (commission_state.err_streak > 3u) {
+                            commission_state.status = COMM_STATUS_ERR_VERIFY_FAIL;
+                            commission_state.phase  = COM_TERMINATE;
+                            more = true;
+                            break;
+                        }
+                    }
+                    // Reset bisect for next ballast (or no-more probe).
+                    com_reset_bisect();
+                    commission_state.phase = COM_WITHDRAW;
+                    more = true;
+                    break;
+                }
+                case COM_WITHDRAW:
+                    // Just-isolated ballast no longer responds; loop
+                    // back to a fresh bisect.  Next first-COMPARE
+                    // either finds another ballast or returns "no",
+                    // which the COM_COMPARE handler turns into natural
+                    // completion (status 0x02xx).
+                    commission_state.phase = COM_SEARCH_H;
+                    more = true;
+                    break;
+                case COM_TERMINATE:
+                    // Stamp natural-completion status iff no terminal
+                    // value was already latched (aborted / no-ballasts /
+                    // verify-fail / addr-exhaust all set their status
+                    // BEFORE TERMINATE issues).
+                    if ((uint8_t)(commission_state.status >> 8) == 0x01u)
+                        commission_state.status = COMM_STATUS_COMPLETE(commission_state.count);
+                    commission_state.phase = COM_IDLE;
+                    // more = false → release dali_busy below.
+                    break;
+                default:
+                    // Trivial linear advance via consecutive enum order.
+                    commission_state.phase = (commission_phase_t)(p + 1u);
+                    more = true;
+                    break;
+            }
             break;
         }
 

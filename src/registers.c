@@ -171,6 +171,27 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         case MBREG_RESCAN_INTERVAL: *val = userrow_get_rescan_interval(); return true;
         case MBREG_SLAVE_ADDR:      *val = userrow_get_slave_addr();      return true;
         case MBREG_BAUD_INDEX:      *val = userrow_get_baud_index();      return true;
+        case MBREG_COMMISSION: {
+            // Read-clears semantics on TERMINAL high bytes (0x02 complete,
+            // 0x03 error/aborted) — same shape as the FC04 0x0108 raw
+            // command result.  Idle (0x00) and running (0x01) values stay
+            // put so the master can poll progress without losing state.
+            // Capture must be atomic w.r.t. the OP_COMMISSION ISR that
+            // writes commission_state.status; TCB0 fence guards LVL1,
+            // ATOMIC_BLOCK guards LVL0.
+            uint16_t snap;
+            uint8_t old_tcb = TCB0.INTCTRL;
+            TCB0.INTCTRL = 0;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                snap = commission_state.status;
+                uint8_t hi = (uint8_t)(snap >> 8);
+                if (hi == 0x02u || hi == 0x03u)
+                    commission_state.status = COMM_STATUS_IDLE;
+            }
+            TCB0.INTCTRL = old_tcb;
+            *val = snap;
+            return true;
+        }
         default:     return false;
     }
 }
@@ -264,6 +285,24 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
         case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
         case MBREG_SCAN_TRIGGER:
             return true;
+        case MBREG_COMMISSION: {
+            // 0x0000 abort, 0x0001 full, 0x0002 incremental.  Anything
+            // else is ILLEGAL_VALUE; an attempt to start while a run is
+            // already in progress is DEVICE_BUSY.  We return false in
+            // both cases — process_fc06 / process_fc10 disambiguate by
+            // re-checking val > 2.
+            if (val > 2u) return false;
+            if (val == 0u) {
+                // Abort: latch the request iff a run is actually in
+                // progress.  No-op when idle or in a terminal state
+                // (master must read 0x1014 to clear those).  phase is a
+                // 1-byte packed enum so the read is atomic on AVR.
+                if (commission_state.phase != COM_IDLE)
+                    commission_state.abort_requested = true;
+                return true;
+            }
+            return dali_sync_arm_commission((uint8_t)val);
+        }
         default:
             return false;
     }

@@ -59,6 +59,32 @@
 // reachable from the master via the MBREG_RAW_CMD raw channel.
 #define DALI_ADDR_SET_DTR0  0xA3u
 
+// ---- Commissioning special-command opcodes (IEC 62386-102) -------------
+// All take the addr-byte slot of the 16-bit forward frame (replace the
+// per-ballast addressing entirely).  Driven by the OP_COMMISSION state
+// machine in dali_sync.c.  INITIALISE / RANDOMISE require SEND-TWICE; the
+// rest are single forward frames with no response (COMPARE / VERIFY /
+// QUERY produce a backward frame).
+#define DALI_ADDR_TERMINATE              0xA1u  // cancel commissioning early
+#define DALI_ADDR_INITIALISE             0xA5u  // data: 0x00=all, 0xFF=no-short, else short addr.  TWICE.
+#define DALI_ADDR_RANDOMISE              0xA7u  // each gear picks a fresh 24-bit random.  TWICE.
+#define DALI_ADDR_COMPARE                0xA9u  // backward 0xFF if any gear's random <= search
+#define DALI_ADDR_WITHDRAW               0xABu  // pull last-matched gear out of comparison set
+#define DALI_ADDR_SEARCHADDRH            0xB1u  // load search-addr high byte
+#define DALI_ADDR_SEARCHADDRM            0xB3u  // load search-addr mid byte
+#define DALI_ADDR_SEARCHADDRL            0xB5u  // load search-addr low byte
+#define DALI_ADDR_PROGRAM_SHORT_ADDRESS  0xB7u  // data = (short<<1)|1, or 0xFF to clear
+#define DALI_ADDR_VERIFY_SHORT_ADDRESS   0xB9u  // data = (short<<1)|1.  Backward 0xFF if match.
+#define DALI_ADDR_QUERY_SHORT_ADDRESS    0xBBu  // backward = (short<<1)|1, or 0xFF if none
+
+// INITIALISE data-byte conventions
+#define DALI_INIT_DATA_ALL          0x00u   // include every gear in the comparison set
+#define DALI_INIT_DATA_NO_SHORT     0xFFu   // include only gears without a short address
+
+// PROGRAM/VERIFY short-address encoding.  Bit 0 set marks the byte as a
+// short-address command target (matches the broader DALI_CMD_FLAG convention).
+#define DALI_PROG_SHORT(s)          ((uint8_t)(((s) << 1) | 0x01u))
+
 // ---- Hardware pins -----------------------------------------------------
 
 #define DALI_PORT         PORTB

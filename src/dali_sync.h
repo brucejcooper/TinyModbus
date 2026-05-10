@@ -57,7 +57,23 @@ typedef enum __attribute__((packed)) {
     OP_WRITE_FADE,    // SYNC_WRITE_FADE:  DTR0/SET_FADE_RATE(2x)/DTR0/SET_FADE_TIME(2x)
     OP_GROUP_BIT,     // single ADD_TO_GROUP / REMOVE_FROM_GROUP (twice)
     OP_RAW,           // raw cmd staged at raw_cmd_addr / raw_cmd_data
+    OP_COMMISSION,    // IEC 62386-102 commissioning state machine (commission_state)
 } dali_op_t;
+
+// Phase tracker for the commissioning state machine.  Each value names
+// one DALI command; completion advances to the next phase.  Lives in a
+// packed 1-byte field of commission_state.
+typedef enum __attribute__((packed)) {
+    COM_IDLE = 0,
+    COM_INITIALISE,                            // INITIALISE x2 (DALI_KIND_TWICE)
+    COM_RANDOMISE,                             // RANDOMISE x2  (DALI_KIND_TWICE)
+    COM_SEARCH_H, COM_SEARCH_M, COM_SEARCH_L,  // SEARCHADDRH/M/L = search[2/1/0]
+    COM_COMPARE,                               // COMPARE; bisect_bit==24 = "any ballast?" probe
+    COM_PROGRAM_ADDR,                          // PROGRAM_SHORT_ADDRESS = (next_short_addr<<1)|1
+    COM_VERIFY,                                // VERIFY_SHORT_ADDRESS, expects backward 0xFF
+    COM_WITHDRAW,                              // WITHDRAW (remove just-isolated gear)
+    COM_TERMINATE                              // TERMINATE (final cleanup)
+} commission_phase_t;
 
 // What DALI is currently doing, so the completion handler knows how to
 // process the response and what (if anything) to start next.
@@ -83,6 +99,71 @@ typedef struct {
 } dali_group_write_t;
 
 extern volatile dali_group_write_t group_write;
+
+// ---- Commissioning state ---------------------------------------------
+//
+// Single global state machine driven by the OP_COMMISSION work-selector
+// slot (highest priority — see pick_work).  Master writes to MBREG_COMMISSION
+// (0x1014) arm or abort the run; reads the same register to poll status.
+//
+// Layout (12 bytes; packed enum keeps phase to 1 byte):
+//   search[0..2]     : current 24-bit SEARCHADDR — search[0]=L, [1]=M, [2]=H.
+//                      Indexed by `bit >> 3` so com_{set,clear}_bit are
+//                      branch-free.  Initialised to 0xFFFFFF at the start
+//                      of every bisect cycle (each ballast).
+//   next_short_addr  : short address to assign on the next PROGRAM step.
+//                      Full mode advances 0..N-1; incremental scans the
+//                      presence bitmap for the lowest 0-bit.
+//   bisect_bit       : current bit of the bisect (23..0).  Sentinel 24
+//                      means "haven't started bisecting yet — first COMPARE
+//                      at 0xFFFFFF probes for any responder at all".
+//   count            : ballasts successfully programmed in this run.
+//                      Mirrored into the low byte of status while running.
+//   err_streak       : consecutive VERIFY-fails.  >3 trips status 0x0303.
+//   phase            : commission_phase_t — drives dispatch + completion.
+//   mode             : 1 = full (INITIALISE 0x00), 2 = incremental (0xFF).
+//   abort_requested  : set by master writing 0x0000.  Picked up at the
+//                      next dispatch boundary; transitions phase to
+//                      COM_TERMINATE with status 0x0301.
+//   status           : exposed verbatim via FC03 0x1014.
+//                        0x0000      idle (post-read or never run)
+//                        0x01xx      running, xx = count so far
+//                        0x02xx      complete, xx = total programmed (read-clears)
+//                        0x03xx      error/aborted, xx = subtype (read-clears)
+//
+// Threading: written from main only inside dali_sync_arm_commission and
+// regs_read_holding (terminal-state clear) under TCB0+ATOMIC.  All other
+// updates run from ISR context (dali_sync_completion / dispatch_current);
+// 16-bit `status` writes from ISR are LVL1, fenced against main reads
+// by main's TCB0=0 around its ATOMIC blocks.
+typedef struct {
+    uint8_t            search[3];        // [0]=L, [1]=M, [2]=H — indexed by bit/8
+    uint8_t            next_short_addr;
+    uint8_t            bisect_bit;       // 24 = "first COMPARE" sentinel; 23..0 = active bit
+    uint8_t            count;
+    uint8_t            err_streak;
+    commission_phase_t phase;
+    uint8_t            mode;             // 1 = full, 2 = incremental
+    bool               abort_requested;
+    uint16_t           status;
+} commission_state_t;
+
+extern volatile commission_state_t commission_state;
+
+// Commission status word encoding (mirrors the FC03 0x1014 wire format).
+#define COMM_STATUS_IDLE             0x0000u
+#define COMM_STATUS_RUNNING(c)       ((uint16_t)(0x0100u | (uint8_t)(c)))
+#define COMM_STATUS_COMPLETE(c)      ((uint16_t)(0x0200u | (uint8_t)(c)))
+#define COMM_STATUS_ERR_ABORTED      0x0301u
+#define COMM_STATUS_ERR_NO_BALLASTS  0x0302u
+#define COMM_STATUS_ERR_VERIFY_FAIL  0x0303u
+#define COMM_STATUS_ERR_ADDR_EXHAUST 0x0304u
+
+// Note: there's no dali_sync_commission_busy() helper analogous to
+// dali_sync_group_busy() — DEVICE_BUSY for 0x1014 writes is signalled
+// by dali_sync_arm_commission returning false (which regs_write_holding
+// also returns).  process_fc06 / process_fc10 distinguish ILLEGAL_VALUE
+// from DEVICE_BUSY by re-checking val > 2.
 
 // ---- Raw command staging ---------------------------------------------
 //
@@ -155,6 +236,14 @@ void dali_sync_dispatch_current(void);
 // Returns false if raw command channel is busy.  sends = 1 (RAW_CMD) or 2
 // (RAW_CMD_TWICE).
 bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends);
+
+// Arm a commissioning run.  mode = 1 for full (INITIALISE_ALL, wipe cache,
+// assign 0..N-1) or 2 for incremental (INITIALISE without short addr,
+// assign lowest unused).  Returns false if a run is already in progress
+// (master should re-poll 0x1014 first).  Called from main context via
+// regs_write_holding for 0x1014 writes; the actual phase progression then
+// runs out of the OP_COMMISSION work-selector slot.
+bool dali_sync_arm_commission(uint8_t mode);
 
 // Arm a group register write (called from modbus.c for 0x0110-0x014F).
 // reg_addr in [0x0110,0x014F]; pending_adds/pending_removes are bit

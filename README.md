@@ -171,7 +171,7 @@ New or reset devices generate a 24-bit random address. A controller discovers an
 4. Issue `PROGRAM SHORT ADDRESS` to assign the next free address
 5. Issue `YES` to confirm, then loop until no devices respond
 
-This firmware does **not** implement commissioning — it assumes devices are already addressed before connecting them to the bus.
+This firmware **implements control-gear commissioning** — see `Commissioning (FC03/FC06 0x1014)` under the Modbus Interface section for the master-facing surface. Master writes 0x0001 to `MBREG_COMMISSION` for full re-addressing or 0x0002 for incremental (assigns short addresses only to gears that don't already have one); reads the same register to poll status. Out of scope for this firmware: 24-bit forward frames (DALI-2 control-device addressing), memory-bank reads, and DT1/DT8 device-type extensions.
 
 ---
 
@@ -179,7 +179,7 @@ This firmware does **not** implement commissioning — it assumes devices are al
 
 The firmware is a **flag-driven state-reconciliation loop**. Every per-ballast cached field (brightness, status, min/max, power-on/sys-fail, fade rate/time, group memberships) lives in a single `g_regs` register map exposed directly over Modbus. A 64-byte `sync_flags[]` table tracks per-ballast reconciliation work — read-flags say "the cache is stale, refresh from the ballast", write-flags say "the master supplied a value, push it to the ballast". A Modbus write updates the cache predictively and sets the appropriate write-flag, then ACKs at the wire layer immediately.
 
-The main loop kicks `start_next_dali_work()` whenever DALI is idle. The work selector walks a fixed priority chain — raw command → pending group bit → SYNC_WRITE_* (rotating cursor) → SYNC_READ_LEVEL (same cursor) → continue in-progress full scan → start new full scan — and issues exactly one DALI command via `issue_dali_command()`. Cache invalidation is handled inside `issue_dali_command` as a uniform property of the command bytes — every DALI command from every source (per-ballast bank write, raw command, internal full-scan step) goes through the same chokepoint, so the invalidation logic lives once and the per-source handlers stay trivial.
+The main loop kicks `start_next_dali_work()` whenever DALI is idle. The work selector walks a fixed priority chain — commissioning state machine → raw command → pending group bit → SYNC_WRITE_* (rotating cursor) → SYNC_READ_LEVEL (same cursor) → continue in-progress full scan → start new full scan — and issues exactly one DALI command via `issue_dali_command()`. Cache invalidation is handled inside `issue_dali_command` as a uniform property of the command bytes — every DALI command from every source (per-ballast bank write, raw command, commissioning step, internal full-scan step) goes through the same chokepoint, so the invalidation logic lives once and the per-source handlers stay trivial. Commissioning sits at the top of the chain so a master raw write of e.g. `0xA3VV` (DTR0 load) can't clobber the staged DTR0 mid-bisect.
 
 Completion runs in ISR context (`dali_sync_completion`) and either advances a multi-step sequence (level read = QUERY_STATUS + GET_LEVEL; multi-step write = DTR0 + SET twice + DTR0 + SET twice) or releases `dali_busy` for the next pick. Periodic level re-polls are spread evenly via the RTC-PIT cursor (one ballast per `RESCAN_INTERVAL` seconds, round-robin across all 64 slots) instead of bursting. Masters detect when reads have caught up by polling the dirty bitmap (FC04 0x0104–0x0107, read-clears).
 
@@ -381,6 +381,7 @@ Per-ballast cached DALI state (read-write) and gateway control registers.
 | 0x1011 | RESCAN_INTERVAL | R/W | Seconds between single-ballast level re-polls (round-robin cursor). Default 64; full cycle = `RESCAN_INTERVAL × 64` seconds. Write 0 to disable. See "Periodic Rescan" above for the semantic change vs pre-refactor firmware. |
 | 0x1012 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to USERROW on write. |
 | 0x1013 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to USERROW on write. |
+| 0x1014 | COMMISSION | status word | Trigger / abort / poll the IEC 62386-102 control-gear commissioning state machine. See "Commissioning (FC03/FC06 0x1014)" below. |
 
 The DALI address byte for raw command registers (0x1000, 0x1001) can be any valid DALI address byte — short address, group address, broadcast (0xFE), or special command (e.g. 0xA3 SET_DTR0).  Cache invalidation runs uniformly on every issued command via `issue_dali_command`, regardless of the master's choice between the per-ballast bank shortcut and a raw command — neither path needs explicit invalidation logic at the call site.
 
@@ -395,6 +396,38 @@ After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 
 | 0x01 | 0x00 | NAK — no backward frame received within the 22 Te response window |
 | 0x02 | response byte | OK — backward frame received |
 | 0x03 | error subtype | Error — bus/timing fault (1 = malformed, 2 = pulse too short, 3 = pulse in middle, 4 = pulse too long) |
+
+### Commissioning (FC03/FC06 0x1014)
+
+`MBREG_COMMISSION` (holding register 0x1014) drives the IEC 62386-102 control-gear commissioning state machine — the bisect-based discovery + addressing protocol that lets the gateway assign short addresses (0–63) to fresh ballasts without an external commissioning tool.
+
+**Write encoding** (FC06 to 0x1014):
+
+| Value | Action |
+|-------|--------|
+| 0x0000 | Abort: send TERMINATE, return to idle. No-op when already idle or in a terminal state (master must read 0x1014 to clear those). |
+| 0x0001 | Start **full** commissioning: INITIALISE(all), wipe existing per-ballast cache, assign 0..N−1 to discovered ballasts. **Destructive** — overwrites any existing addressing. |
+| 0x0002 | Start **incremental** commissioning: INITIALISE(without short addr), only address ballasts that don't currently have one. Already-addressed ballasts are not disturbed; new gear takes the lowest unused short addresses. |
+| anything else | ILLEGAL_VALUE |
+
+Writing 0x0001 or 0x0002 while a run is already in progress returns DEVICE_BUSY. 0x0000 always succeeds (no-op when idle / terminal).
+
+**Read encoding** (FC03 of 0x1014) — high byte encodes phase, low byte encodes count or error subtype:
+
+| High byte | Low byte | Meaning |
+|-----------|----------|---------|
+| 0x00 | 0x00 | Idle — no run ever, or last run completed and master has consumed status |
+| 0x01 | count | Running — `count` ballasts addressed so far this run |
+| 0x02 | total | Complete — `total` short addresses assigned this run (read-clears) |
+| 0x03 | subtype | Error / aborted (read-clears). Subtype: 0x01 = aborted by master, 0x02 = no ballasts found, 0x03 = >3 consecutive verify failures, 0x04 = ran out of short addresses (more ballasts than free slots) |
+
+**Read-clears semantics on terminal states**: reading 0x1014 when the high byte is 0x02 or 0x03 returns the value AND resets the underlying state to 0x0000 atomically — same shape as FC04 0x0108. Idle (0x00) and running (0x01) reads are non-clearing so masters can poll progress.
+
+**Concurrency**: OP_COMMISSION is the highest-priority work-selector slot — concurrent raw commands and per-ballast bank writes that arrive mid-run are queued and execute after the run finishes. Successful PROGRAM_SHORT_ADDRESS additionally arms `SYNC_READ_FULL` on the just-addressed ballast, so the cache populates without a manual SCAN_TRIGGER.
+
+**Timing**: a full-bus commissioning of 64 ballasts takes ~3 minutes at 1200 baud (~3 s/ballast for the bisect chain — 24 search rounds × 4 sends + program/verify/withdraw). The master can poll 0x1014 at any rate; the count low byte advances monotonically as PROGRAM/VERIFY rounds succeed.
+
+**Aborting**: writing 0x0000 mid-run latches an abort request — the next dispatch boundary forces TERMINATE, then idle. Status latches to 0x0301 before TERMINATE issues so a master poll between abort-request and TERMINATE-completion still observes the aborted state.
 
 ### Write propagation and fade tracking
 

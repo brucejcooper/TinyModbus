@@ -85,6 +85,18 @@ extern register_map_t g_regs;
 #define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
 #define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400
 
+// IEC 62386-102 commissioning channel.  Write triggers a run, read returns
+// the live status word with read-clears semantics on terminal high bytes
+// (mirrors the FC04 0x0108 raw-command-result pattern).  See dali_sync.h
+// COMM_STATUS_* macros for the wire-format encoding.
+//
+//   Write 0x0000 — abort (no-op if idle / already terminal)
+//   Write 0x0001 — start full commissioning (wipes existing addresses)
+//   Write 0x0002 — start incremental commissioning (preserves addressed gear)
+//   Write any other value → ILLEGAL_VALUE
+//   Write 0x0001/0x0002 while already running → DEVICE_BUSY
+#define MBREG_COMMISSION        0x1014u
+
 #define DALI_STATUS_FADE_RUNNING 0x10
 
 // raw_cmd_result high-byte status codes (FC04 0x0108)

@@ -125,6 +125,13 @@ extern volatile dali_group_write_t group_write;
 //   abort_requested  : set by master writing 0x0000.  Picked up at the
 //                      next dispatch boundary; transitions phase to
 //                      COM_TERMINATE with status 0x0301.
+//   resend_pending   : set by COM_COMPARE when a bb==0 NO outcome restores
+//                      bit 0 of `search` locally; SEARCH_L's completion
+//                      handler clears the flag and routes directly to
+//                      COM_PROGRAM_ADDR (skipping the wasted COMPARE round).
+//                      Without this, the gear-side SEARCHADDR registers
+//                      lag the local search and PROGRAM is issued against
+//                      a stale value -> verify-fail.
 //   status           : exposed verbatim via FC03 0x1014.
 //                        0x0000      idle (post-read or never run)
 //                        0x01xx      running, xx = count so far
@@ -145,6 +152,7 @@ typedef struct {
     commission_phase_t phase;
     uint8_t            mode;             // 1 = full, 2 = incremental
     bool               abort_requested;
+    bool               resend_pending;   // bb==0 NO -> resync SEARCHADDR before PROGRAM
     uint16_t           status;
 } commission_state_t;
 
@@ -158,6 +166,7 @@ extern volatile commission_state_t commission_state;
 #define COMM_STATUS_ERR_NO_BALLASTS  0x0302u
 #define COMM_STATUS_ERR_VERIFY_FAIL  0x0303u
 #define COMM_STATUS_ERR_ADDR_EXHAUST 0x0304u
+#define COMM_STATUS_ERR_BUS_STUCK    0x0305u  // 200 TE bus-shorted timeout aborted the run
 
 // Note: there's no dali_sync_commission_busy() helper analogous to
 // dali_sync_group_busy() — DEVICE_BUSY for 0x1014 writes is signalled

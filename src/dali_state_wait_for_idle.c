@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include "dali.h"
+#include "dali_sync.h"
 #include "tick.h"
 
 #define IDLE_THRESHOLD_TE   22u   // minimum bus-idle period before next TX
@@ -25,9 +26,27 @@ static void on_idle_bus(void) {
 
 // Safety escape: bus held high for 200 TE without clearing.
 // Force TX low (release any stuck open-drain drive) and recover.
+//
+// Without clearing dali_busy here, dali_idle_state_enter takes its
+// "busy" branch and re-enters wait_for_idle on the still-shorted bus —
+// indefinite ~83 ms/cycle loop, slave never sleeps.  Clear dali_busy
+// so dali_idle_state_enter takes the idle-arm branch instead, and
+// (for an in-flight commissioning run) force phase=COM_IDLE with a
+// distinct ERR_BUS_STUCK status so pick_work doesn't immediately
+// re-pick OP_COMMISSION on the next main pass and re-issue commands
+// onto the still-shorted bus.  Non-commissioning ops are left to be
+// re-picked by main; if the bus has cleared by then they retry, and
+// if it hasn't they'll re-enter wait_for_idle (one cycle of slow
+// retry rather than a tight loop).
 static void bus_stuck_timeout(void) {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     dali_cancel_edge_detect();
+    dali_busy = false;
+    current_op.op = OP_NONE;
+    if (commission_state.phase != COM_IDLE) {
+        commission_state.status = COMM_STATUS_ERR_BUS_STUCK;
+        commission_state.phase  = COM_IDLE;
+    }
     dali_idle_state_enter();
 }
 

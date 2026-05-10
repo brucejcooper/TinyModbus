@@ -419,7 +419,7 @@ Writing 0x0001 or 0x0002 while a run is already in progress returns DEVICE_BUSY.
 | 0x00 | 0x00 | Idle — no run ever, or last run completed and master has consumed status |
 | 0x01 | count | Running — `count` ballasts addressed so far this run |
 | 0x02 | total | Complete — `total` short addresses assigned this run (read-clears) |
-| 0x03 | subtype | Error / aborted (read-clears). Subtype: 0x01 = aborted by master, 0x02 = no ballasts found, 0x03 = >3 consecutive verify failures, 0x04 = ran out of short addresses (more ballasts than free slots) |
+| 0x03 | subtype | Error / aborted (read-clears). Subtype: 0x01 = aborted by master, 0x02 = no ballasts found, 0x03 = >3 consecutive verify failures, 0x04 = ran out of short addresses (more ballasts than free slots), 0x05 = bus shorted longer than 200 TE during commissioning (run aborted) |
 
 **Read-clears semantics on terminal states**: reading 0x1014 when the high byte is 0x02 or 0x03 returns the value AND resets the underlying state to 0x0000 atomically — same shape as FC04 0x0108. Idle (0x00) and running (0x01) reads are non-clearing so masters can poll progress.
 

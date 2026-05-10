@@ -7,8 +7,9 @@
 //     command bytes (not its source), then hands a stack-local
 //     cmd_entry_t to dali_transmitting_state_enter.
 //   - start_next_dali_work picks the highest-priority pending work
-//     (raw -> group bit -> SYNC_WRITE_* -> SYNC_READ_LEVEL ->
-//     full-scan continue -> full-scan new) and kicks off the first send.
+//     (commissioning -> raw -> group bit -> SYNC_WRITE_* ->
+//     SYNC_READ_LEVEL -> full-scan continue -> full-scan new)
+//     and kicks off the first send.
 //   - The bit-level state machine drives the send to completion.  When
 //     it returns to idle, dali_result_received fires.  If dali_busy is
 //     true, that routes to dali_sync_completion (here), which advances
@@ -30,6 +31,12 @@
 //     (dali_result_received runs at LVL1).
 //   - g_regs.dirty[]: ISR-set, main-cleared via regs_read_clear_dirty
 //     (already atomic).
+//   - commission_state: written from main only inside
+//     dali_sync_arm_commission and regs_read_holding's terminal-state
+//     clear (both under TCB0+ATOMIC); all other updates run from ISR
+//     context (dali_sync_completion / dispatch_current).  16-bit status
+//     writes from ISR are LVL1, fenced against main reads by main's
+//     TCB0=0 around its ATOMIC blocks.
 
 #include <avr/interrupt.h>
 #include <avr/io.h>
@@ -91,6 +98,7 @@ void dali_sync_init(void) {
     commission_state.phase           = COM_IDLE;
     commission_state.status          = COMM_STATUS_IDLE;
     commission_state.abort_requested = false;
+    commission_state.resend_pending  = false;
 }
 
 // ---- Cache-invalidation classification ------------------------------
@@ -627,6 +635,7 @@ bool dali_sync_arm_commission(uint8_t mode) {
         commission_state.err_streak      = 0;
         commission_state.mode            = mode;
         commission_state.abort_requested = false;
+        commission_state.resend_pending  = false;
         commission_state.status          = COMM_STATUS_RUNNING(0);
         commission_state.phase           = COM_INITIALISE;
         do_wipe = (mode == 1u);
@@ -925,7 +934,27 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                     // Common bisect advance: bb=24 → 23, bb>0 → bb-1,
                     // bb==0 → bisect done (search holds the random_addr).
                     if (bb == 0u) {
-                        commission_state.phase = COM_PROGRAM_ADDR;
+                        if (!yes) {
+                            // bb==0 NO: prior SEARCH_L pushed a bit-0-cleared
+                            // search to the gears; com_set_bit(0) above
+                            // restored bit 0 in our local copy but the gears'
+                            // SEARCHADDR registers are now stale.  Re-send
+                            // SEARCH_H/M/L before PROGRAM, otherwise the
+                            // isolated gear (random has bit 0 = 1) won't
+                            // match the gear-side search and PROGRAM is a
+                            // no-op -> VERIFY NAKs -> err_streak trips.
+                            // SEARCH_L's completion handler sees this flag
+                            // and routes to PROGRAM_ADDR (skipping the
+                            // wasted COMPARE round).
+                            commission_state.resend_pending = true;
+                            commission_state.phase = COM_SEARCH_H;
+                        } else {
+                            // bb==0 YES: gears already hold the matching
+                            // search (the bit-0-cleared value still matches
+                            // the gear's random with bit 0 = 0).  PROGRAM
+                            // directly.
+                            commission_state.phase = COM_PROGRAM_ADDR;
+                        }
                     } else {
                         commission_state.bisect_bit = bb - 1u;
                         com_clear_bit(bb - 1u);
@@ -934,6 +963,22 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                     more = true;
                     break;
                 }
+                case COM_SEARCH_L:
+                    // SEARCH_L's normal advance is the default (-> COMPARE).
+                    // Only divergent path: a bb==0 NO COMPARE outcome set
+                    // resend_pending so that, after we just emitted the
+                    // corrected SEARCHADDR, we go straight to PROGRAM_ADDR
+                    // instead of wasting another COMPARE round.  Clear the
+                    // flag here so a subsequent verify-fail re-bisect cycle
+                    // can't accidentally inherit it.
+                    if (commission_state.resend_pending) {
+                        commission_state.resend_pending = false;
+                        commission_state.phase = COM_PROGRAM_ADDR;
+                    } else {
+                        commission_state.phase = (commission_phase_t)(p + 1u);
+                    }
+                    more = true;
+                    break;
                 case COM_VERIFY: {
                     // Strict OK + 0xFF: only the just-programmed gear
                     // should respond.  Anything else (NAK / OK-wrong-

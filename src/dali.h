@@ -88,6 +88,16 @@
 
 // ---- Hardware pins -----------------------------------------------------
 
+// DALI_TX (PB0) polarity convention: OUTSET (PB0 HIGH) asserts the bus;
+// OUTCLR (PB0 LOW) and high-Z release.  The external transistor inverts
+// polarity between the MCU pin and the bus line, so PB0 LOW = bus released
+// = idle/safe state.  Invariant maintained by every TX callback in the
+// bit-level state machine (see dali_state_transmitting.c): PB0 is released
+// within one TCA0 tick (~417 µs) of every OUTSET, by pairing each OUTSET
+// with `dali_timer = 1` and a callback (half_bit_toggle / start_stop_bits)
+// that OUTTGLs or OUTCLRs the line.  Any new OUTSET site MUST preserve
+// this invariant or the TX-asserted watchdog in TCA0_OVF_vect (tick.c) is
+// the only firmware-side backstop before the WDT (~8.2 s).
 #define DALI_PORT         PORTB
 #define DALI_TX_bm        PIN0_bm
 #define DALI_RX_bm        PIN1_bm

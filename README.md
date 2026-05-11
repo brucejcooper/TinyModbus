@@ -450,7 +450,7 @@ The firmware is designed to operate as the sole DALI master on its bus. It can d
 | PA1 | RS-485 TX (USART0 alternate TXD) |
 | PA2 | RS-485 RX (USART0 alternate RXD) |
 | PA4 | RS-485 DE — driver enable, driven by hardware RS-485 mode (USART_RS485_EXT_gc), no firmware management needed |
-| PB0 | DALI TX — open-drain output, driven low to pull bus down |
+| PB0 | DALI TX — drives the external bus transistor. **OUTSET (PB0 HIGH) asserts the bus** (drives bus low via the transistor); **OUTCLR (PB0 LOW) / high-Z releases**. Reset state (high-Z) is released. |
 | PB1 | DALI RX — input via optocoupler (signal is inverted: HIGH = bus active/low) |
 
 ### Power

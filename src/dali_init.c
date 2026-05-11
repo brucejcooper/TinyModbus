@@ -17,7 +17,20 @@
 void (*dali_rx_callback)(void) = NULL;
 
 void dali_init(void) {
-    // TX: output, initially low (open-drain, OUTCLR stays low - only DIR is toggled)
+    // TX: configured as output, driven LOW (released bus).  DIR is held set
+    // for the lifetime of the firmware; OUT is what the bit-level state
+    // machine toggles - OUTSET asserts the bus (PB0 HIGH); OUTCLR releases
+    // (PB0 LOW).  The external transistor inverts polarity between MCU pin
+    // and bus line, so PB0 LOW = bus released = idle/safe.
+    //
+    // PB0 returns to high-Z (DIR=0, OUT=0) on every reset source per
+    // ATtiny1604 datasheet § 16.5.4.  This is the WDT-during-TX recovery
+    // mechanism: if the WDT fires while PB0 is OUTSET (bus asserted), the
+    // reset clears OUT and DIR atomically, the external transistor base
+    // pull-down keeps the bus released, then this dali_init runs and
+    // re-establishes PB0 = driven LOW (released).  The OUTCLR-then-DIRSET
+    // sequence below transitions PB0 high-Z -> driven LOW without ever
+    // passing through driven-HIGH.
     DALI_PORT.OUTCLR = DALI_TX_bm;
     DALI_PORT.DIRSET = DALI_TX_bm;
 

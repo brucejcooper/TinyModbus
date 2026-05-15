@@ -10,11 +10,11 @@ The Makefile already sets `PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)` so `
 
 ATtiny1604 has 1KB SRAM. Static data (BSS + data + COMMON) must stay well under 1KB to leave room for the stack (~150 bytes minimum). Key consumers:
 
-- `g_regs` (registers.c): 702 bytes - the register map for 64 ballasts
-- `g_cmd_queue` (cmd_queue.c): ~82 bytes - 8-entry ring buffer with packed enums
-- `buf` (modbus.c): 72 bytes - Modbus frame buffer, limits max FC03/FC04 read to 32 registers
+- `g_regs` (registers.c): ~672 bytes - the FC03/FC04 register map for 64 ballasts. Includes a 14 B `_reserved` padding hole at 0x0109-0x010F to anchor `group_mask` at the master-visible FC03 address 0x0110 across the FC04 trim (subtask 8).
+- `sync_flags[64]` + `current_op` + `group_write` + `commission_state` + `s_active` (dali_sync.c): the sync-flag-driven work bookkeeping that replaced the old `cmd_queue` / `bg_tasks` state.
+- `buf` (modbus.c): 40 bytes (`MAX_PKT_SZ = 16*2+8`), limits max FC03/FC04 read to 16 registers (`MAX_REG_RD`).
 
-Enum fields in `cmd_entry_t` use `__attribute__((packed))` to force 1-byte storage (instead of default 2-byte int-sized enums on AVR). The Modbus version string (FC04 at 0x0200) is built on demand directly into `buf` rather than kept in a static buffer.
+Packed enums (`__attribute__((packed))`) on `cmd_type_t`, `reg_target_t`, `dali_op_t`, `commission_phase_t`, `dali_kind_t` force 1-byte storage instead of the default 2-byte int-sized AVR enum. The Modbus version string (FC04 at 0x0200) is built on demand directly into `buf` rather than kept in a static buffer.
 
 ## Diagnostics
 

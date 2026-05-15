@@ -77,10 +77,11 @@ extern register_map_t g_regs;
 // Bus scan - write 0x0001 to trigger a full bus scan
 #define MBREG_SCAN_TRIGGER      0x1010u
 
-// Configuration registers
-//   - rescan interval is persisted to EEPROM (changes often, byte-erasable)
-//   - slave addr / baud are persisted to USERROW (changes rarely, survives chip
-//     erase + reflash so a re-flashed unit keeps its address)
+// Configuration registers - all persisted to USERROW (survives chip erase +
+// reflash so a re-flashed unit keeps its address / baud / rescan interval).
+// Each write triggers a NVMCTRL page-erase-write (~3.4 ms, CPU halted) and
+// is skipped if the value already matches.  Runtime baud/slave switches are
+// deferred until the FC06/FC10 response has cleared the wire.
 #define MBREG_RESCAN_INTERVAL   0x1011u  // seconds between periodic bus rescans; 0 = disabled
 #define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
 #define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400

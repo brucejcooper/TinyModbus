@@ -80,7 +80,7 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 | 0  | addr (0–63) | 1 | Command to short address |
 | 1  | group (0–15) | 0 | DAPC to group |
 | 1  | group (0–15) | 1 | Command to group |
-| 1  | 1111111 | 1 | Broadcast command |
+| 1  | 111111 | 0/1 | Broadcast (A0=0 → DAPC, A0=1 → command) |
 
 The per-ballast holding-register banks in this firmware use short addresses (0–63). The raw command registers (0x1000 / 0x1001) accept any valid DALI address byte, so group and broadcast commands are also supported through them.
 
@@ -94,8 +94,10 @@ The per-ballast holding-register banks in this firmware use short addresses (0�
 | Command | Data byte | Description |
 |---------|-----------|-------------|
 | Off | 0x00 | Turn off (no fade) |
-| Up | 0x01 | Step up one level |
-| Down | 0x02 | Step down one level |
+| Up | 0x01 | Fade up by one step at the configured fade rate |
+| Down | 0x02 | Fade down by one step at the configured fade rate |
+| Step Up | 0x03 | Step up one level (no fade) |
+| Step Down | 0x04 | Step down one level (no fade) |
 | Recall Max | 0x05 | Go to maximum level |
 | Recall Min | 0x06 | Go to minimum level |
 | Go To Last Active | 0x0A | Restore last non-zero level |
@@ -304,7 +306,7 @@ Each ballast has one byte in `sync_flags[64]` (`dali_sync.c`) tracking pending r
 - `SYNC_WRITE_LEVEL / MINMAX / POWER / FADE` — master-supplied value cached predictively in `g_regs`, awaits push to the ballast. The MINMAX/POWER/FADE sequences are 4-step (DTR0 + SET twice + DTR0 + SET twice) and run atomically because DTR0 is shared across all ballasts.
 - `SYNC_RETRY_PENDING` — first NAK seen on a level read or a write-final step; one retry before marking the ballast absent.
 
-`start_next_dali_work()` walks the priority chain (raw command → pending group bit → SYNC_WRITE_* → SYNC_READ_LEVEL → continue full scan → start full scan) and, when work is found, dispatches one DALI command via `dali_sync_dispatch_current()` → `issue_dali_command()`. The unified issuance function classifies cache invalidation as a property of the outgoing address + data bytes — DAPC and step/recall commands set `SYNC_READ_LEVEL` on the affected ballast(s); SET, scene, and group-membership commands set `SYNC_READ_FULL`; queries and DTR loads set nothing. Completion is dispatched in ISR context by `dali_sync_completion`, which advances the multi-step sequence or releases `dali_busy` for the next pick.
+`start_next_dali_work()` walks the priority chain (commissioning state machine → raw command → pending group bit → SYNC_WRITE_* → SYNC_READ_LEVEL → continue full scan → start full scan) and, when work is found, dispatches one DALI command via `dali_sync_dispatch_current()` → `issue_dali_command()`. The unified issuance function classifies cache invalidation as a property of the outgoing address + data bytes — DAPC and step/recall commands set `SYNC_READ_LEVEL` on the affected ballast(s); SET, scene, and group-membership commands set `SYNC_READ_FULL`; queries and DTR loads set nothing. Completion is dispatched in ISR context by `dali_sync_completion`, which advances the multi-step sequence or releases `dali_busy` for the next pick.
 
 ### Periodic Rescan
 
@@ -333,7 +335,7 @@ The firmware detects transmissions from other DALI masters on the bus: if a risi
 
 Modbus RTU, RS-485, **9600 baud, 8N1**.
 
-The slave address (1–247) is stored in EEPROM (holding register 0x1012, persisted on write). On first boot (EEPROM blank), it falls back to `USERROW[0] + 2` — so the factory default (`0xFF`) gives address 1. The baud rate (holding register 0x1013, default 0 = 9600) is also persisted to EEPROM.
+Slave address, baud rate, and rescan interval all live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud / 64 s rescan. Writes to holding registers 0x1011 / 0x1012 / 0x1013 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
 
 ### Function Codes
 
@@ -507,15 +509,14 @@ These are residual issues that the current firmware does not address. None are r
 ### Modbus
 
 - **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2–3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
-- **FC10 partial execution on register-map holes.**  The holding-register map has gaps at 0x1002–0x100A (action regs retired in subtask 4/5) and at 0x100E–0x100F.  A multi-register write spanning a gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the holes.
+- **FC10 partial execution on register-map holes.**  The holding-register map has gaps at 0x0100–0x010F (FC04-only range), 0x1002–0x100A (action regs retired in subtask 4/5), 0x100B–0x100D (DTR setters retired in subtask 9), and 0x100E–0x100F.  A multi-register write spanning a gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the holes.
 - **FC04 0x0200 returns an ASCII version string, not a register address space.**  Reading exactly 16 input registers from address 0x0200 yields the 32-byte string `"DALI v<maj>.<min> <serial>"`.  Other lengths at this address fall through to the standard register-range check and return `ILLEGAL_ADDRESS`.
 - **`frame_is_valid` still recognises the retired coil function codes (FC01 / FC05 / FC0F) for size-check purposes, and the broadcast filter still admits FC05 / FC0F.**  This is intentional: well-formed coil frames pass frame validation, reach the FC dispatcher, and receive a graceful `ILLEGAL_FUNCTION` exception reply (or — for a broadcast-addressed FC05 / FC0F — are silently absorbed) rather than being dropped at the size check.  Candidate for future tightening: removing the FC01 / FC05 / FC0F cases from `frame_is_valid` and from the broadcast filter would drop those frames at validation time instead.  Nothing breaks if it stays as-is; the current shape gives masters that probe for coil support a clearer "function not supported" answer.
 
 ### DALI
 
 - **No multi-master collision detection during our own TX.**  If another master begins driving the bus while we are already transmitting, the resulting collision is not detected; the receiving ballast simply sees a malformed frame and ignores it.
-- **`WAIT_FOR_IDLE` skipped after a backward-frame NAK.**  After a query that NAKs (no response), the state machine goes directly to the next command without an explicit 22 Te idle wait.  Safe in practice because the NAK timeout itself spans well over 22 Te, but it is structural rather than enforced.
-- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a tolerance window; pulses falling between the half-bit and full-bit ranges (~500–667 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
+- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a ±83 µs tolerance window (`DALI_HALF_BIT_USECS / 5`); pulses falling between the half-bit and full-bit ranges (~500–750 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
 - **Multi-step write sequences hold the bus for ~300 ms.**  `SYNC_WRITE_MINMAX`, `SYNC_WRITE_POWER`, and `SYNC_WRITE_FADE` each issue four logical steps (DTR0 + SET twice + DTR0 + SET twice = six hardware sends) atomically, because DTR0 is shared across all ballasts and an interleaving raw command or another write could clobber it mid-sequence.  Other DALI work (raw commands, level reads, full-scan steps) waits up to ~300 ms behind one of these.  `SYNC_WRITE_LEVEL` (single DAPC) and group-bit changes are unaffected — they take ≤ 50 ms each.
 
 ### Hardware / runtime

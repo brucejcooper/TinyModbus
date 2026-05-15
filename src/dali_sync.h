@@ -176,12 +176,18 @@ extern volatile commission_state_t commission_state;
 
 // ---- Raw command staging ---------------------------------------------
 //
-// Single-command staging.  The 0x015D state machine encodes the live
-// state in g_regs.raw_cmd_result:
-//   0x0000 idle, 0xFFnn pending (nn = sends remaining: 0x02/0x01/0x00),
-//   0x01xx NAK, 0x02xx OK (xx = response), 0x03xx error (xx = subtype).
-// Master read of 0x015D returns the value AND clears it back to idle if
-// the high byte is 0x01/0x02/0x03 (read-clears semantics).
+// Single-command staging.  g_regs.raw_cmd_result holds the outcome of the
+// most recent raw command (or PENDING while one is in flight) until the
+// next RAW_CMD write overwrites it.  Encoding (see RAW_RESULT_* macros):
+//   0x00xx OK (xx = response byte; 0x0000 also = no cmd issued yet),
+//   0x0100 NAK,
+//   0x02xx error (xx = subtype),
+//   0xFFnn pending (nn = DALI sends remaining: 0x01 single / 0x02 twice).
+// The register is NOT auto-cleared on FC04 read — the master can re-read
+// the previous outcome as many times as it likes.  A RAW_CMD write
+// succeeds (overwriting whatever was there with PENDING) whenever the
+// high byte is not 0xFF, otherwise the master gets DEVICE_BUSY and the
+// register is left untouched.
 extern volatile uint8_t raw_cmd_addr;   // DALI address byte
 extern volatile uint8_t raw_cmd_data;   // DALI data byte
 

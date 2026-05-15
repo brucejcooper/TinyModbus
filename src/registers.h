@@ -26,8 +26,11 @@ typedef struct { uint8_t fade_rate; uint8_t fade_time;  } ballast_fade_t;
 // FC04 input registers (read-only):
 //   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
 //   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
-//   0x0108         raw_cmd_result    high=0x00 idle, 0xFF pending, 0x01 nak, 0x02 ok, 0x03 err
-//                                    low byte: DALI response (when ok) or error subtype (when err)
+//   0x0108         raw_cmd_result    high=0x00 ok (low byte = response byte; 0x0000 also = no cmd issued yet),
+//                                    0x01 nak, 0x02 err (low byte = error subtype),
+//                                    0xFF pending (low byte = DALI sends remaining: 0x01 single / 0x02 twice).
+//                                    Holds the outcome of the most recent raw command; not cleared on read.
+//                                    A new RAW_CMD write overwrites it (DEVICE_BUSY only when still PENDING).
 //   0x0109-0x010F  (reserved hole)   keeps group_mask anchored at 0x0110 — read returns zeroes
 //   0x0200         version block     16-register special case (see process_fc04)
 //
@@ -100,12 +103,19 @@ extern register_map_t g_regs;
 
 #define DALI_STATUS_FADE_RUNNING 0x10
 
-// raw_cmd_result high-byte status codes (FC04 0x0108)
-#define RAW_RESULT_IDLE    0x0000u  // no command in progress
-#define RAW_RESULT_PENDING 0xFF00u  // command sent, awaiting response
-#define RAW_RESULT_NAK     0x0100u  // completed, no response (normal for send-twice)
-#define RAW_RESULT_OK(b)   (0x0200u | (uint8_t)(b))  // response received
-#define RAW_RESULT_ERR(e)  (0x0300u | (uint8_t)(e))  // bus/timing error
+// raw_cmd_result encoding (FC04 0x0108).  Holds the outcome of the most
+// recent raw command, or PENDING while one is in flight.  Not cleared on
+// FC04 read; each new RAW_CMD write overwrites whatever was there, so a
+// master can re-read the last result as many times as it likes.  The
+// initial value (0x0000, set by regs_init's memset) is indistinguishable
+// from RAW_RESULT_OK(0); that's intentional — a master that hasn't issued
+// any raw commands sees the same value as one whose last command returned
+// 0, and the only rejection signal a master cares about is the Modbus
+// DEVICE_BUSY exception returned when the channel is currently PENDING.
+#define RAW_RESULT_OK(b)        ((uint16_t)(uint8_t)(b))     // 0x00xx — response byte (0x0000 also = no cmd issued yet)
+#define RAW_RESULT_NAK          0x0100u                       // completed, no backward frame (normal for send-twice)
+#define RAW_RESULT_ERR(e)       (0x0200u | (uint8_t)(e))      // bus/timing error; low byte = error subtype
+#define RAW_RESULT_PENDING      0xFF00u                       // command in flight; OR with sends-remaining for the low byte
 
 // Initialise the register map to zeroed defaults.  All persisted config
 // (slave addr, baud, rescan interval) lives in USERROW and is read on demand

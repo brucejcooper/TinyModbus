@@ -247,20 +247,18 @@ static void process_fc04(void) {
         }
     }
 
-    // 0x0108 raw-cmd-result: read-clears semantics on TERMINAL values
-    // (high byte 0x01 NAK / 0x02 OK / 0x03 ERR).  Pending (0xFF) and idle
-    // (0x00) stay put so the master can poll without losing state.  The
-    // capture must be atomic w.r.t. the ISR completion handler that writes
-    // raw_cmd_result, so disable TCB0 + ATOMIC_BLOCK during the snapshot.
+    // 0x0108 raw-cmd-result: no read-clears, the register simply holds
+    // the most recent outcome (or PENDING while in flight) until the next
+    // RAW_CMD write overwrites it.  The atomic snapshot is still needed
+    // because regs_read_input_bulk's memcpy reads the two bytes as
+    // separate LDS instructions and the LVL1 completion handler could tear
+    // the read by writing a new value between them.
     if (addr <= FC04_RAW_RESULT && addr + count > FC04_RAW_RESULT) {
         uint16_t snap;
         uint8_t old_tcb = TCB0.INTCTRL;
         TCB0.INTCTRL = 0;
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             snap = g_regs.raw_cmd_result;
-            uint8_t hi = (uint8_t)(snap >> 8);
-            if (hi == 0x01u || hi == 0x02u || hi == 0x03u)
-                g_regs.raw_cmd_result = RAW_RESULT_IDLE;
         }
         TCB0.INTCTRL = old_tcb;
         uint16_t buf_off = (uint16_t)(FC04_RAW_RESULT - addr) * 2u;

@@ -377,7 +377,7 @@ Per-ballast cached DALI state (read-write) and gateway control registers.
 
 | Address | Name | Read | Write |
 |---------|------|------|-------|
-| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x0108. Returns DEVICE_BUSY if previous result not yet read. |
+| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x0108. Returns DEVICE_BUSY only if a previous raw command is still in flight (high byte of 0x0108 == 0xFF); a stale terminal result is silently overwritten. |
 | 0x1001 | RAW_CMD_TWICE | 0 | Same frame format as 0x1000 but sent twice within the DALI 100 ms re-send window (used for SET / INITIALISE / RANDOMISE). |
 | 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to set SYNC_READ_FULL on all 64 ballasts (full re-discovery). |
 | 0x1011 | RESCAN_INTERVAL | R/W | Seconds between single-ballast level re-polls (round-robin cursor). Default 64; full cycle = `RESCAN_INTERVAL × 64` seconds. Write 0 to disable. See "Periodic Rescan" above for the semantic change vs pre-refactor firmware. |
@@ -389,15 +389,16 @@ The DALI address byte for raw command registers (0x1000, 0x1001) can be any vali
 
 ### Async Raw Command Result (FC04 0x0108)
 
-After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 0x0108 for the result.  Reading the register at a terminal state (high byte 0x01 / 0x02 / 0x03) returns the value AND clears it back to 0x0000 atomically — so the master can detect completion in a single FC04 read without a follow-up clear write.
+After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 0x0108 for the result.  The register simply holds the outcome of the most recent raw command (or PENDING while one is in flight); it is NOT cleared by reads, so the master can re-read the same outcome as many times as it wants.  A subsequent RAW_CMD write overwrites whatever was there with a fresh PENDING — the only state that blocks a new write is PENDING itself.
 
 | High byte | Low byte | Meaning |
 |-----------|----------|---------|
-| 0x00 | 0x00 | Idle — no command in progress (or master has just consumed the previous result) |
-| 0xFF | sends remaining | Pending — high byte 0xFF, low byte = number of DALI sends remaining at arming (0x02 right after writing 0x1001; 0x01 right after writing 0x1000). The low byte does NOT decrement mid-twice-send: a RAW_CMD_TWICE stays at `0xFF02` from arming until both sends have completed and a terminal value is written. The two sends are coalesced into a single completion (the bit-level state machine handles the inter-send 22 Te re-fire) for simpler completion semantics — masters only need to distinguish "pending" from "terminal", not count sends. Match the high byte for the pending check (`(value & 0xFF00) == 0xFF00`); the only visible mid-pending value is `0xFF02`, but treating any `0xFFxx` as pending is the safe rule. |
+| 0x00 | response byte | OK — backward frame received; the low byte is the response. `0x0000` is also the initial value before any raw command has been issued (a master that hasn't issued one sees the same thing as one whose last command returned 0). |
 | 0x01 | 0x00 | NAK — no backward frame received within the 22 Te response window |
-| 0x02 | response byte | OK — backward frame received |
-| 0x03 | error subtype | Error — bus/timing fault (1 = malformed, 2 = pulse too short, 3 = pulse in middle, 4 = pulse too long) |
+| 0x02 | error subtype | Error — bus/timing fault (1 = malformed, 2 = pulse too short, 3 = pulse in middle, 4 = pulse too long) |
+| 0xFF | sends remaining | Pending — high byte 0xFF, low byte = number of DALI sends remaining at arming (0x02 right after writing 0x1001; 0x01 right after writing 0x1000). The low byte does NOT decrement mid-twice-send: a RAW_CMD_TWICE stays at `0xFF02` from arming until both sends have completed and a terminal value is written. The two sends are coalesced into a single completion (the bit-level state machine handles the inter-send 22 Te re-fire) for simpler completion semantics — masters only need to distinguish "pending" from "terminal", not count sends. Match the high byte for the pending check (`(value & 0xFF00) == 0xFF00`); the only visible mid-pending value is `0xFF02`, but treating any `0xFFxx` as pending is the safe rule. |
+
+Sequencing: a RAW_CMD write submitted while the channel is in flight (PENDING) is rejected with a Modbus `DEVICE_BUSY` exception and `0x0108` is left untouched, so the master keeps its in-flight visibility. A RAW_CMD write submitted at any other time succeeds: it sets `raw_cmd_addr` / `raw_cmd_data` and flips `0x0108` to PENDING, silently overwriting whatever terminal value was sitting there. There is no arming step or queue full state — the only gating mechanism is the PENDING check.
 
 ### Commissioning (FC03/FC06 0x1014)
 
@@ -501,6 +502,7 @@ The flag-driven refactor (branch `task-1-flag-driven`) introduces several wire-p
 - **Async raw command pending state uses `0xFFnn` with non-zero low byte.** The 0x0108 pending encoding is `0xFF02` (after writing 0x1001 RAW_CMD_TWICE) or `0xFF01` (after writing 0x1000 RAW_CMD); the low byte does NOT decrement mid-twice-send (the firmware transitions directly from `0xFF02` to the terminal value once both sends complete). Masters that strict-equal `value == 0xFF00` for "still pending" will miss both initial arming states; match the high byte instead (`(value & 0xFF00) == 0xFF00`).
 - **DTR-setter holding registers removed (subtask 9).** `SET_DTR0` (0x100B), `SET_DTR1` (0x100C), and `SET_DTR2` (0x100D) all return `ILLEGAL_ADDRESS`. They were thin wrappers around raw DALI sends; issue the equivalent special command via the raw channel instead — write `0xA3VV` to 0x1000 to load DTR0 with `VV`, `0xC3VV` for DTR1, `0xC5VV` for DTR2 (single send, no backward frame expected; the result register at FC04 0x0108 reaches `NAK` once the send completes). The internal multi-step write sequences (min/max, power-on/sys-fail, fade rate/time) still drive DTR0 directly via the address-byte 0xA3 special command — no master interaction required.
 - **FC04 input register layout cleaned up (subtask 8).** Present, dirty, and raw-command-result moved down to a contiguous block at 0x0100–0x0108: present[4] at 0x0100–0x0103, dirty[4] at 0x0104–0x0107, raw_cmd_result at 0x0108. The fading bitmap (formerly 0x0155–0x0158), group_status array (formerly 0x0100–0x010F), and scan_status (formerly 0x0150) are removed entirely — they were derivable from the per-ballast status byte / group_mask, or vestigial from the pre-flag-driven era. Masters that read presence/dirty/raw_result must update their addresses; the master-visible group_mask range at FC03 0x0110–0x014F is intentionally preserved by a 14-byte padding hole inside `register_map_t`. Fade-running detection switches from the removed bitmap to bit 4 of the per-ballast status byte at FC03 0x0000–0x003F (high byte).
+- **Raw command result high-byte encoding revamped and FC04 read-clears removed.** OK was `0x02xx`; it is now `0x00xx` (the register value is just the response byte, with `0x0000` doing double duty as "no command issued yet"). ERR was `0x03xx`; it is now `0x02xx` with the same error-subtype low byte. PENDING (`0xFFxx`) and NAK (`0x0100`) are unchanged. Reads of FC04 0x0108 no longer clear the register — the outcome of the last raw command persists until the next RAW_CMD write overwrites it. The arm gate now only checks PENDING: any other state is silently overwritten on the next RAW_CMD write (so masters that want to preserve a prior outcome must read it before re-arming).
 
 ## Known Limitations
 

@@ -592,10 +592,17 @@ bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends) {
     uint8_t old_tcb = TCB0.INTCTRL;
     TCB0.INTCTRL = 0;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        if (g_regs.raw_cmd_result == RAW_RESULT_IDLE) {
+        // Reject only when a previous command is still in flight (high
+        // byte 0xFF).  Any other value — initial 0x0000, OK, NAK, ERR —
+        // is a terminal the master is free to overwrite by issuing a
+        // new RAW_CMD.  The register is not auto-cleared on read, so the
+        // master can re-read the prior outcome as many times as it wants
+        // before deciding to overwrite.
+        if ((uint8_t)(g_regs.raw_cmd_result >> 8) != 0xFFu) {
             raw_cmd_addr = addr_byte;
             raw_cmd_data = data_byte;
-            // 0xFF02 (twice) or 0xFF01 (single).
+            // 0xFF02 (twice) or 0xFF01 (single).  Low byte is consumed
+            // by dali_sync_dispatch_current to pick KIND_TWICE vs KIND_QUERY.
             g_regs.raw_cmd_result = (uint16_t)(0xFF00u | (sends & 0xFFu));
             armed = true;
         }

@@ -82,7 +82,7 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 | 1  | group (0–15) | 1 | Command to group |
 | 1  | 1111111 | 1 | Broadcast command |
 
-The per-ballast query registers in this firmware use short addresses (0–63). The DAPC, action, and raw command registers accept any valid DALI address byte, so group and broadcast commands are also supported.
+The per-ballast holding-register banks in this firmware use short addresses (0–63). The raw command registers (0x1000 / 0x1001) accept any valid DALI address byte, so group and broadcast commands are also supported through them.
 
 ### Command Types
 
@@ -171,13 +171,25 @@ New or reset devices generate a 24-bit random address. A controller discovers an
 4. Issue `PROGRAM SHORT ADDRESS` to assign the next free address
 5. Issue `YES` to confirm, then loop until no devices respond
 
-This firmware does **not** implement commissioning — it assumes devices are already addressed before connecting them to the bus.
+This firmware **implements control-gear commissioning** — see `Commissioning (FC03/FC06 0x1014)` under the Modbus Interface section for the master-facing surface. Master writes 0x0001 to `MBREG_COMMISSION` for full re-addressing or 0x0002 for incremental (assigns short addresses only to gears that don't already have one); reads the same register to poll status. Out of scope for this firmware: 24-bit forward frames (DALI-2 control-device addressing), memory-bank reads, and DT1/DT8 device-type extensions.
+
+---
+
+## Architectural Model
+
+The firmware is a **flag-driven state-reconciliation loop**. Every per-ballast cached field (brightness, status, min/max, power-on/sys-fail, fade rate/time, group memberships) lives in a single `g_regs` register map exposed directly over Modbus. A 64-byte `sync_flags[]` table tracks per-ballast reconciliation work — read-flags say "the cache is stale, refresh from the ballast", write-flags say "the master supplied a value, push it to the ballast". A Modbus write updates the cache predictively and sets the appropriate write-flag, then ACKs at the wire layer immediately.
+
+The main loop kicks `start_next_dali_work()` whenever DALI is idle. The work selector walks a fixed priority chain — commissioning state machine → raw command → pending group bit → SYNC_WRITE_* (rotating cursor) → SYNC_READ_LEVEL (same cursor) → continue in-progress full scan → start new full scan — and issues exactly one DALI command via `issue_dali_command()`. Cache invalidation is handled inside `issue_dali_command` as a uniform property of the command bytes — every DALI command from every source (per-ballast bank write, raw command, commissioning step, internal full-scan step) goes through the same chokepoint, so the invalidation logic lives once and the per-source handlers stay trivial. Commissioning sits at the top of the chain so a master raw write of e.g. `0xA3VV` (DTR0 load) can't clobber the staged DTR0 mid-bisect.
+
+Completion runs in ISR context (`dali_sync_completion`) and either advances a multi-step sequence (level read = QUERY_STATUS + GET_LEVEL; multi-step write = DTR0 + SET twice + DTR0 + SET twice) or releases `dali_busy` for the next pick. Periodic level re-polls are spread evenly via the RTC-PIT cursor (one ballast per `RESCAN_INTERVAL` seconds, round-robin across all 64 slots) instead of bursting. Masters detect when reads have caught up by polling the dirty bitmap (FC04 0x0104–0x0107, read-clears).
+
+There is no command queue, no event-callback chain, and no synchronous DALI work in the main loop. State *is* the protocol; events are derived from state changes; ISRs only set/clear flags or update cache cells.
 
 ---
 
 ## DALI State Machine
 
-The firmware implements a five-state machine that drives all DALI bus activity. Every state transition is interrupt-driven — the main loop simply sleeps until a Modbus command arrives or the background scan triggers a wakeup.
+The firmware implements a five-state bit-level machine that drives all DALI bus activity. Every state transition is interrupt-driven — the main loop simply sleeps until a Modbus command arrives or the PIT-driven sync-flag cursor sets a flag the work selector picks up.
 
 ### Timer Architecture
 
@@ -190,8 +202,8 @@ Two hardware timers underpin the state machine:
 
 ```
                     ┌─────────────────────┐
-       has          │        IDLE         │◄────────────────────────────┐
-       commands     │  (dali_idle = true) │                             │
+       sync work    │        IDLE         │◄────────────────────────────┐
+       pending      │  (dali_idle = true) │                             │
           ┌─────────┤  watch for external │                             │
           │         │  TX on RX pin       │                             │
           │         └──────────┬──────────┘                             │
@@ -225,9 +237,9 @@ Two hardware timers underpin the state machine:
 
 **IDLE** (`dali_state_idle.c`)
 
-The bus is quiet and we own it. Two things can happen:
-- If the command queue has entries, immediately call `dali_transmitting_state_enter()`.
-- Otherwise, set `dali_idle = true` (allowing the main loop to sleep), arm a one-shot rising-edge interrupt on the RX pin, and wait. If a rising edge arrives it means another master has started transmitting, so we call `dali_wait_for_idle_state_enter()` to stay out of the way until the bus is quiet again.
+The bus is quiet and we own it. The entry path branches on `dali_busy`:
+- If `dali_busy` is true, a sync op is in flight and we just finished the inter-frame gap. Clear `dali_idle`, re-check the bus, and dispatch the next step of the in-flight op via `dali_sync_dispatch_current()` (which picks the right command for the current `OP_*` and calls `issue_dali_command`).
+- Otherwise, `OUTCLR` the DALI TX line (belt-and-braces release), set `dali_idle = true` (allowing the main loop to sleep or to call `start_next_dali_work()` to launch a new sync op), prepare the receive timer, and arm a one-shot rising-edge interrupt on RX. If a rising edge arrives it means another master has started transmitting, so we yield via `dali_wait_for_idle_state_enter()` until the bus is quiet again.
 
 **TRANSMITTING** (`dali_state_transmitting.c`)
 
@@ -238,7 +250,7 @@ Sends the 16-bit forward frame using Manchester encoding driven entirely by TCA0
 3. `send_one()` drives TX high and schedules `half_bit_toggle()`.
 4. `half_bit_toggle()` toggles TX (completing the mid-bit transition), schedules the next bit's first-half function (`send_one` or `send_zero` from the MSB of `shift_reg`), shifts `shift_reg` left, decrements `bits_left`.
 5. When `bits_left == 0`, schedules `start_stop_bits()`, which drives TX low for 4 Te (two full stop bits).
-6. After stop bits: CMD_QUERY and CMD_SEND_TWICE call `dali_wait_for_response_state_enter()`. CMD_SEND and CMD_DIRECT_ARC call `cmdq_result_received(DALI_RESPONSE_NAK, 0)` directly (no response expected; skips the 22 Te response window to halve inter-command latency).
+6. After stop bits: CMD_QUERY and CMD_SEND_TWICE call `dali_wait_for_response_state_enter()`. CMD_SEND and CMD_DIRECT_ARC call `dali_result_received(DALI_RESPONSE_NAK, 0)` directly (no response expected; skips the 22 Te response window to halve inter-command latency).
 
 Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
 
@@ -247,7 +259,7 @@ Each bit takes exactly 2 TCA0 ticks (2 × 416.67 µs = 833.33 µs = 1200 bps).
 After the forward frame the master must listen for a backward frame within 7–22 Te. This state:
 - Pre-configures TCB0 for pulse capture (`dali_state_receiving_prepare()`).
 - Arms a one-shot rising-edge interrupt on RX. A rising edge means a backward frame start bit is arriving; we call `dali_state_receiving_enter()`.
-- Sets a TCA0 timeout of 22 Te. If it fires before any edge, the device did not respond: call `cmdq_result_received(DALI_RESPONSE_NAK, 0)` and return to IDLE.
+- Sets a TCA0 timeout of 22 Te. If it fires before any edge, the device did not respond: call `dali_result_received(DALI_RESPONSE_NAK, 0)` and return to IDLE.
 
 Commands that do not expect a response (e.g. DAPC, Off) still pass through this state; the NAK timeout simply confirms silence and the state machine moves on.
 
@@ -270,8 +282,8 @@ MIDDLE_1    START_1,   no shift               MIDDLE_0, shift 0
 The *short* pulse is a half-bit transition (mid-bit); the *long* pulse spans a full bit and carries the same bit value as the previous bit (a "stretched" transition at the bit boundary).
 
 TCA0 is re-armed to 5 Te on every edge. When TCA0 fires with no new edge — i.e. the bus has been idle for more than two full bits — `timer_overflow()` is called:
-- If the final state is `START_0` or `MIDDLE_1` **and** exactly 8 bits were received: `cmdq_result_received(DALI_RESPONSE_OK, shift_reg)`.
-- Otherwise: `cmdq_result_received(DALI_RESPONSE_MALFORMED, 0)`.
+- If the final state is `START_0` or `MIDDLE_1` **and** exactly 8 bits were received: `dali_result_received(DALI_RESPONSE_OK, shift_reg)`.
+- Otherwise: `dali_result_received(DALI_RESPONSE_MALFORMED, 0)`.
 
 Either way, transitions to WAIT_FOR_IDLE to enforce the minimum inter-frame gap.
 
@@ -283,24 +295,31 @@ Enforces the DALI requirement that the bus be idle for at least 22 Te before the
 - If the bus goes high again before the countdown expires (another master, collision debris, capacitive ringing), restart.
 - When 22 Te completes uninterrupted: call `dali_idle_state_enter()`.
 
-### Command Queue
+### Sync-flag work selector
 
-`cmdq_push*()` (in `cmd_queue.c`) appends to an 8-entry ring buffer (`CMD_QUEUE_SIZE = 8`). Each entry (`cmd_entry_t`) holds:
-- `type` — `CMD_DIRECT_ARC`, `CMD_SEND`, `CMD_SEND_TWICE`, or `CMD_QUERY`
-- `dali_addr` / `dali_cmd` — the two bytes of the DALI forward frame
-- `ballast_idx` — short address (0–63) used to index into the register map; 0xFF for group/broadcast
-- `reg_target` — which register field to update with the response (`REG_BRIGHTNESS`, `REG_STATUS`, etc.)
-- `repeat` — remaining send count (2 for `CMD_SEND_TWICE`, 1 otherwise)
-- `on_result` — optional callback fired from ISR context when the command completes
+Each ballast has one byte in `sync_flags[64]` (`dali_sync.c`) tracking pending reconciliation:
 
-When a command completes (or NAKs), `cmdq_result_received()` (in `dali_state_idle.c`) is called. It:
-1. Stores the response byte into the register field named by `reg_target` (via `regs_apply_result()`).
-2. For `CMD_SEND_TWICE`: decrements `repeat` and re-dispatches without popping or calling the callback.
-3. Fires `on_result` if set, then pops the queue and enters the next state.
+- `SYNC_READ_LEVEL` — periodic level re-poll (QUERY_STATUS + QUERY_ACTUAL_LEVEL, two queries one logical op).
+- `SYNC_READ_FULL` — re-fetch all 7 config fields (min, max, fade rate/time, power-on, sys-fail, groups 0–7, groups 8–15). Chunked one query per work-selector pass so other DALI work can interleave.
+- `SYNC_WRITE_LEVEL / MINMAX / POWER / FADE` — master-supplied value cached predictively in `g_regs`, awaits push to the ballast. The MINMAX/POWER/FADE sequences are 4-step (DTR0 + SET twice + DTR0 + SET twice) and run atomically because DTR0 is shared across all ballasts.
+- `SYNC_RETRY_PENDING` — first NAK seen on a level read or a write-final step; one retry before marking the ballast absent.
+
+`start_next_dali_work()` walks the priority chain (raw command → pending group bit → SYNC_WRITE_* → SYNC_READ_LEVEL → continue full scan → start full scan) and, when work is found, dispatches one DALI command via `dali_sync_dispatch_current()` → `issue_dali_command()`. The unified issuance function classifies cache invalidation as a property of the outgoing address + data bytes — DAPC and step/recall commands set `SYNC_READ_LEVEL` on the affected ballast(s); SET, scene, and group-membership commands set `SYNC_READ_FULL`; queries and DTR loads set nothing. Completion is dispatched in ISR context by `dali_sync_completion`, which advances the multi-step sequence or releases `dali_busy` for the next pick.
 
 ### Periodic Rescan
 
-The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator). A software counter counts down from the value of holding register `RESCAN_INTERVAL` (0x1011, default 64), triggering `bgtasks_trigger_scan()` on expiry. Writing 0 to the register disables periodic rescans; a manual scan can still be triggered at any time via `SCAN_TRIGGER` (0x1010). The scan walks all 64 DALI addresses in order using a chained callback pattern — one query command at a time — issuing 9 queries per responding device (status, brightness, min, max, power-on, sys-fail, fade rate, fade time, groups 0–7, groups 8–15). The chain approach keeps the 8-entry queue from overflowing and allows the fade tracker to interleave between scan commands.
+The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator).  Each PIT tick increments a counter; once it reaches `RESCAN_INTERVAL` (0x1011), the firmware sets `SYNC_READ_LEVEL` on **one** ballast at the cursor position and advances the cursor (mod 64).  `RESCAN_INTERVAL = 0` disables the cursor entirely.  Writing 0x0001 to `SCAN_TRIGGER` (0x1010) sets `SYNC_READ_FULL` on all 64 ballasts in one pass, kicking off a full re-discovery.
+
+**Semantic change vs pre-refactor firmware**: `RESCAN_INTERVAL` used to mean "seconds between burst rescans of the entire bus."  It now means "seconds between single-ballast level polls."  The full-cycle latency at default `RESCAN_INTERVAL = 64` is therefore 64 ballasts × 64 s ≈ 68 minutes — much slower than the previous 64 s burst.  This is a deliberate trade-off: the round-robin cursor never bursts, so background bus duty is effectively zero between polls and never spikes.
+
+Settings:
+
+- `RESCAN_INTERVAL = 0` — disabled (cursor never advances, no automatic polls).
+- `RESCAN_INTERVAL = 1` — 1 ballast/s, full cycle in 64 s. Equivalent per-ballast polling rate to the old default 64 s burst, but spread evenly. Recommended for installations that need fast drift detection.
+- `RESCAN_INTERVAL = 64` (default) — 1 ballast/min, full cycle ≈ 68 min. Recommended when masters rely on the dirty bitmap (FC04 0x0104–0x0107) for change notification rather than firmware-driven polls.
+- Larger values trade slower drift detection for even lower bus load.
+
+The default is intentionally conservative; the firmware does not change it. Tune via `make configure RESCAN_INTERVAL=...` as needed.
 
 ### Multi-Master Behaviour
 
@@ -320,90 +339,105 @@ The slave address (1–247) is stored in EEPROM (holding register 0x1012, persis
 
 | Code | Name | Description |
 |------|------|-------------|
-| 0x03 | Read Holding Registers | Read configuration registers (max 16 registers per request) |
-| 0x04 | Read Input Registers | Read ballast data and device info (max 16 registers per request) |
-| 0x05 | Write Single Coil | Write a single coil output |
-| 0x06 | Write Single Holding Register | Send a DALI command or update config |
-| 0x0F | Write Multiple Coils | Write multiple coil outputs |
-| 0x10 | Write Multiple Holding Registers | Write a block of holding registers |
+| 0x03 | Read Holding Registers | Read per-ballast cache, group masks, and gateway config (max 16 regs per request) |
+| 0x04 | Read Input Registers | Read presence + dirty bitmaps, raw-command result, version block |
+| 0x06 | Write Single Holding Register | Update per-ballast cache, group mask, raw command, or gateway config |
+| 0x10 | Write Multiple Holding Registers | Write a contiguous block of holding registers |
 
-### FC01/FC05/FC0F — Coil Map
-
-Coil N maps to ballast N (0–63).
-
-| Operation | Behaviour |
-|-----------|-----------|
-| FC01 read coil N | Returns 1 if ballast N is present and brightness > 0, else 0 |
-| FC05 write coil N ON (0xFF00) | Sends GOTO_LAST_ACTIVE to ballast N; starts fade tracking |
-| FC05 write coil N OFF (0x0000) | Sends OFF to ballast N; starts fade tracking |
-| FC05 write coil N TOGGLE (0x5500) | Non-standard extension: reads current brightness and inverts state |
-| FC0F write multiple coils | Applies ON/OFF to each coil in the bitmask; returns DEVICE_BUSY if the command queue has fewer free slots than the coil count |
-
-**Broadcast / group operations**: FC01/FC05/FC0F only address individual ballasts (coil N = short address N). To send a DALI broadcast or group command (e.g. turn all lights off), write to the appropriate holding register action command (e.g. `MBREG_OFF` at 0x1004 with the DALI broadcast address byte 0xFF).
+Coils (FC01 / FC05 / FC0F) were retired in subtask 5: per-ballast on/off / level changes go through the per-ballast brightness bank (0x0000-0x003F) which arms the asynchronous DALI work selector and ACKs immediately; broadcast / group / specialty DALI sends go through the raw command channel (0x1000 / 0x1001).  Frames using the retired function codes get an ILLEGAL_FUNCTION exception reply.
 
 ### FC04 — Input Register Map
 
-All DALI ballast data is read via FC04 (Read Input Registers). Registers are 16-bit, addressed from 0x0000.
+Read-only state derived from DALI traffic. Registers are 16-bit, addressed from 0x0000.
 
 | Address range | Width | Content |
 |---------------|-------|---------|
-| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness (high byte = DALI status bits, low byte = arc level) |
-| 0x0040–0x007F | 64 regs | Per-ballast min \| max level |
-| 0x0080–0x00BF | 64 regs | Per-ballast power-on \| sys-fail level |
-| 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time |
-| 0x0100–0x010F | 16 regs | Group status — OR of all member ballast status bytes |
-| 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group) |
-| 0x0150 | 1 reg | Scan status: 0 = idle, 1 = scanning, 2 = complete |
-| 0x0151–0x0154 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
-| 0x0155–0x0158 | 4 regs | Fading bitmask — set when DALI status fade-running bit is active |
-| 0x0159–0x015C | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
-| 0x015D | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
+| 0x0100–0x0103 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
+| 0x0104–0x0107 | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
+| 0x0108 | 1 reg | Async raw command result (see FC06 0x1000 / 0x1001) |
 | 0x0200–0x020F | 16 regs | Version string: `DALI v<maj>.<min> <10-byte-serial-as-20-hex-chars>` — read exactly 16 registers |
+
+A master can fetch presence + dirty in a single 8-register FC04 read at 0x0100. FC04 reads outside these ranges return `ILLEGAL_ADDRESS`. The per-ballast banks formerly at 0x0000–0x00FF and the group membership masks formerly at 0x0110–0x014F have moved to the holding-register map below — this is a breaking change from earlier firmware revisions.
 
 ### FC03/FC06/FC10 — Holding Register Map
 
+Per-ballast cached DALI state (read-write) and gateway control registers.
+
+| Address range | Width | Content |
+|---------------|-------|---------|
+| 0x0000–0x003F | 64 regs | Per-ballast status \| brightness. FC03 returns the cached `[status:brightness]` pair. FC06/FC10 write: low byte = DAPC level (0–254 valid; 255 = "no change" per DALI), high byte ignored. |
+| 0x0040–0x007F | 64 regs | Per-ballast min \| max level. Both bytes consumed on write. |
+| 0x0080–0x00BF | 64 regs | Per-ballast power-on \| sys-fail level. Both bytes consumed on write. |
+| 0x00C0–0x00FF | 64 regs | Per-ballast fade rate \| fade time. Both bytes consumed on write. |
+| 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group). Writes are predictively cached and propagate per-bit via ADD_TO_GROUP / REMOVE_FROM_GROUP DALI commands by the work selector. |
+
+**Per-ballast bank writes ACK immediately at the Modbus layer.**  The actual DALI command that pushes the change to the ballast is dispatched asynchronously by the sync-flag work selector — the master no longer blocks waiting for DALI propagation.  To detect when reconciliation has completed, poll the dirty bitmap (FC04 0x0104-0x0107, read-clears semantics).  This is a behavioural change vs pre-refactor firmware where writes blocked until DALI completion.
+
 | Address | Name | Read | Write |
 |---------|------|------|-------|
-| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x015D. Returns DEVICE_BUSY if previous result not yet read. |
-| 0x1001 | RAW_CMD_TWICE | 0 | Same frame format as 0x1000 but sent twice (for DALI set commands). No backward frame expected. |
-| 0x1002 | DAPC | 0 | `[15:8]` = DALI address byte, `[7:0]` = arc level. Sends Direct Arc Power Control. |
-| 0x1003 | GOTO_LAST_ACTIVE | 0 | Low byte = DALI address byte. Sends Go To Last Active. |
-| 0x1004 | OFF | 0 | Low byte = DALI address byte. Sends Off. |
-| 0x1005 | UP | 0 | Low byte = DALI address byte. Sends Up. |
-| 0x1006 | DOWN | 0 | Low byte = DALI address byte. Sends Down. |
-| 0x1007 | STEP_UP | 0 | Low byte = DALI address byte. Sends Step Up. |
-| 0x1008 | STEP_DOWN | 0 | Low byte = DALI address byte. Sends Step Down. |
-| 0x1009 | RECALL_MAX | 0 | Low byte = DALI address byte. Sends Recall Max Level. |
-| 0x100A | RECALL_MIN | 0 | Low byte = DALI address byte. Sends Recall Min Level. |
-| 0x100B | SET_DTR0 | 0 | Low byte = value to load into DALI DTR0. |
-| 0x100C | SET_DTR1 | 0 | Low byte = value to load into DALI DTR1. |
-| 0x100D | SET_DTR2 | 0 | Low byte = value to load into DALI DTR2. |
-| 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to start a full bus scan immediately. |
-| 0x1011 | RESCAN_INTERVAL | R/W | Seconds between automatic periodic bus rescans. Default 64. Write 0 to disable. |
-| 0x1012 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to EEPROM on write. |
-| 0x1013 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to EEPROM on write. |
+| 0x1000 | RAW_CMD | 0 | `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x0108. Returns DEVICE_BUSY if previous result not yet read. |
+| 0x1001 | RAW_CMD_TWICE | 0 | Same frame format as 0x1000 but sent twice within the DALI 100 ms re-send window (used for SET / INITIALISE / RANDOMISE). |
+| 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to set SYNC_READ_FULL on all 64 ballasts (full re-discovery). |
+| 0x1011 | RESCAN_INTERVAL | R/W | Seconds between single-ballast level re-polls (round-robin cursor). Default 64; full cycle = `RESCAN_INTERVAL × 64` seconds. Write 0 to disable. See "Periodic Rescan" above for the semantic change vs pre-refactor firmware. |
+| 0x1012 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to USERROW on write. |
+| 0x1013 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to USERROW on write. |
+| 0x1014 | COMMISSION | status word | Trigger / abort / poll the IEC 62386-102 control-gear commissioning state machine. See "Commissioning (FC03/FC06 0x1014)" below. |
 
-The DALI address byte for action registers (0x1003–0x100A) can be any valid DALI address byte — short address, group address, or broadcast (0xFE) — encoded in the standard DALI format. The same applies to DAPC (0x1002) and the raw command registers (0x1000, 0x1001).
+The DALI address byte for raw command registers (0x1000, 0x1001) can be any valid DALI address byte — short address, group address, broadcast (0xFE), or special command (e.g. 0xA3 SET_DTR0).  Cache invalidation runs uniformly on every issued command via `issue_dali_command`, regardless of the master's choice between the per-ballast bank shortcut and a raw command — neither path needs explicit invalidation logic at the call site.
 
-### Async Raw Command Result (FC04 0x015D)
+### Async Raw Command Result (FC04 0x0108)
 
-After writing to 0x1000 (RAW_CMD), poll FC04 register 0x015D for the result:
+After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 0x0108 for the result.  Reading the register at a terminal state (high byte 0x01 / 0x02 / 0x03) returns the value AND clears it back to 0x0000 atomically — so the master can detect completion in a single FC04 read without a follow-up clear write.
 
-| Value | Meaning |
-|-------|---------|
-| 0x0000 | Idle — no command in progress |
-| 0xFF00 | Pending — command sent, awaiting response |
-| 0x0100 | NAK — no backward frame received |
-| 0x02xx | OK — backward frame received; low byte = response |
-| 0x03xx | Error — bus/timing fault; low byte = error subtype |
+| High byte | Low byte | Meaning |
+|-----------|----------|---------|
+| 0x00 | 0x00 | Idle — no command in progress (or master has just consumed the previous result) |
+| 0xFF | sends remaining | Pending — high byte 0xFF, low byte = number of DALI sends remaining at arming (0x02 right after writing 0x1001; 0x01 right after writing 0x1000). The low byte does NOT decrement mid-twice-send: a RAW_CMD_TWICE stays at `0xFF02` from arming until both sends have completed and a terminal value is written. The two sends are coalesced into a single completion (the bit-level state machine handles the inter-send 22 Te re-fire) for simpler completion semantics — masters only need to distinguish "pending" from "terminal", not count sends. Match the high byte for the pending check (`(value & 0xFF00) == 0xFF00`); the only visible mid-pending value is `0xFF02`, but treating any `0xFFxx` as pending is the safe rule. |
+| 0x01 | 0x00 | NAK — no backward frame received within the 22 Te response window |
+| 0x02 | response byte | OK — backward frame received |
+| 0x03 | error subtype | Error — bus/timing fault (1 = malformed, 2 = pulse too short, 3 = pulse in middle, 4 = pulse too long) |
 
-### Fade Tracking
+### Commissioning (FC03/FC06 0x1014)
 
-After any DAPC or arc command sent to a short address, the firmware starts a reactive STATUS → BRIGHTNESS → STATUS polling chain for that ballast. The chain continues until the DALI status fade-running bit (bit 4) clears, then stops. At most two DALI commands are queued per chain, so many concurrent fades do not overflow the command queue. The FC04 fading bitmask (0x0155–0x0158) reflects the current state from real DALI responses.
+`MBREG_COMMISSION` (holding register 0x1014) drives the IEC 62386-102 control-gear commissioning state machine — the bisect-based discovery + addressing protocol that lets the gateway assign short addresses (0–63) to fresh ballasts without an external commissioning tool.
+
+**Write encoding** (FC06 to 0x1014):
+
+| Value | Action |
+|-------|--------|
+| 0x0000 | Abort: send TERMINATE, return to idle. No-op when already idle or in a terminal state (master must read 0x1014 to clear those). |
+| 0x0001 | Start **full** commissioning: INITIALISE(all), wipe existing per-ballast cache, assign 0..N−1 to discovered ballasts. **Destructive** — overwrites any existing addressing. |
+| 0x0002 | Start **incremental** commissioning: INITIALISE(without short addr), only address ballasts that don't currently have one. Already-addressed ballasts are not disturbed; new gear takes the lowest unused short addresses. |
+| anything else | ILLEGAL_VALUE |
+
+Writing 0x0001 or 0x0002 while a run is already in progress returns DEVICE_BUSY. 0x0000 always succeeds (no-op when idle / terminal).
+
+**Read encoding** (FC03 of 0x1014) — high byte encodes phase, low byte encodes count or error subtype:
+
+| High byte | Low byte | Meaning |
+|-----------|----------|---------|
+| 0x00 | 0x00 | Idle — no run ever, or last run completed and master has consumed status |
+| 0x01 | count | Running — `count` ballasts addressed so far this run |
+| 0x02 | total | Complete — `total` short addresses assigned this run (read-clears) |
+| 0x03 | subtype | Error / aborted (read-clears). Subtype: 0x01 = aborted by master, 0x02 = no ballasts found, 0x03 = >3 consecutive verify failures, 0x04 = ran out of short addresses (more ballasts than free slots), 0x05 = bus shorted longer than 200 TE during commissioning (run aborted) |
+
+**Read-clears semantics on terminal states**: reading 0x1014 when the high byte is 0x02 or 0x03 returns the value AND resets the underlying state to 0x0000 atomically — same shape as FC04 0x0108. Idle (0x00) and running (0x01) reads are non-clearing so masters can poll progress.
+
+**Concurrency**: OP_COMMISSION is the highest-priority work-selector slot — concurrent raw commands and per-ballast bank writes that arrive mid-run are queued and execute after the run finishes. Successful PROGRAM_SHORT_ADDRESS additionally arms `SYNC_READ_FULL` on the just-addressed ballast, so the cache populates without a manual SCAN_TRIGGER.
+
+**Timing**: a full-bus commissioning of 64 ballasts takes ~3 minutes at 1200 baud (~3 s/ballast for the bisect chain — 24 search rounds × 4 sends + program/verify/withdraw). The master can poll 0x1014 at any rate; the count low byte advances monotonically as PROGRAM/VERIFY rounds succeed.
+
+**Aborting**: writing 0x0000 mid-run latches an abort request — the next dispatch boundary forces TERMINATE, then idle. Status latches to 0x0301 before TERMINATE issues so a master poll between abort-request and TERMINATE-completion still observes the aborted state.
+
+### Write propagation and fade tracking
+
+Brightness register writes are **predictive**: the master writes a new level to the per-ballast brightness register (0x0000–0x003F low byte), the firmware updates the cached value immediately, sets `SYNC_WRITE_LEVEL` on that ballast, and ACKs the Modbus write at the wire layer. The DALI DAPC command that pushes the level to the ballast is dispatched asynchronously by the work selector when DALI is next idle — typically within a few milliseconds, but the master is no longer blocked. Once the DAPC completes, the per-ballast dirty bit is set; on the next master read of the brightness bank, the dirty bit clears.
+
+There is no separate fade-polling chain. The fade-running indicator is bit 4 of the per-ballast status byte (FC03 0x0000–0x003F high byte), updated whenever a `SYNC_READ_LEVEL` pass issues `QUERY_STATUS` against that ballast. The work selector visits each ballast on the round-robin cursor (one per `RESCAN_INTERVAL` seconds), so a fade in progress is detected the next time the cursor reaches it; the dirty bit (0x0104–0x0107) flips on every status-byte change and notifies the master that a fresh read of block0 is worth doing. Masters that need fast fade visibility should lower `RESCAN_INTERVAL` toward 1 (full cycle in 64 s) or trigger an explicit `SCAN_TRIGGER` re-discovery, then watch the dirty bitmap and re-read block0 to observe FADE_RUNNING clearing.
 
 ### Multi-Master Operation
 
-The firmware is designed to operate as the sole DALI master on its bus. It can detect when another master is transmitting (rising edge on the RX pin) and will yield rather than collide — but it does not decode traffic it did not initiate. If another DALI master changes ballast levels, the FC04 register data will remain stale until the next scheduled rescan (default: 64 seconds) or a manual scan trigger. For reliable register state, use this device as the exclusive DALI master or reduce the rescan interval (`MBREG_RESCAN_INTERVAL`, 0x1011) to suit the expected update rate.
+The firmware is designed to operate as the sole DALI master on its bus. It can detect when another master is transmitting (rising edge on the RX pin) and will yield rather than collide — but it does not decode traffic it did not initiate. If another DALI master changes ballast levels, the FC04 register data will remain stale until the next round-robin level re-poll visits the affected ballast (full cycle = `RESCAN_INTERVAL × 64` seconds) or a `SCAN_TRIGGER` re-discovery. For reliable register state, use this device as the exclusive DALI master, lower `RESCAN_INTERVAL` toward 1, or have the master poll the dirty bitmap (FC04 0x0104-0x0107) for change notification.
 
 ---
 
@@ -416,7 +450,7 @@ The firmware is designed to operate as the sole DALI master on its bus. It can d
 | PA1 | RS-485 TX (USART0 alternate TXD) |
 | PA2 | RS-485 RX (USART0 alternate RXD) |
 | PA4 | RS-485 DE — driver enable, driven by hardware RS-485 mode (USART_RS485_EXT_gc), no firmware management needed |
-| PB0 | DALI TX — open-drain output, driven low to pull bus down |
+| PB0 | DALI TX — drives the external bus transistor. **OUTSET (PB0 HIGH) asserts the bus** (drives bus low via the transistor); **OUTCLR (PB0 LOW) / high-Z releases**. Reset state (high-Z) is released. |
 | PB1 | DALI RX — input via optocoupler (signal is inverted: HIGH = bus active/low) |
 
 ### Power
@@ -453,33 +487,39 @@ make configure SLAVE_ADDR=42 BAUD_INDEX=2 RESCAN_INTERVAL=30
 
 `BAUD_INDEX` is `0=9600 / 1=19200 / 2=38400`. `make configure` rewrites all 32 USERROW bytes — the four config bytes plus 28 bytes of `0xFF`.
 
+## Behavioural Changes (vs pre-refactor firmware)
+
+The flag-driven refactor (branch `task-1-flag-driven`) introduces several wire-protocol-visible changes. Masters built against earlier firmware revisions need the following adjustments:
+
+- **Writes ACK at the Modbus wire layer, not at DALI completion.** Per-ballast bank writes (0x0000–0x00FF), group-mask writes (0x0110–0x014F), and raw command writes (0x1000 / 0x1001) all return their normal echo-style ACK as soon as the cache is updated and the work is armed. The DALI command that pushes the change to the ballast is dispatched asynchronously by the work selector. Masters that previously took the write-ACK as "ballast confirmed" must switch to **dirty-bit polling** (FC04 0x0104–0x0107, read-clears) to detect when the change has propagated.
+- **Per-ballast cache addresses moved from FC04 (input regs) to FC03 (holding regs).** Addresses 0x0000–0x00FF (status/brightness, min/max, power-on/sys-fail, fade rate/time) and 0x0110–0x014F (group masks) are now read via FC03 and written via FC06/FC10. Reading them via FC04 returns `ILLEGAL_ADDRESS`.
+- **Coil function codes (FC01 / FC05 / FC0F) removed.** All three return `ILLEGAL_FUNCTION`. Masters that used FC05 / FC0F to drive ON/OFF should write the brightness register low byte (0 = off, ≥1 = on / proportional). FC01 (read coils) likewise has no replacement; read the brightness bank via FC03 instead.
+- **Action holding registers 0x1002–0x100A removed.** DAPC at 0x1002, GOTO_LAST_ACTIVE at 0x1003, OFF/UP/DOWN/STEP_UP/STEP_DOWN/RECALL_MAX/RECALL_MIN at 0x1004–0x100A all return `ILLEGAL_ADDRESS`. DAPC is now done via the brightness register (0x0000–0x003F); the rest are issued via the raw command channel (0x1000 / 0x1001).
+- **`RESCAN_INTERVAL` (0x1011) semantic change.** Previously "seconds between full-bus burst rescans"; now "seconds between single-ballast level polls" via the round-robin cursor. Same address, same units, very different cycle time at the same numeric value. See the *Periodic Rescan* section above.
+- **Async raw command pending state uses `0xFFnn` with non-zero low byte.** The 0x0108 pending encoding is `0xFF02` (after writing 0x1001 RAW_CMD_TWICE) or `0xFF01` (after writing 0x1000 RAW_CMD); the low byte does NOT decrement mid-twice-send (the firmware transitions directly from `0xFF02` to the terminal value once both sends complete). Masters that strict-equal `value == 0xFF00` for "still pending" will miss both initial arming states; match the high byte instead (`(value & 0xFF00) == 0xFF00`).
+- **DTR-setter holding registers removed (subtask 9).** `SET_DTR0` (0x100B), `SET_DTR1` (0x100C), and `SET_DTR2` (0x100D) all return `ILLEGAL_ADDRESS`. They were thin wrappers around raw DALI sends; issue the equivalent special command via the raw channel instead — write `0xA3VV` to 0x1000 to load DTR0 with `VV`, `0xC3VV` for DTR1, `0xC5VV` for DTR2 (single send, no backward frame expected; the result register at FC04 0x0108 reaches `NAK` once the send completes). The internal multi-step write sequences (min/max, power-on/sys-fail, fade rate/time) still drive DTR0 directly via the address-byte 0xA3 special command — no master interaction required.
+- **FC04 input register layout cleaned up (subtask 8).** Present, dirty, and raw-command-result moved down to a contiguous block at 0x0100–0x0108: present[4] at 0x0100–0x0103, dirty[4] at 0x0104–0x0107, raw_cmd_result at 0x0108. The fading bitmap (formerly 0x0155–0x0158), group_status array (formerly 0x0100–0x010F), and scan_status (formerly 0x0150) are removed entirely — they were derivable from the per-ballast status byte / group_mask, or vestigial from the pre-flag-driven era. Masters that read presence/dirty/raw_result must update their addresses; the master-visible group_mask range at FC03 0x0110–0x014F is intentionally preserved by a 14-byte padding hole inside `register_map_t`. Fade-running detection switches from the removed bitmap to bit 4 of the per-ballast status byte at FC03 0x0000–0x003F (high byte).
+
 ## Known Limitations
 
 These are residual issues that the current firmware does not address. None are runtime-fatal; each has a documented workaround or expected impact.
 
 ### Modbus
 
-- **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2-3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
-- **FC10 partial execution on register-map holes.**  The holding-register set has gaps at 0x100E and 0x100F.  A multi-register write spanning the gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the hole.
-- **FC0F worst-case latency.**  Writing 64 coils at once dispatches 64 DALI commands; with the mandatory 22 Te idle gap between frames the bus takes ~4.8 s to drain.  A master that times out faster than that will see `DEVICE_BUSY` on follow-up writes until the queue clears.
+- **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2–3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
+- **FC10 partial execution on register-map holes.**  The holding-register map has gaps at 0x1002–0x100A (action regs retired in subtask 4/5) and at 0x100E–0x100F.  A multi-register write spanning a gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the holes.
 - **FC04 0x0200 returns an ASCII version string, not a register address space.**  Reading exactly 16 input registers from address 0x0200 yields the 32-byte string `"DALI v<maj>.<min> <serial>"`.  Other lengths at this address fall through to the standard register-range check and return `ILLEGAL_ADDRESS`.
+- **`frame_is_valid` still recognises the retired coil function codes (FC01 / FC05 / FC0F) for size-check purposes, and the broadcast filter still admits FC05 / FC0F.**  This is intentional: well-formed coil frames pass frame validation, reach the FC dispatcher, and receive a graceful `ILLEGAL_FUNCTION` exception reply (or — for a broadcast-addressed FC05 / FC0F — are silently absorbed) rather than being dropped at the size check.  Candidate for future tightening: removing the FC01 / FC05 / FC0F cases from `frame_is_valid` and from the broadcast filter would drop those frames at validation time instead.  Nothing breaks if it stays as-is; the current shape gives masters that probe for coil support a clearer "function not supported" answer.
 
 ### DALI
 
-- **Add/remove-from-group readback bug.**  A raw `ADD_TO_GROUP` / `REMOVE_FROM_GROUP` command (0x60-0x7F) is dispatched but no follow-up `QUERY_GROUPS_*` is queued, so the cached `group_mask` does not refresh until the periodic bus scan runs (default 64 s).
 - **No multi-master collision detection during our own TX.**  If another master begins driving the bus while we are already transmitting, the resulting collision is not detected; the receiving ballast simply sees a malformed frame and ignores it.
 - **`WAIT_FOR_IDLE` skipped after a backward-frame NAK.**  After a query that NAKs (no response), the state machine goes directly to the next command without an explicit 22 Te idle wait.  Safe in practice because the NAK timeout itself spans well over 22 Te, but it is structural rather than enforced.
-- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a tolerance window; pulses falling between the half-bit and full-bit ranges (~500-667 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
-- **Bus duty cycle during scan.**  A full 64-address scan with each ballast's nine follow-up queries occupies the bus at roughly 30% duty for ~30 s.  Other DALI traffic (DAPC commands from the master) is queued and dispatched between scan steps but with reduced throughput.
-- **`MBREG_SET_DTR0` / `SET_DTR1` / `SET_DTR2` race against raw set helpers.**  A raw DALI set sequence (e.g. SET_MAX_LEVEL, which loads DTR0 then sends the SET command twice) runs as multiple queue entries; an interleaved write to `MBREG_SET_DTR0` from the master can clobber DTR0 mid-sequence.  Use either the helper or the raw flow exclusively, not both concurrently.
-
-### Concurrency
-
-- **`bgtasks_start_fade_poll` race.**  The check-and-set on `fade_chain_active` inside `ATOMIC_BLOCK` only fences out LVL0 ISRs; TCB0 (LVL1) clearing the bit between LVL0's check and its set can drop a fresh fade-tracking request.  Symptom: stale `block0[idx].brightness` until the next user action on the same ballast.
-- **Double-pop race on receive timeout.**  In a microsecond-wide window during `rx_cleanup`, both LVL0 (`timer_overflow`) and LVL1 (`send_rx_error`) can call `cmdq_result_received` for the same outstanding command, popping the queue twice.  Triggers only if `TCB0.INTFLAGS` is already pending at the moment TCA0 dispatches the receive timeout - vanishingly unlikely under spec-compliant DALI timing.
+- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a tolerance window; pulses falling between the half-bit and full-bit ranges (~500–667 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
+- **Multi-step write sequences hold the bus for ~300 ms.**  `SYNC_WRITE_MINMAX`, `SYNC_WRITE_POWER`, and `SYNC_WRITE_FADE` each issue four logical steps (DTR0 + SET twice + DTR0 + SET twice = six hardware sends) atomically, because DTR0 is shared across all ballasts and an interleaving raw command or another write could clobber it mid-sequence.  Other DALI work (raw commands, level reads, full-scan steps) waits up to ~300 ms behind one of these.  `SYNC_WRITE_LEVEL` (single DAPC) and group-bit changes are unaffected — they take ≤ 50 ms each.
 
 ### Hardware / runtime
 
-- **Stack budget tight.**  Worst-case nested-ISR depth (TCA0 LVL0 chain + TCB0 LVL1 chain + main thread mid-`modbus_process`) leaves ~30-50 bytes of headroom over the 175 B available.  The largest contributor is the `snprintf` call in the FC04 version-string path; if that path grows, monitor stack usage with the `.su` files emitted by `-fstack-usage`.
-- **RS-485 DE pin floats briefly at reset.**  `main` drives PA4 low immediately, but there is a ~50-200 µs window after reset (before that store executes) where the pin is high-Z.  An external pull-down on PA4 plus the BOD fuse on the next PCB revision is the recommended fix.
-- **`USERROW` write halts the CPU.**  A `MBREG_SLAVE_ADDR`/`BAUD_INDEX`/`RESCAN_INTERVAL` write performs a NVMCTRL page-erase-write that suspends CPU execution for ~3.4 ms.  Triggered by Modbus writes the firmware schedules so the halt lands in the master's silence window before our response, but a DALI frame in flight at that exact moment will be corrupted.  Avoid changing config during heavy DALI traffic.
+- **Stack budget tight.**  Worst-case nested-ISR depth (TCA0 LVL0 chain + TCB0 LVL1 chain + main thread mid-`modbus_process`) leaves ~30–50 bytes of headroom over the 175 B available.  The largest contributor at main level is the `snprintf` call in the FC04 version-string path (`modbus_process` reports 49 B `dynamic,bounded` in its `.su` file); if that path grows or any new ISR vector is added, monitor stack usage with the `.su` files emitted by `-fstack-usage`.
+- **RS-485 DE pin floats briefly at reset.**  `main` drives PA4 low immediately, but there is a ~50–200 µs window after reset (before that store executes) where the pin is high-Z.  Subtask 1 enabled the BOD fuse at 2.6 V, narrowing the window by holding the chip in reset until Vcc is stable; an external pull-down on PA4 on the next PCB revision is the residual recommended fix.
+- **`USERROW` write halts the CPU.**  A `MBREG_SLAVE_ADDR` / `BAUD_INDEX` / `RESCAN_INTERVAL` write performs a NVMCTRL page-erase-write that suspends CPU execution for ~3.4 ms.  Triggered by Modbus writes the firmware schedules so the halt lands in the master's silence window before our response, but a DALI frame in flight at that exact moment will be corrupted.  Avoid changing config during heavy DALI traffic.

@@ -11,13 +11,26 @@
 //
 // PORTB_PORT_vect runs at LVL0 and reads this pointer with two LDS instructions; TCB0
 // (LVL1) can preempt during the read and rewrite the pointer through the
-// cmdq_result_received chain (which calls dali_idle_state_enter / dali_call_on_rising_once).
+// dali_result_received chain (which calls dali_idle_state_enter / dali_call_on_rising_once).
 // Both reads and LVL0 writes are wrapped in ATOMIC_BLOCK to keep the 16-bit access
 // uninterruptible.
 void (*dali_rx_callback)(void) = NULL;
 
 void dali_init(void) {
-    // TX: output, initially low (open-drain, OUTCLR stays low - only DIR is toggled)
+    // TX: configured as output, driven LOW (released bus).  DIR is held set
+    // for the lifetime of the firmware; OUT is what the bit-level state
+    // machine toggles - OUTSET asserts the bus (PB0 HIGH); OUTCLR releases
+    // (PB0 LOW).  The external transistor inverts polarity between MCU pin
+    // and bus line, so PB0 LOW = bus released = idle/safe.
+    //
+    // PB0 returns to high-Z (DIR=0, OUT=0) on every reset source per
+    // ATtiny1604 datasheet § 16.5.4.  This is the WDT-during-TX recovery
+    // mechanism: if the WDT fires while PB0 is OUTSET (bus asserted), the
+    // reset clears OUT and DIR atomically, the external transistor base
+    // pull-down keeps the bus released, then this dali_init runs and
+    // re-establishes PB0 = driven LOW (released).  The OUTCLR-then-DIRSET
+    // sequence below transitions PB0 high-Z -> driven LOW without ever
+    // passing through driven-HIGH.
     DALI_PORT.OUTCLR = DALI_TX_bm;
     DALI_PORT.DIRSET = DALI_TX_bm;
 
@@ -76,7 +89,7 @@ ISR(PORTB_PORT_vect) {
         DALI_PORT.DALI_RX_PINCTRL = 0;
 
         // Snapshot the 16-bit pointer atomically: TCB0 (LVL1) can preempt this LVL0 ISR
-        // and rewrite dali_rx_callback through the cmdq_result_received chain.
+        // and rewrite dali_rx_callback through the dali_result_received chain.
         void (*cb)(void);
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             cb = dali_rx_callback;

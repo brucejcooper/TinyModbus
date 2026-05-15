@@ -23,6 +23,5 @@ void dali_tick(void);
 
 // Prototypes for the other ISR-dispatched tick functions (implemented in their modules).
 void modbus_tick(void);
-void bgtasks_tick(void);
 
 #endif

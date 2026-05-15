@@ -29,4 +29,9 @@ Clang (macOS) will report false-positive errors for AVR-specific attributes (`__
 - For every coder team member, also fire up a reviewer, who works with the coder to review changes and make suggestions.  The reviewer's job is to make sure that what they write works, is in line with the task, and doesn't drift too far from what the main intent of the system is
 - Tasks are performed on a git branch.  your team may check work into this branch at sensible checkpoints. For examle, if the work is broken down into sub-tasks, check in as each subtask is completed, with description.
 - When tasks are completed and signed off by the user, move the task to a `done` subdirectory of the tasks directy.  Mark the work as done, and make sure the document is updated with what was changed during the change.  Check any changes into git, and make sure the comment includes informaiton on what was done.  The branch should be ready for a pull request at this time.
+- We store our code on a forgejo repostiory.  Use the forgejo mcp tool to create pull requests
+
+
+## Developer environment
+- the user's machine has Tmux installed, and they will be running claude from tmux.  Make appropriate use of tmux panes where necessary
  

@@ -39,8 +39,9 @@
 #define DALI_CMD_QUERY_FAIL_LEVEL     0xA4u
 // QUERY_FADE_TIME_FADE_RATE returns one byte: high nibble = fade time
 // (0..15), low nibble = fade rate (0..15).  Both fields refresh from this
-// single query.  (DALI opcode 0xA6 is reserved by IEC 62386-102 - never
-// issue it.)
+// single query.  (DALI opcode 0xA6 is QUERY_MANUFACTURER_SPECIFIC_MODE
+// per IEC 62386-102; we don't issue it from internal scans because the
+// response is manufacturer-defined.)
 #define DALI_CMD_QUERY_FADE_TIME_FADE_RATE  0xA5u
 #define DALI_CMD_QUERY_GROUP_0_7      0xC0u
 #define DALI_CMD_QUERY_GROUP_8_15     0xC1u
@@ -53,13 +54,50 @@
 #define DALI_CMD_SET_FADE_TIME        0x2Eu
 #define DALI_CMD_SET_FADE_RATE        0x2Fu
 
-// DTR set commands: addr byte = opcode, cmd byte = value to load
+// DTR0 set: addr byte = opcode 0xA3, cmd byte = value to load.  Used by the
+// internal multi-step write sequences (DTR0 -> SET_X(twice) -> DTR0 ->
+// SET_Y(twice)) in dali_sync.c.  DTR1/DTR2 setters (0xC3 / 0xC5) are
+// reachable from the master via the MBREG_RAW_CMD raw channel.
 #define DALI_ADDR_SET_DTR0  0xA3u
-#define DALI_ADDR_SET_DTR1  0xC3u
-#define DALI_ADDR_SET_DTR2  0xC5u
+
+// ---- Commissioning special-command opcodes (IEC 62386-102) -------------
+// All take the addr-byte slot of the 16-bit forward frame (replace the
+// per-ballast addressing entirely).  Driven by the OP_COMMISSION state
+// machine in dali_sync.c.  INITIALISE / RANDOMISE require SEND-TWICE; the
+// rest are single forward frames with no response (COMPARE / VERIFY /
+// QUERY produce a backward frame).
+#define DALI_ADDR_TERMINATE              0xA1u  // cancel commissioning early
+#define DALI_ADDR_INITIALISE             0xA5u  // data: 0x00=all, 0xFF=no-short, else short addr.  TWICE.
+#define DALI_ADDR_RANDOMISE              0xA7u  // each gear picks a fresh 24-bit random.  TWICE.
+#define DALI_ADDR_COMPARE                0xA9u  // backward 0xFF if any gear's random <= search
+#define DALI_ADDR_WITHDRAW               0xABu  // pull last-matched gear out of comparison set
+#define DALI_ADDR_SEARCHADDRH            0xB1u  // load search-addr high byte
+#define DALI_ADDR_SEARCHADDRM            0xB3u  // load search-addr mid byte
+#define DALI_ADDR_SEARCHADDRL            0xB5u  // load search-addr low byte
+#define DALI_ADDR_PROGRAM_SHORT_ADDRESS  0xB7u  // data = (short<<1)|1, or 0xFF to clear
+#define DALI_ADDR_VERIFY_SHORT_ADDRESS   0xB9u  // data = (short<<1)|1.  Backward 0xFF if match.
+#define DALI_ADDR_QUERY_SHORT_ADDRESS    0xBBu  // backward = (short<<1)|1, or 0xFF if none
+
+// INITIALISE data-byte conventions
+#define DALI_INIT_DATA_ALL          0x00u   // include every gear in the comparison set
+#define DALI_INIT_DATA_NO_SHORT     0xFFu   // include only gears without a short address
+
+// PROGRAM/VERIFY short-address encoding.  Bit 0 set marks the byte as a
+// short-address command target (matches the broader DALI_CMD_FLAG convention).
+#define DALI_PROG_SHORT(s)          ((uint8_t)(((s) << 1) | 0x01u))
 
 // ---- Hardware pins -----------------------------------------------------
 
+// DALI_TX (PB0) polarity convention: OUTSET (PB0 HIGH) asserts the bus;
+// OUTCLR (PB0 LOW) and high-Z release.  The external transistor inverts
+// polarity between the MCU pin and the bus line, so PB0 LOW = bus released
+// = idle/safe state.  Invariant maintained by every TX callback in the
+// bit-level state machine (see dali_state_transmitting.c): PB0 is released
+// within one TCA0 tick (~417 µs) of every OUTSET, by pairing each OUTSET
+// with `dali_timer = 1` and a callback (half_bit_toggle / start_stop_bits)
+// that OUTTGLs or OUTCLRs the line.  Any new OUTSET site MUST preserve
+// this invariant or the TX-asserted watchdog in TCA0_OVF_vect (tick.c) is
+// the only firmware-side backstop before the WDT (~8.2 s).
 #define DALI_PORT         PORTB
 #define DALI_TX_bm        PIN0_bm
 #define DALI_RX_bm        PIN1_bm
@@ -114,6 +152,6 @@ void dali_state_receiving_enter(void);
 // Single authority for post-command state transitions - called from ISR context.
 // Updates the target register (if any), fires the optional callback, decrements
 // repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
-void cmdq_result_received(dali_response_type_t type, uint8_t value);
+void dali_result_received(dali_response_type_t type, uint8_t value);
 
 #endif

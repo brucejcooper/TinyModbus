@@ -1,16 +1,32 @@
 #include <avr/interrupt.h>
 #include <avr/io.h>
+#include <avr/fuse.h>
 #include <avr/sleep.h>
 #include <avr/wdt.h>
 #include <stdbool.h>
 #include <util/delay.h>
 
 #include "registers.h"
-#include "cmd_queue.h"
 #include "tick.h"
 #include "dali.h"
+#include "dali_sync.h"
 #include "modbus.h"
-#include "bg_tasks.h"
+
+// Fuse configuration.  Emits a `.fuse` section in the ELF; the Makefile's
+// avr-objcopy invocation passes this through into main.hex so pymcuprog
+// programs it on flash.  Brown-out detection is enabled at 2.6 V in active
+// mode - this is the highest-leverage protection against the bus-stuck
+// symptom seen when Vcc dips during DALI activity.  All other fuse bytes
+// are left at their factory defaults.
+FUSES = {
+    .WDTCFG  = FUSE_WDTCFG_DEFAULT,
+    .BODCFG  = ACTIVE_ENABLED_gc | LVL_BODLEVEL2_gc,
+    .OSCCFG  = FUSE_OSCCFG_DEFAULT,
+    .SYSCFG0 = FUSE_SYSCFG0_DEFAULT,
+    .SYSCFG1 = FUSE_SYSCFG1_DEFAULT,
+    .APPEND  = FUSE_APPEND_DEFAULT,
+    .BOOTEND = FUSE_BOOTEND_DEFAULT,
+};
 
 int main(void) {
     // Drive DE low immediately - prevents floating pin from enabling RS-485 TX
@@ -24,7 +40,7 @@ int main(void) {
 
     // Initialise subsystems
     regs_init();
-    cmdq_init();
+    dali_sync_init();                     // sync_flags[], current_op, group_write
     tick_init();                          // starts TCA0 - ticks begin here
     modbus_init(userrow_get_slave_addr());
     dali_init();
@@ -41,16 +57,21 @@ int main(void) {
 
     sei();
 
-    // Initial bus scan
-    bgtasks_trigger_scan();
-    bgtasks_run();
+    // Initial bus scan: arm SYNC_READ_FULL on every ballast.  The work
+    // selector services them one at a time via the unified DALI
+    // issuance path (which sets the present bit on first OK response).
+    for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
+        sync_flags_set(i, SYNC_READ_FULL);
 
     for (;;) {
         modbus_process();
-        bgtasks_run();
+        // Kick the sync-flag-driven work selector when the bus is idle
+        // and no sync op is currently in flight.
+        if (dali_idle && !dali_busy)
+            start_next_dali_work();
         wdt_reset();
 
-        if (dali_idle && modbus_idle)
+        if (dali_idle && modbus_idle && !dali_busy)
             sleep_cpu();
     }
 }

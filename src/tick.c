@@ -4,7 +4,6 @@
 #include "tick.h"
 #include "dali.h"
 #include "modbus.h"
-#include "bg_tasks.h"
 
 volatile uint8_t   dali_timer    = 0;
 volatile tick_cb_t dali_timer_cb = NULL;
@@ -24,7 +23,7 @@ void tick_init(void) {
 // Decrement dali_timer and fire dali_timer_cb when it reaches zero.
 // Called from the TCA0_OVF ISR every ~416 µs.
 //
-// dali_timer_cb is a 16-bit pointer that TCB0 (LVL1) can rewrite via cmdq_result_received
+// dali_timer_cb is a 16-bit pointer that TCB0 (LVL1) can rewrite via dali_result_received
 // → dali_idle_state_enter / dali_wait_for_idle_state_enter.  Snapshot the pointer inside
 // ATOMIC_BLOCK so a TCB0 preemption between the two LDS instructions cannot tear the load.
 void dali_tick(void) {
@@ -45,6 +44,16 @@ ISR(TCA0_OVF_vect) {
     // clobber a freshly raised flag - at most one tick is lost rather than all in-progress fires.
     TCA0.SINGLE.INTFLAGS = TCA_SINGLE_OVF_bm;
     dali_tick();
+    // Defensive: if the bit-level state machine has stalled with PB0 asserted
+    // (HIGH) and no pending callback armed, force a release.  Under correct
+    // operation this never fires - every OUTSET in send_one is paired with
+    // dali_timer = 1, and the next callback (half_bit_toggle) OUTTGLs and
+    // re-arms dali_timer = 1, so the guard observes dali_timer != 0.  The
+    // check catches a hypothetical stall where dali_timer reached zero
+    // without a callback that released the line.  DALI_PORT.IN is the live
+    // pin readback (same pattern as dali_is_bus_active in dali_init.c).
+    if ((DALI_PORT.IN & DALI_TX_bm) && dali_timer == 0u) {
+        DALI_PORT.OUTCLR = DALI_TX_bm;
+    }
     modbus_tick();
-    bgtasks_tick();
 }

@@ -2,6 +2,7 @@
 #include <avr/io.h>
 #include <util/atomic.h>
 #include "registers.h"
+#include "dali_sync.h"
 
 register_map_t g_regs;
 
@@ -142,20 +143,55 @@ void regs_read_input_bulk(uint16_t addr, uint8_t count, uint8_t *buf) {
 // ---- FC03 holding read -------------------------------------------------
 
 bool regs_read_holding(uint16_t addr, uint16_t *val) {
+    // Per-ballast banks 0x0000-0x00FF.  The register_map_t layout aligns each
+    // 2-byte struct (status|brightness, min|max, power_on|sys_fail,
+    // fade_rate|fade_time) on the same byte positions FC04 used to expose, so
+    // a direct offset into g_regs reproduces the exact wire bytes.
+    if (addr <= 0x00FFu) {
+        const uint8_t *p = (const uint8_t *)&g_regs + (uint16_t)addr * 2u;
+        *val = ((uint16_t)p[0] << 8) | p[1];
+        return true;
+    }
+    // Group membership masks 0x0110-0x014F: 16 groups × 4 registers (8 bytes
+    // each).  Same direct-offset trick — group_mask[16][8] is anchored at
+    // struct offset 0x0220 (= 0x0110 * 2) by the present/dirty/raw + 14-byte
+    // _reserved padding hole that precedes it in register_map_t.
+    if (addr >= 0x0110u && addr <= 0x014Fu) {
+        const uint8_t *p = (const uint8_t *)&g_regs + (uint16_t)addr * 2u;
+        *val = ((uint16_t)p[0] << 8) | p[1];
+        return true;
+    }
+
     switch (addr) {
-        // Action registers read as 0 (write-only by convention)
-        case MBREG_RAW_CMD:       case MBREG_RAW_CMD_TWICE:
-        case MBREG_DAPC:
-        case MBREG_GOTO_LAST_ACTIVE: case MBREG_OFF:          case MBREG_UP:
-        case MBREG_DOWN:          case MBREG_STEP_UP:         case MBREG_STEP_DOWN:
-        case MBREG_RECALL_MAX:    case MBREG_RECALL_MIN:
-        case MBREG_SET_DTR0:      case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
+        // Action / control registers read as 0 (write-only by convention)
+        case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
         case MBREG_SCAN_TRIGGER:
             *val = 0;
             return true;
         case MBREG_RESCAN_INTERVAL: *val = userrow_get_rescan_interval(); return true;
         case MBREG_SLAVE_ADDR:      *val = userrow_get_slave_addr();      return true;
         case MBREG_BAUD_INDEX:      *val = userrow_get_baud_index();      return true;
+        case MBREG_COMMISSION: {
+            // Read-clears semantics on TERMINAL high bytes (0x02 complete,
+            // 0x03 error/aborted) — same shape as the FC04 0x0108 raw
+            // command result.  Idle (0x00) and running (0x01) values stay
+            // put so the master can poll progress without losing state.
+            // Capture must be atomic w.r.t. the OP_COMMISSION ISR that
+            // writes commission_state.status; TCB0 fence guards LVL1,
+            // ATOMIC_BLOCK guards LVL0.
+            uint16_t snap;
+            uint8_t old_tcb = TCB0.INTCTRL;
+            TCB0.INTCTRL = 0;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                snap = commission_state.status;
+                uint8_t hi = (uint8_t)(snap >> 8);
+                if (hi == 0x02u || hi == 0x03u)
+                    commission_state.status = COMM_STATUS_IDLE;
+            }
+            TCB0.INTCTRL = old_tcb;
+            *val = snap;
+            return true;
+        }
         default:     return false;
     }
 }
@@ -163,6 +199,81 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
 // ---- FC06/FC10 holding write -------------------------------------------
 
 bool regs_write_holding(uint16_t addr, uint16_t val) {
+    // Per-ballast bank writes: predictive cache update + SYNC_WRITE_*
+    // arming.  The work selector services the flag and calls
+    // issue_dali_command, which in turn handles cache-invalidation
+    // uniformly for all DALI command sources.
+    if (addr <= 0x003Fu) {
+        // Brightness bank: low byte = DAPC level; high byte (status) ignored.
+        // Status is owned by DALI query responses, not master writes.
+        // 8-bit store is atomic on AVR; no ATOMIC needed for this byte.
+        g_regs.block0[addr].brightness = (uint8_t)val;
+        sync_flags_set((uint8_t)addr, SYNC_WRITE_LEVEL);
+        return true;
+    }
+    if (addr >= 0x0040u && addr <= 0x007Fu) {
+        uint8_t idx = (uint8_t)(addr - 0x0040u);
+        // Two byte stores; not touched by ISR cache writers (regs_apply_result
+        // runs at LVL1 and writes block1.min/max during scan, so wrap to be safe).
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_regs.block1[idx].min = (uint8_t)(val >> 8);
+            g_regs.block1[idx].max = (uint8_t)val;
+        }
+        sync_flags_set(idx, SYNC_WRITE_MINMAX);
+        return true;
+    }
+    if (addr >= 0x0080u && addr <= 0x00BFu) {
+        uint8_t idx = (uint8_t)(addr - 0x0080u);
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_regs.block2[idx].power_on = (uint8_t)(val >> 8);
+            g_regs.block2[idx].sys_fail = (uint8_t)val;
+        }
+        sync_flags_set(idx, SYNC_WRITE_POWER);
+        return true;
+    }
+    if (addr >= 0x00C0u && addr <= 0x00FFu) {
+        uint8_t idx = (uint8_t)(addr - 0x00C0u);
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            g_regs.block3[idx].fade_rate = (uint8_t)(val >> 8);
+            g_regs.block3[idx].fade_time = (uint8_t)val;
+        }
+        sync_flags_set(idx, SYNC_WRITE_FADE);
+        return true;
+    }
+    // Group masks 0x0110-0x014F: validate, snapshot old value, compute
+    // pending_adds = new & ~old, pending_removes = old & ~new, update
+    // cache, arm group_write state machine.  Master writes that don't
+    // change any bits (changed == 0) need no DALI work and return
+    // success WITHOUT consulting the group_write state — even if a
+    // group write is in flight.  Only a write that actually requires
+    // ADD/REMOVE commands needs to fence against an existing in-flight.
+    if (addr >= 0x0110u && addr <= 0x014Fu) {
+        uint8_t group_idx = (uint8_t)((addr - 0x0110u) >> 2);
+        uint8_t word_idx  = (uint8_t)((addr - 0x0110u) & 0x03u);
+        uint16_t old_val, new_val = val;
+        old_val  = ((uint16_t)g_regs.group_mask[group_idx][word_idx * 2u]      << 8)
+                 |  (uint16_t)g_regs.group_mask[group_idx][word_idx * 2u + 1u];
+        uint16_t changed = (uint16_t)(old_val ^ new_val);
+        if (changed == 0) {
+            // No-op write: nothing to send to ballasts, just ACK.
+            return true;
+        }
+        uint16_t pending_adds    = (uint16_t)(new_val & changed);
+        uint16_t pending_removes = (uint16_t)(old_val & changed);
+        // Predictive cache update.
+        g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(new_val >> 8);
+        g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)new_val;
+        if (!dali_sync_arm_group_write(addr, pending_adds, pending_removes)) {
+            // Race: another group write became armed between caller's
+            // pre-check and now (or no pre-check happened at all).
+            // Rollback cache and refuse.
+            g_regs.group_mask[group_idx][word_idx * 2u]      = (uint8_t)(old_val >> 8);
+            g_regs.group_mask[group_idx][word_idx * 2u + 1u] = (uint8_t)old_val;
+            return false;
+        }
+        return true;
+    }
+
     switch (addr) {
         case MBREG_RESCAN_INTERVAL:
             return userrow_set_rescan_interval(val);
@@ -170,15 +281,28 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
             return userrow_set_slave_addr((uint8_t)val);
         case MBREG_BAUD_INDEX:
             return userrow_set_baud_index((uint8_t)val);
-        // Action registers: caller handles DALI dispatch
-        case MBREG_RAW_CMD:       case MBREG_RAW_CMD_TWICE:
-        case MBREG_DAPC:
-        case MBREG_GOTO_LAST_ACTIVE: case MBREG_OFF:          case MBREG_UP:
-        case MBREG_DOWN:          case MBREG_STEP_UP:         case MBREG_STEP_DOWN:
-        case MBREG_RECALL_MAX:    case MBREG_RECALL_MIN:
-        case MBREG_SET_DTR0:      case MBREG_SET_DTR1:        case MBREG_SET_DTR2:
+        // Raw / scan-trigger: caller (dispatch_action_reg) handles DALI dispatch
+        case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
         case MBREG_SCAN_TRIGGER:
             return true;
+        case MBREG_COMMISSION: {
+            // 0x0000 abort, 0x0001 full, 0x0002 incremental.  Anything
+            // else is ILLEGAL_VALUE; an attempt to start while a run is
+            // already in progress is DEVICE_BUSY.  We return false in
+            // both cases — process_fc06 / process_fc10 disambiguate by
+            // re-checking val > 2.
+            if (val > 2u) return false;
+            if (val == 0u) {
+                // Abort: latch the request iff a run is actually in
+                // progress.  No-op when idle or in a terminal state
+                // (master must read 0x1014 to clear those).  phase is a
+                // 1-byte packed enum so the read is atomic on AVR.
+                if (commission_state.phase != COM_IDLE)
+                    commission_state.abort_requested = true;
+                return true;
+            }
+            return dali_sync_arm_commission((uint8_t)val);
+        }
         default:
             return false;
     }
@@ -186,15 +310,12 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
 
 // ---- result application ------------------------------------------------
 
+// Apply a single full-scan query response to the appropriate cache field.
+// Only called from dali_sync.c's OP_FULL_SCAN completion path; the
+// per-step targets (REG_MIN/MAX/POWER_ON/SYS_FAIL/FADE_RATE/GROUP_0_7/GROUP_8_15)
+// match the scan_steps[] table.
 void regs_apply_result(uint8_t idx, reg_target_t target, uint8_t value) {
     switch (target) {
-        case REG_BRIGHTNESS:
-            g_regs.block0[idx].brightness = value;
-            bm_set(g_regs.dirty, idx, true);
-            break;
-        case REG_STATUS:
-            regs_apply_status(idx, value);
-            break;
         case REG_MIN:
             g_regs.block1[idx].min = value;
             break;
@@ -227,7 +348,6 @@ void regs_apply_result(uint8_t idx, reg_target_t target, uint8_t value) {
 
 void regs_apply_status(uint8_t idx, uint8_t dali_status) {
     g_regs.block0[idx].status = dali_status;
-    bm_set(g_regs.fading, idx, (dali_status & DALI_STATUS_FADE_RUNNING) != 0);
     bm_set(g_regs.dirty,  idx, true);
 }
 
@@ -242,13 +362,6 @@ void regs_clear_ballast(uint8_t idx) {
     memset(&g_regs.block2[idx], 0, sizeof(ballast_pf_t));
     memset(&g_regs.block3[idx], 0, sizeof(ballast_fade_t));
     regs_set_present(idx, false);
-    bm_set(g_regs.fading, idx, false);
-    uint8_t byte_idx = idx >> 3;
-    uint8_t bit_mask = (uint8_t)(1u << (idx & 7u));
-    for (uint8_t g = 0; g < 16; g++) {
-        if (g_regs.group_mask[g][byte_idx] & bit_mask)
-            regs_rebuild_group_status(g);
-    }
 }
 
 uint16_t regs_read_clear_dirty(uint8_t word_idx) {
@@ -271,16 +384,4 @@ void regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups)
         else
             g_regs.group_mask[base + group_idx][byte_idx] &= ~bit_mask;
     }
-
-    for (uint8_t group_idx = 0; group_idx < 8; group_idx++)
-        regs_rebuild_group_status(base + group_idx);
-}
-
-void regs_rebuild_group_status(uint8_t group_idx) {
-    uint8_t merged_status = 0;
-    for (uint8_t ballast_idx = 0; ballast_idx < 64; ballast_idx++) {
-        if (g_regs.group_mask[group_idx][ballast_idx >> 3] & (1u << (ballast_idx & 7u)))
-            merged_status |= g_regs.block0[ballast_idx].status;
-    }
-    g_regs.group_status[group_idx].status = merged_status;
 }

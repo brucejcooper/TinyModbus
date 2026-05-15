@@ -12,9 +12,12 @@ static void cleanup(void) {
 }
 
 static void timeout_waiting_for_response(void) {
+    // Belt-and-braces: release the DALI TX line before yielding back to idle,
+    // in case any prior path left it asserted.
+    DALI_PORT.OUTCLR = DALI_TX_bm;
     cleanup();
     dali_cancel_edge_detect();
-    cmdq_result_received(DALI_RESPONSE_NAK, 0);
+    dali_result_received(DALI_RESPONSE_NAK, 0);
 }
 
 static void start_receiving_response(void) {

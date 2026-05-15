@@ -3,7 +3,8 @@ CLOCK      	= 10000000
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)
-COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=2 -fstack-usage
+COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=2 -fstack-usage -ffunction-sections -fdata-sections
+LDFLAGS    	= -Wl,--gc-sections
 AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )
 ASMSOURCES  = $(wildcard src/*.S )
@@ -28,8 +29,8 @@ prepare:
 	mkdir -p build
 	
 build: prepare $(OBJECTS)
-	$(COMPILE) -o build/$(FILENAME).elf $(OBJECTS)
-	avr-objcopy -R .eeprom -R .fuse -R .lock -R .signature -R .user_signatures -O ihex build/$(FILENAME).elf build/$(FILENAME).hex
+	$(COMPILE) $(LDFLAGS) -o build/$(FILENAME).elf $(OBJECTS)
+	avr-objcopy -R .eeprom -R .lock -R .signature -R .user_signatures -O ihex build/$(FILENAME).elf build/$(FILENAME).hex
 	avr-size --format=avr --mcu=$(DEVICE) build/$(FILENAME).elf
 
 erase:

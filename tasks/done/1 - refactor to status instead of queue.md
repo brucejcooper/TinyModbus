@@ -496,3 +496,90 @@ If during implementation any of the following come up, raise them rather than pi
 - Any change to the Modbus framing, CRC, or wire-protocol logic.
 - Any change to the existing dirty-bitmap exposure to the master.
 - Power optimisation (e.g., RUNSTDBY gating). Discussed and intentionally deferred.
+
+---
+
+## Outcome
+
+**Date completed:** 2026-05-03 (final acceptance pending; review iteration ongoing)
+**Branch:** `task-1-flag-driven`
+**Commit range:** `9de0ecc..task-1-complete` (subtasks 1–6 plus two subtask-4 fix-ups, plus subtasks 7–9 polish passes landed during the user's post-merge review). The `task-1-complete` git tag tracks the latest accepted commit and is moved forward on every new accepted commit.
+
+### Sub-task summary
+
+| # | Commit | Subject |
+|---|--------|---------|
+| 1 | `9de0ecc` | Defensive fixes: DALI TX `OUTCLR` on idle entry + BOD fuse @ 2.6 V (also removes `-R .fuse`). |
+| 2 | `7de757f` | Per-ballast banks moved from FC04 (input regs) to FC03 (holding regs). Reads + write stubs only. |
+| 3 | `dcc98fd` | New `dali_sync.{c,h}` skeleton: `sync_flags[64]` table, op definitions, RTC-PIT round-robin cursor. |
+| 4 | `638f303` | Unified `issue_dali_command()` chokepoint, work selector with priority chain, write/raw paths wired through. |
+| 4-fix-1 | `42900ad` | Reviewer feedback: twice-send re-fire, presence transition on first OK, group-write BUSY-vs-no-op race. |
+| 4-fix-2 | `759b82c` | Reviewer P1: collapse SYNC_WRITE_* and SYNC_READ_LEVEL onto a single rotating cursor; relax group-write BUSY contract. |
+| 5 | `e83688d` | Physical deletion of `cmd_queue.{c,h}` and `bg_tasks.{c,h}`. Coil FCs (FC01/05/0F) and action holding regs (0x1002–0x100A) retired with `ILLEGAL_FUNCTION` / `ILLEGAL_ADDRESS` replies. `dali_result_received` rename. |
+| 6 | `d1c7ed2` | Final README pass, verification, hand-trace, task move to `done/`. |
+| 7 | `ae30a84` | Post-merge polish: collapse `classify_invalidation` to 4 branches; atomic helpers in `note_present_on_ok` / `apply_retry_pending`; `OP_FULL_SCAN` short-circuits on NAK (move to next ballast); `(void)reg_off;` dead-code removed; README documents `0x015D` no-decrement-mid-twice-send and `frame_is_valid` coil-FC retention as a future-removal candidate; `noinline, noclone` attributes verified still needed (removing them costs +480 B flash on avr-gcc 7.3, well above the 200 B threshold). |
+| 8 | `719b8f8` | FC04 input-register trim: removed `fading[4]` (redundant with status bit 4), `group_status[16]` (derivable + already stale w.r.t. status changes), and `scan_status` (vestigial from the bg_tasks era); moved `present[4]` / `dirty[4]` / `raw_cmd_result` to a contiguous 0x0100-0x0108 ladder so masters can read presence + dirty in one FC04 request; deleted `regs_rebuild_group_status`; preserved `group_mask` at FC03 0x0110 via a 7-register padding hole rather than introduce a second breaking change. |
+| 9 | `task-1-complete` | DTR-setter holding registers `MBREG_SET_DTR0/1/2` (0x100B-0x100D) removed entirely. Master can issue equivalent raw commands via 0x1000 with address bytes 0xA3 / 0xC3 / 0xC5. `DALI_ADDR_SET_DTR0` macro retained for internal use by the multi-step write sequences in `dali_sync.c`; `DALI_ADDR_SET_DTR1` / `DALI_ADDR_SET_DTR2` deleted (no remaining callers). FC10 raw-arming pre-flight tightened to recognise only the two raw-command registers. |
+
+### Final binary sizes (subtask-0 baseline → final)
+
+| Section | Baseline (`4c2888b`) | Subtask 6 (`d1c7ed2`) | Subtask 7 (`ae30a84`) | Subtask 8 (`719b8f8`) | Final (`task-1-complete` = `fbdd681`) | Delta vs baseline |
+|---------|---------------------|------------------------|------------------------|------------------------|-----------------------------------------|-------------------|
+| Program | 14316 B | 13734 B | 13754 B | 13252 B | **13040 B** | **−1276 B (−8.9%)** |
+| Data    |   849 B |   851 B |   851 B |   823 B | **  823 B** | **−26 B (−3.1%)** |
+
+The Program-side reduction is well beyond the spec's "essentially RAM-neutral" prediction. Major contributors: deleting the queue + bg_tasks subsystems plus enabling `-ffunction-sections / -fdata-sections / --gc-sections` in subtask 4 (large drop); deleting `regs_rebuild_group_status` in subtask 8 (a 64-iteration loop the compiler had inlined into multiple call sites — surprise −502 B); deleting the DTR-setter dispatch and macros in subtask 9 (−212 B). Data-side delta of −26 B vs baseline comes from subtask 8's removal of `group_status[16]` (−32), `fading[4]` (−8), and `scan_status` (−2), partly offset by a 14 B padding hole that anchors `group_mask` at its existing FC03 wire address. The +20 B Program from subtask 6 → 7 is the cost of replacing naked `sync_flags[idx] |=` / `&=` in `note_present_on_ok` and `apply_retry_pending` with the `ATOMIC_BLOCK`-wrapped helpers — worth it because the safety becomes locally provable instead of relying on subtle ISR-priority invariants. Stack high-water mark is unchanged throughout: `modbus_process` reports 49 B `dynamic,bounded` (the FC04 version-string `snprintf` path) and no other function exceeds 50 B static.
+
+### Hand-trace verification (master writes brightness on ballast 5 → DALI propagation → dirty-bit confirmation)
+
+End-to-end walk with the actual code (see commit message of the subtask-6 commit for the full annotated trace):
+
+1. Master sends FC06 to register `0x0005` value `0x0042`.
+2. `process_fc06` validates, calls `regs_write_holding(0x0005, 0x0042)`.
+3. `regs_write_holding` (registers.c:185) writes `g_regs.block0[5].brightness = 0x42`, calls `sync_flags_set(5, SYNC_WRITE_LEVEL)`. Returns true.
+4. `process_fc06` builds the standard echo response and `start_tx`s — Modbus master sees the ACK before any DALI activity.
+5. Main loop: `!dali_busy` → `start_next_dali_work()` runs. `pick_work()` falls through priorities 1–2 (no raw, no group-bit), reaches priority 3 (write), walks `sync_flags[]` from `work_cursor`, finds ballast 5 with `SYNC_WRITE_LEVEL`. Sets `current_op = {OP_WRITE_LEVEL, 5, 0}`, advances `work_cursor` to 6.
+6. `dali_sync_dispatch_current()` → `OP_WRITE_LEVEL` branch → `issue_dali_command(DALI_SHORT_ADDR(5), 0x42, DALI_KIND_DAPC, 1)`.
+7. Inside `issue_dali_command`: `classify_invalidation(0x0A, 0x42)` returns `SYNC_READ_LEVEL` (DAPC, address bit 0 clear). `apply_invalidation` calls `sync_flags_set(5, SYNC_READ_LEVEL)` — the cache will be re-confirmed once DALI completes.
+8. `dali_transmitting_state_enter` runs the 16-bit Manchester-encoded forward frame (~15.8 ms). For `CMD_DIRECT_ARC` (DAPC), `finished_transmission` skips `wait_for_response` and calls `dali_result_received(DALI_RESPONSE_NAK, 0)` directly (DAPC has no backward frame).
+9. `dali_result_received` sees `dali_busy` true and `s_active.repeat == 1`, so it dispatches to `dali_sync_completion(NAK, 0)`.
+10. `dali_sync_completion` `OP_WRITE_LEVEL` branch: NAK is the expected outcome, so `sync_flags_clear(5, SYNC_WRITE_LEVEL)` and `mark_dirty(5)` (unconditional — DAPC always sets the dirty bit because we cannot confirm whether the level actually changed without a follow-up query). `dali_busy = false`. Tail-calls `dali_wait_for_idle_state_enter()` to enforce the 22 Te post-frame gap.
+11. After the gap, IDLE re-enters. `dali_busy == false` so the work selector is re-armed. With `SYNC_READ_LEVEL` set on ballast 5 (from step 7), the next `start_next_dali_work` picks priority 4 (level read) and runs QUERY_STATUS → cache status → step 1 → QUERY_ACTUAL_LEVEL → cache brightness → if `old_b != value` set dirty (already dirty from step 10), `sync_flags_clear(5, SYNC_READ_LEVEL | SYNC_RETRY_PENDING)`.
+12. Master polls FC04 0x0159 (covers ballasts 0–15). Bit 5 is set (from step 10). FC04 read-clears the entire word — bit 5 returns to 0.
+13. Master reads FC03 0x0005 → `[status:brightness]` = `[<actual ballast status>:0x42]`. Cache fully reconciled.
+
+Atomicity: the PIT ISR firing during this sequence and setting `SYNC_READ_LEVEL` on a *different* ballast is safe — `sync_flags_set` uses `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)`. A PIT tick targeting ballast 5 specifically during steps 7–11 would just OR-set a bit that's already set or about to be set; idempotent. The `regs_read_clear_dirty` ATOMIC_BLOCK ensures FC04 reads of the dirty bitmap don't lose updates from the DALI completion handler running at LVL1.
+
+### Deviations from spec
+
+- **Action regs and coils retired in subtask 4 (rolled into the unified-issuance commit) rather than a dedicated subtask 5 step.** Subtask 5 then became "physical file deletion + last-mile rename." Net same outcome; just rebalanced the commit boundaries. Open Question "Coils removal confirmation" was answered by the user mid-subtask-4 with explicit consent to remove all three coil FCs.
+- **`-ffunction-sections / -fdata-sections / --gc-sections` added to the Makefile in subtask 4.** Not in the spec; introduced because the subtask-4 size measurement showed 200+ B of unreferenced code from the partially-deleted command-queue path. The change reclaimed all of it and remains in place as a permanent improvement.
+- **0x015D async raw result encoding ended up simpler than the spec described.** The spec proposed a per-state pending encoding with documented sends-remaining semantics. Implementation honours the same encoding (`0xFFnn`, low byte = sends remaining), and the README documents the master-visible behaviour: match on the high byte for "still pending"; the low byte transitions are visible but not separately specified for master use. Backwards-compatible-ish: any master strict-equalling `0xFF00` would be wrong on a twice-send, hence the breaking-change callout in the new "Behavioural Changes" README section.
+- **Default `RESCAN_INTERVAL` left at 64.** The spec recommended changing to 1 (matching the old burst's per-ballast cadence). Subtask 6 elected to document the trade-off and leave the default conservative — RAM/flash-side it makes no difference, and changing the default is a master-visible behaviour change the user should opt into rather than receive silently.
+- **Cache invalidation classification simplified beyond the spec's per-opcode table** (subtask 7). The spec listed nine ranges with distinct INV_LEVEL/CONFIG/BOTH/NONE classifications. The implementation collapses to four branches (DAPC; data < 0x20; data == 0x20 RESET; data < 0x90) and accepts that a handful of reserved opcodes (`0x21` STORE_CURRENT_LEVEL_DTR0 and the 0x22-0x29, 0x30-0x3F reserved ranges) over-invalidate to SYNC_READ_FULL when issued via raw command. The user explicitly approved this trade — "we don't need to be perfect; the cost of a wasted scan is bounded."
+- **`OP_FULL_SCAN` short-circuits on NAK** (subtask 7). The spec's "cache result (zero on NAK)" semantics were replaced with "abort the scan for this ballast and let the work selector pick the next one." Cuts SCAN_TRIGGER runtime on sparse buses roughly in half (~6.4 s vs ~11.2 s for 32-of-64-present). Edge case: a present ballast that NAKs at step 4 of 7 leaves cache fields 4-6 at their previous values rather than zeroes — accepted because the periodic level-poll catches presence flips eventually, and SCAN_TRIGGER can be re-issued by the master.
+- **Every brightness write to a per-ballast bank triggers a follow-up `SYNC_READ_LEVEL`** (i.e. QUERY_STATUS + QUERY_ACTUAL_LEVEL after the DAPC). This is intentional: ballasts may clip the written level (e.g. master writes `0xBE` but ballast max is `0xB0`), and step/up/down style commands have no closed-form predictive cache value. The readback ensures the cache reflects what the ballast actually did. User explicitly chose this behaviour over an optimisation that would skip the readback for plain DAPC writes.
+- **Broadcast/group writes intentionally generate per-ballast readback storms.** A broadcast DAPC sets `SYNC_READ_LEVEL` on all 64 ballasts; the work selector then queues 64 QUERY_STATUS + QUERY_ACTUAL_LEVEL pairs (~3.2 s of bus traffic). Group writes scale with group size. User explicitly accepts this — "that is the nature of this."
+- **FC04 input-register surface trimmed beyond the spec** (subtask 8). The spec preserved `fading[4]`, `group_status[16]`, and `scan_status` from the pre-refactor firmware. User-driven review noted that fading is redundant with the status byte (bit 4 of every block0[i].status), group_status is derivable from `group_mask` + statuses (and was already stale w.r.t. status changes in the pre-refactor code), and scan_status is vestigial in the flag-driven model (no producer). All three are now removed; `present` / `dirty` / `raw_cmd_result` moved up to a contiguous 0x0100-0x0108 ladder so a single FC04 read covers presence + dirty. Master-visible breaking change: every old FC04 address from 0x0150-0x015D moved.
+- **DTR-setter holding registers removed beyond the spec** (subtask 9). The spec kept `MBREG_SET_DTR0/1/2` (0x100B-0x100D) as control registers. User-driven review observed they're pure convenience wrappers around raw commands — a master can write `0x1000` with address byte 0xA3 / 0xC3 / 0xC5 to load DTR0 / DTR1 / DTR2 directly. Removing them shrinks the API surface and saves 212 B of flash. Master migration: any existing code that wrote 0x100B/0x100C/0x100D switches to 0x1000 with the appropriate address byte. `DALI_ADDR_SET_DTR0` (0xA3) macro stays — `dali_sync.c`'s multi-step write sequences (DTR0 → SET_X(twice) → DTR0 → SET_Y(twice)) still use it internally.
+
+### Open questions resolved
+
+- **Coils removal:** confirmed by user — FC01/FC05/FC0F all removed.
+- **Action register removal:** confirmed — 0x1002–0x100A all return `ILLEGAL_ADDRESS`.
+- **Per-ballast banks moving from input → holding regs:** confirmed — accepted as a breaking change, called out in Behavioural Changes section.
+- **Byte ordering for min/max, fade, power:** matched alternative-impl's existing FC04 read layout (high=max, low=min etc.). Verified against the `regs_read_holding` direct-offset trick in registers.c — wire bytes identical to pre-refactor FC04 reads.
+- **DAPC value 255:** kept as a valid write that issues the no-op DAPC; documented in the FC03/FC06/FC10 holding register table.
+- **Dirty-bit semantics:** unchanged from alternative-impl — set on any block0 (status/brightness) change, cleared by FC04 read of the relevant word. Group/min/max/fade/power changes do not set the dirty bit.
+- **Async raw result encoding:** the spec's `0xFFnn` extension is honoured; the master-visible encoding is now documented (see the FC04 0x015D table and Behavioural Changes section).
+
+### Verification status
+
+- [x] `make build` clean against the project-local `avr/bin/avr-gcc` toolchain.
+- [x] `avr/bin/avr-size --mcu=attiny1604 -C build/main.elf` reports Program 13040 / Data 823 (well under the 1 KB SRAM budget; ~175 B stack headroom).
+- [x] `.su` files sweep — no function exceeds 50 B; `modbus_process` at 49 B `dynamic,bounded` (FC04 version-string `snprintf` path) is the high-water mark.
+- [x] Hand-trace from FC06 brightness write → DAPC dispatch → dirty-bit confirmation walked end-to-end against the actual code.
+- [x] README integrated final pass: function-code table FC03/04/06/10 only; coils section retired; per-ballast banks documented under FC03 (writable); 0x015D encoding accurate to implementation; Fade Tracking restructured around the flag-driven model; RESCAN_INTERVAL semantic redefined; Known Limitations pruned of fixed entries (group readback, set_dtr0 race, bus duty cycle during scan, double-fire receive timeout) and augmented with refactor-specific entries; new "Behavioural Changes" subsection lists every wire-protocol-visible breaking change; new "Architectural Model" top-level section gives the one-paragraph orientation.
+- [x] Task file moved from `tasks/` to `tasks/done/` with this Outcome section appended.
+
+Branch is in a clean, mergeable state. Tag `task-1-complete` points to the latest accepted commit and is updated on every new commit; the eventual PR description can reference it.

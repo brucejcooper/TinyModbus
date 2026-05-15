@@ -57,15 +57,15 @@ static void rx_cleanup(void) {
 static void timer_overflow(void) {
     rx_cleanup();
     if ((rx_state == STATE_START_0 || rx_state == STATE_MIDDLE_1) && num_bits == 8)
-        cmdq_result_received(DALI_RESPONSE_OK, shift_reg);
+        dali_result_received(DALI_RESPONSE_OK, shift_reg);
     else
-        cmdq_result_received(DALI_RESPONSE_MALFORMED, 0);
+        dali_result_received(DALI_RESPONSE_MALFORMED, 0);
 }
 
 // A pulse fell outside valid half-bit or full-bit windows; report the specific error.
 static void send_rx_error(dali_response_type_t err) {
     rx_cleanup();
-    cmdq_result_received(err, 0);
+    dali_result_received(err, 0);
 }
 
 void dali_state_receiving_prepare(void) {
@@ -89,7 +89,7 @@ void dali_state_receiving_enter(void) {
     TCB0.CTRLA    = TCB_CLKSEL_CLKDIV1_gc | TCB_ENABLE_bm;
     TCB0.INTFLAGS = TCB_CAPT_bm;
     // TCB0 is now armed; a pulse-decoder error inside TCB0_INT_vect (LVL1) can preempt
-    // the LDS pair below and rewrite dali_timer_cb through cmdq_result_received.
+    // the LDS pair below and rewrite dali_timer_cb through dali_result_received.
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         dali_timer_cb = timer_overflow;
     }

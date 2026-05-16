@@ -38,6 +38,12 @@ int main(void) {
     CCP = CCP_IOREG_gc;
     CLKCTRL.MCLKCTRLB = CLKCTRL_PDIV_2X_gc | CLKCTRL_PEN_bm;
 
+    // Hold off bus traffic for 1 s after reset so DALI ballasts on the same
+    // supply rail have time to power up and start responding before the
+    // initial SYNC_READ_FULL sweep marks them absent.  Runs after the clock
+    // switch so _delay_ms is calibrated against F_CPU = 10 MHz.
+    _delay_ms(1000);
+
     // Initialise subsystems
     regs_init();
     dali_sync_init();                     // sync_flags[], current_op, group_write

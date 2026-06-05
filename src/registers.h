@@ -101,6 +101,14 @@ extern register_map_t g_regs;
 //   Write 0x0001/0x0002 while already running → DEVICE_BUSY
 #define MBREG_COMMISSION        0x1014u
 
+// System reset.  Write the magic value 0xA5A5 to force an immediate software
+// reset of the gateway (RSTCTRL software reset) once the Modbus ACK for this
+// write has cleared the wire.  Any other value is rejected (ILLEGAL_ADDRESS).
+// A recovery hatch so a Modbus master can power-cycle the gateway logic without
+// physical access (used by the controller's `gw_reboot` command).
+#define MBREG_SYSTEM_RESET       0x1015u
+#define MBREG_SYSTEM_RESET_MAGIC 0xA5A5u
+
 #define DALI_STATUS_FADE_RUNNING 0x10
 
 // raw_cmd_result encoding (FC04 0x0108).  Holds the outcome of the most

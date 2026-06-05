@@ -119,6 +119,16 @@ volatile bool            modbus_idle   = true;
 #define APPLY_SLAVE  0x02u
 static volatile uint8_t  pending_apply_mask = 0;
 
+// Latched by a MBREG_SYSTEM_RESET write; fired once the ACK is on the wire so
+// the master sees its ACK before the gateway reboots.  RSTCTRL.SWRR is
+// CCP-protected, so the write goes through _PROTECTED_WRITE; it never returns.
+static volatile bool     pending_reset = false;
+
+static inline void fire_pending_reset(void) {
+    if (pending_reset)
+        _PROTECTED_WRITE(RSTCTRL.SWRR, RSTCTRL_SWRE_bm);
+}
+
 
 // ---- CRC-16 table ---------------------------------------------------
 
@@ -353,6 +363,12 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
             for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
                 sync_flags_set(i, SYNC_READ_FULL);
         }
+        return 0;
+    }
+    if (mb_reg == MBREG_SYSTEM_RESET) {
+        // regs_write_holding already validated the magic value.  Latch the
+        // reset; fire_pending_reset() reboots once the ACK has left the wire.
+        pending_reset = true;
         return 0;
     }
     return 0;
@@ -636,6 +652,7 @@ void modbus_process(void) {
         // Broadcast: no response was sent, so apply the new config now (no
         // outgoing frame to wait for).
         apply_pending_config();
+        fire_pending_reset();   // broadcast reset: no ACK to wait for
         return_to_rx();
     }
 
@@ -665,6 +682,7 @@ ISR(USART0_TXC_vect) {
     // slave_addr.  Done before return_to_rx so the next byte is sampled at
     // the new baud rate and matched against the new slave address.
     apply_pending_config();
+    fire_pending_reset();   // ACK is on the wire; reboot if one was latched
     return_to_rx();
 }
 

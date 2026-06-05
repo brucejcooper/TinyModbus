@@ -285,6 +285,11 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
         case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
         case MBREG_SCAN_TRIGGER:
             return true;
+        case MBREG_SYSTEM_RESET:
+            // Validate the magic here; dispatch_action_reg latches the deferred
+            // reset so the FC06/FC10 ACK can still go out before we reboot.  A
+            // wrong value falls through to ILLEGAL_ADDRESS.
+            return (val == MBREG_SYSTEM_RESET_MAGIC);
         case MBREG_COMMISSION: {
             // 0x0000 abort, 0x0001 full, 0x0002 incremental.  Anything
             // else is ILLEGAL_VALUE; an attempt to start while a run is

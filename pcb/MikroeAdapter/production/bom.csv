@@ -1,0 +1,10 @@
+﻿Designator,Footprint,Quantity,Value,LCSC Part #
+CON1,MIKROBUS_HOST_CONN,1,MIKROBUS_HOST_CONN,
+D1,LED_D5.0mm_Clear,1,LED,
+"J2, J3",PinHeader_1x03_P2.54mm_Vertical,2,Conn_01x03_Pin,
+J4,"TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",1,Screw_Terminal_01x12,
+J5,TerminalBlock_RND_205-00233_1x03_P5.08mm_Horizontal,1,Conn_01x03,
+"MOUSE-BITE-2MM-4MM_3, MOUSE-BITE-2MM-4MM_2, MOUSE-BITE-2MM-4MM",mouse-bite-2mm-4mm,3,VAL**,
+R1,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,1,220,
+SW1,SW_PUSH_6mm_H8mm,1,SW_Push,
+U3,XIAO-ESP32C6-DIP,1,XIAO-ESP32-C6,

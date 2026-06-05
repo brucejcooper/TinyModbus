@@ -557,15 +557,27 @@ try_writes:
 }
 
 bool start_next_dali_work(void) {
-    bool launch;
+    bool launch = false;
     uint8_t old_tcb = TCB0.INTCTRL;
-    TCB0.INTCTRL = 0;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        launch = dali_idle && !dali_busy && pick_work();
-        if (launch) {
-            dali_busy = true;
-            dali_idle = false;
-            dali_cancel_edge_detect();
+    TCB0.INTCTRL = 0;   // keep the LVL1 completion handler out for the whole selection
+
+    // pick_work() scans up to ~192 ballast-flag entries.  It MUST NOT run under a
+    // global interrupt-disable: doing so (the previous ATOMIC_BLOCK here) held all
+    // interrupts off for hundreds of µs on every idle main-loop pass, overrunning
+    // the USART's 2-byte RX FIFO and silently dropping ~25% of incoming Modbus
+    // bytes — so every frame failed CRC and the gateway went deaf whenever DALI
+    // was idle.  The scan only needs the TCB0 fence above (sync_flags vs the LVL1
+    // completion writer); single-byte flag reads are atomic and a flag changing
+    // mid-scan is benign (picked next pass).  Only the short commit needs a
+    // global-atomic re-check against the LVL0 idle-timer / PIT / edge callbacks.
+    if (dali_idle && !dali_busy && pick_work()) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            if (dali_idle && !dali_busy) {   // re-check: state may have moved during the scan
+                dali_busy = true;
+                dali_idle = false;
+                dali_cancel_edge_detect();
+                launch = true;
+            }
         }
     }
     TCB0.INTCTRL = old_tcb;

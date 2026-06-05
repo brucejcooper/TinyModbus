@@ -34,6 +34,14 @@ int main(void) {
     PORTA.DIRSET = PIN4_bm;
     PORTA.OUTCLR = PIN4_bm;
 
+    // PB3 = logic-probe channel D7, reserved as a general-purpose firmware timing
+    // marker.  Configured as a driven-LOW output here but NOT toggled by any
+    // current code — drop a PORTB.OUTSET/OUTCLR/OUTTGL PIN3_bm at any point of
+    // interest to expose it on the scope.  (PB3 is otherwise unused — DALI is
+    // PB0/PB1.)
+    PORTB.DIRSET = PIN3_bm;
+    PORTB.OUTCLR = PIN3_bm;
+
     // 10 MHz internal oscillator (safe at 3.3 V, per datasheet)
     CCP = CCP_IOREG_gc;
     CLKCTRL.MCLKCTRLB = CLKCTRL_PDIV_2X_gc | CLKCTRL_PEN_bm;
@@ -77,6 +85,8 @@ int main(void) {
             start_next_dali_work();
         wdt_reset();
 
+        // Sleep left ENABLED — confirmed (again) NOT the cause of the deafness:
+        // with sleep disabled and scanning disabled the gateway is still dead.
         if (dali_idle && modbus_idle && !dali_busy)
             sleep_cpu();
     }

@@ -4,7 +4,7 @@ An ATtiny1604-based Modbus RTU to DALI gateway. It acts as a Modbus slave device
 
 The PCB design is in the `pcb` folder. It is set up to hold an RS-485 transceiver and the DALI bus driver circuitry on a compact board.
 
-![PCB](pcb/TinyModbus.png)
+![PCB](pcb/MikroeAdapter/MikroeAdapter.png)
 
 ---
 

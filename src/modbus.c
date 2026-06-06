@@ -108,6 +108,22 @@ static volatile uint8_t  silence_ticks = 0;
 static volatile bool     frame_ready   = false;
 static          uint8_t  tx_sz    = 0;
 static          bool     no_response   = false;
+
+// ---- RX diagnostics (read via FC04 0x0300, 16-register read) --------------
+// Counters to pin down why some Modbus requests go unanswered under load:
+//   rx_overflow : USART RX FIFO overflowed — a byte was lost (RXC starvation).
+//   frame_error : USART framing/parity error on a received byte.
+//   crc_error   : a frame's worth of bytes arrived, then 3.5-char silence, but
+//                 the CRC was non-zero (corruption — distinct from a foreign
+//                 slave's valid-CRC frame, which is NOT counted).
+//   frames_ok   : valid frames addressed to us that we processed (denominator).
+// last_fail[]   : the bytes of the most recent CRC-failed frame, for forensics.
+static volatile uint16_t diag_rx_overflow   = 0;
+static volatile uint16_t diag_frame_error   = 0;
+static volatile uint16_t diag_crc_error     = 0;
+static volatile uint16_t diag_frames_ok     = 0;
+static volatile uint8_t  diag_last_fail_len = 0;
+static volatile uint8_t  diag_last_fail[16];
 volatile bool            modbus_idle   = true;
 
 // Set when a write to MBREG_SLAVE_ADDR or MBREG_BAUD_INDEX has just landed in
@@ -245,6 +261,24 @@ static void process_fc04(void) {
                  SIGROW_SERNUM0, SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3,
                  SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7,
                  SIGROW_SERNUM8, SIGROW_SERNUM9);
+        start_tx(35u);
+        return;
+    }
+
+    // RX diagnostics block at FC04_DIAG_BLOCK (16-register read, 32 bytes).  All
+    // values big-endian.  RX is disabled while we build this response, so the
+    // ISR-updated counters can't tear mid-read.
+    if (addr == FC04_DIAG_BLOCK && count == 0x10u) {
+        buf[2] = 32u;
+        memset(buf + 3, 0, 32u);
+        uint8_t *p = buf + 3;
+        p[0] = (uint8_t)(diag_rx_overflow >> 8); p[1] = (uint8_t)diag_rx_overflow;
+        p[2] = (uint8_t)(diag_frame_error >> 8); p[3] = (uint8_t)diag_frame_error;
+        p[4] = (uint8_t)(diag_crc_error   >> 8); p[5] = (uint8_t)diag_crc_error;
+        p[6] = (uint8_t)(diag_frames_ok   >> 8); p[7] = (uint8_t)diag_frames_ok;
+        p[8] = 0;                                p[9] = diag_last_fail_len;
+        for (uint8_t i = 0; i < 16u; i++) p[10 + i] = diag_last_fail[i];
+        // p[26..31] left zero (spare)
         start_tx(35u);
         return;
     }
@@ -643,6 +677,18 @@ void modbus_tick(void) {
                 frame_ready = true;
                 USART0.CTRLA = USART_RS485_EXT_gc;  // Disable RX ISRs during processing
             } else {
+                // Frame discarded on silence.  Count it as a corruption only if
+                // bytes accumulated AND the CRC is non-zero — a foreign slave's
+                // frame has a valid (zero) CRC and just isn't our address, so it
+                // must not inflate the error counter.  Snapshot the bytes for
+                // forensics (what did the mangled frame look like?).
+                if (rx_sz >= 4u && rx_crc != 0u) {
+                    diag_crc_error++;
+                    diag_last_fail_len = rx_sz;
+                    uint8_t n = (rx_sz < sizeof diag_last_fail) ? rx_sz
+                                                                : (uint8_t)sizeof diag_last_fail;
+                    for (uint8_t i = 0; i < n; i++) diag_last_fail[i] = buf[i];
+                }
                 return_to_rx();
             }
         }
@@ -651,6 +697,7 @@ void modbus_tick(void) {
 
 void modbus_process(void) {
     if (!frame_ready) return;
+    diag_frames_ok++;   // a valid, CRC-good frame addressed to us reached processing
 
     // No explicit response delay needed.  modbus_tick gates frame_ready on
     // silence_ticks reaching 0, which is sized to ≥3.5 char-times per
@@ -729,7 +776,13 @@ ISR(USART0_RXC_vect) {
     }
 
     if (USART0.STATUS & USART_RXCIF_bm) {
+        // RXDATAH carries BUFOVF/FERR/PERR for this byte and must be read
+        // before RXDATAL (which pops the FIFO).  BUFOVF = the 2-deep RX FIFO
+        // overflowed and a byte was lost — the smoking gun for RXC starvation.
+        uint8_t sh  = USART0.RXDATAH;
         uint8_t val = USART0.RXDATAL;
+        if (sh & USART_BUFOVF_bm)                    diag_rx_overflow++;
+        if (sh & (USART_FERR_bm | USART_PERR_bm))    diag_frame_error++;
         if (rx_sz < MAX_PKT_SZ) {
             *rx_ptr++ = val;
             uint8_t idx = val ^ (uint8_t)rx_crc;

@@ -64,6 +64,12 @@ extern register_map_t g_regs;
 
 #define FC04_VERSION_BLOCK  0x0200u  // version string, 16 registers, read-only
 
+// RX diagnostics block, 16 registers, read-only (16-reg read only).  Layout:
+//   reg0 rx_overflow   reg1 frame_error   reg2 crc_error   reg3 frames_ok
+//   reg4 last_fail_len   reg5..12 last CRC-failed frame bytes (2/reg, big-endian)
+//   reg13..15 spare
+#define FC04_DIAG_BLOCK     0x0300u
+
 // ---- Modbus holding register (FC03/FC06) addresses ------------------------
 
 // Raw DALI forward frame - [15:8]=frame byte 0, [7:0]=frame byte 1

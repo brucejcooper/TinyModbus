@@ -1,1 +1,4 @@
 MikroeAdapter-backups/
+_autosave-*
+*.lck
+fp-info-cache

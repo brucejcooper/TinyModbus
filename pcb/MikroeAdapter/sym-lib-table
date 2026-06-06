@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "AVR32DD14") (type "KiCad") (uri "/Users/bruce/dev/kicad-footprints/AVR32DD14.kicad_sym") (options "") (descr ""))
+)

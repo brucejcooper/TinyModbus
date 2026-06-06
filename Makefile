@@ -56,7 +56,7 @@ get_config:
 # Bytes 4-31 are written 0xFF so the page is in a known state regardless of
 # what was there before.
 SLAVE_ADDR      ?= 2
-BAUD_INDEX      ?= 2
+BAUD_INDEX      ?= 1
 RESCAN_INTERVAL ?= 64
 
 USERROW_SLAVE_BYTE := $(if $(filter 1,$(SLAVE_ADDR)),0xFF,$(shell printf '0x%02X' $$(($(SLAVE_ADDR) - 2))))

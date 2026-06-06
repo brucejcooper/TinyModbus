@@ -291,12 +291,12 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
             // wrong value falls through to ILLEGAL_ADDRESS.
             return (val == MBREG_SYSTEM_RESET_MAGIC);
         case MBREG_COMMISSION: {
-            // 0x0000 abort, 0x0001 full, 0x0002 incremental.  Anything
-            // else is ILLEGAL_VALUE; an attempt to start while a run is
-            // already in progress is DEVICE_BUSY.  We return false in
-            // both cases — process_fc06 / process_fc10 disambiguate by
-            // re-checking val > 2.
-            if (val > 2u) return false;
+            // 0x0000 abort, 0x0001 full, 0x0002 incremental, 0x03YY re-provision
+            // the gear at short address YY.  Anything else is ILLEGAL_VALUE; an
+            // attempt to start while a run is already in progress is DEVICE_BUSY.
+            // We return false in both cases — process_fc06 / process_fc10
+            // disambiguate via MBREG_COMM_VALID.
+            if (!MBREG_COMM_VALID(val)) return false;
             if (val == 0u) {
                 // Abort: latch the request iff a run is actually in
                 // progress.  No-op when idle or in a terminal state
@@ -306,7 +306,9 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
                     commission_state.abort_requested = true;
                 return true;
             }
-            return dali_sync_arm_commission((uint8_t)val);
+            if ((val & 0xFF00u) == MBREG_COMM_REPROV_BASE)
+                return dali_sync_arm_commission(3u, (uint8_t)(val & 0x00FFu));
+            return dali_sync_arm_commission((uint8_t)val, 0u);
         }
         default:
             return false;

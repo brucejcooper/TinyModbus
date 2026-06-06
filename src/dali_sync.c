@@ -388,9 +388,14 @@ void dali_sync_dispatch_current(void) {
             uint8_t data_byte = 0x00u;
             switch (p) {
                 case COM_INITIALISE:
-                    data_byte = (commission_state.mode == 1u)
-                                    ? DALI_INIT_DATA_ALL
-                                    : DALI_INIT_DATA_NO_SHORT;
+                    // mode 1: all gear; mode 3: only the gear currently at the
+                    // collided short address (0AAAAAA1); mode 2: no-short gear.
+                    if (commission_state.mode == 1u)
+                        data_byte = DALI_INIT_DATA_ALL;
+                    else if (commission_state.mode == 3u)
+                        data_byte = DALI_PROG_SHORT(commission_state.reprov_addr);
+                    else
+                        data_byte = DALI_INIT_DATA_NO_SHORT;
                     break;
                 case COM_SEARCH_H:
                 case COM_SEARCH_M:
@@ -623,7 +628,7 @@ bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends) {
     return armed;
 }
 
-bool dali_sync_arm_commission(uint8_t mode) {
+bool dali_sync_arm_commission(uint8_t mode, uint8_t target) {
     bool armed   = false;
     bool do_wipe = false;
 
@@ -639,10 +644,12 @@ bool dali_sync_arm_commission(uint8_t mode) {
             // Already running — caller surfaces DEVICE_BUSY.
             goto out;
         }
-        uint8_t initial_addr = (mode == 2u) ? com_lowest_unused() : 0u;
-        if (mode == 2u && initial_addr >= DALI_MAX_DEVICES) {
-            // Incremental + bus already fully addressed: latch terminal
-            // status, no DALI work to do.
+        // Incremental (2) and re-provision-one-address (3) both assign onto the
+        // lowest free short address; full (1) renumbers from 0.
+        bool lowest_free = (mode == 2u || mode == 3u);
+        uint8_t initial_addr = lowest_free ? com_lowest_unused() : 0u;
+        if (lowest_free && initial_addr >= DALI_MAX_DEVICES) {
+            // Bus already fully addressed: no free slot to assign into.
             commission_state.status = COMM_STATUS_ERR_ADDR_EXHAUST;
             commission_state.phase  = COM_IDLE;
             armed = true;
@@ -650,6 +657,7 @@ bool dali_sync_arm_commission(uint8_t mode) {
         }
         com_reset_bisect();
         commission_state.next_short_addr = initial_addr;
+        commission_state.reprov_addr     = target;   // only consulted in mode 3
         commission_state.count           = 0;
         commission_state.err_streak      = 0;
         commission_state.mode            = mode;
@@ -657,7 +665,7 @@ bool dali_sync_arm_commission(uint8_t mode) {
         commission_state.resend_pending  = false;
         commission_state.status          = COMM_STATUS_RUNNING(0);
         commission_state.phase           = COM_INITIALISE;
-        do_wipe = (mode == 1u);
+        do_wipe = (mode == 1u);   // never wipe in modes 2/3 — preserve other gear
         armed   = true;
     out: ;
     }

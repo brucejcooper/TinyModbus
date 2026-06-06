@@ -103,9 +103,18 @@ extern register_map_t g_regs;
 //   Write 0x0000 — abort (no-op if idle / already terminal)
 //   Write 0x0001 — start full commissioning (wipes existing addresses)
 //   Write 0x0002 — start incremental commissioning (preserves addressed gear)
+//   Write 0x03YY — re-provision the gear currently at short address YY (0..63)
+//                  onto the lowest free addresses (fixes a collision at YY;
+//                  leaves all other gear untouched)
 //   Write any other value → ILLEGAL_VALUE
-//   Write 0x0001/0x0002 while already running → DEVICE_BUSY
+//   Write a valid command while already running → DEVICE_BUSY
 #define MBREG_COMMISSION        0x1014u
+
+#define MBREG_COMM_REPROV_BASE  0x0300u   // OR with the target short address (0..63)
+// True if `v` is a syntactically valid MBREG_COMMISSION write command.  Used by
+// the FC06/FC10 handlers to choose ILLEGAL_VALUE vs DEVICE_BUSY on a failed arm.
+#define MBREG_COMM_VALID(v) \
+    ((v) <= 2u || (((v) & 0xFF00u) == MBREG_COMM_REPROV_BASE && ((v) & 0x00FFu) < 64u))
 
 // System reset.  Write the magic value 0xA5A5 to force an immediate software
 // reset of the gateway (RSTCTRL software reset) once the Modbus ACK for this

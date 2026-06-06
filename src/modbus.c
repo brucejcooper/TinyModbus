@@ -456,12 +456,12 @@ static void process_fc06(void) {
     if (!regs_write_holding(addr, val)) {
         // Three failure shapes share the regs_write_holding "false" return:
         //   - group-register write rejected because group channel is busy
-        //   - 0x1014 commissioning write with val > 2 (illegal value)
+        //   - 0x1014 commissioning write with an invalid value (illegal value)
         //   - 0x1014 commissioning write while running (busy)
         //   - everything else is genuine ILLEGAL_ADDRESS.
         if (addr == MBREG_COMMISSION) {
-            if (val > 2u) send_error(MB_ERR_ILLEGAL_VALUE);
-            else          send_error(MB_ERR_DEVICE_BUSY);
+            if (!MBREG_COMM_VALID(val)) send_error(MB_ERR_ILLEGAL_VALUE);
+            else                        send_error(MB_ERR_DEVICE_BUSY);
         } else if (addr >= 0x0110u && addr <= 0x014Fu && dali_sync_group_busy()) {
             send_error(MB_ERR_DEVICE_BUSY);
         } else {
@@ -532,8 +532,8 @@ static void process_fc10(void) {
         if (!regs_write_holding(r, reg_value)) {
             // Same BUSY-vs-ILLEGAL distinction as FC06.
             if (r == MBREG_COMMISSION) {
-                if (reg_value > 2u) send_error(MB_ERR_ILLEGAL_VALUE);
-                else                send_error(MB_ERR_DEVICE_BUSY);
+                if (!MBREG_COMM_VALID(reg_value)) send_error(MB_ERR_ILLEGAL_VALUE);
+                else                             send_error(MB_ERR_DEVICE_BUSY);
             } else if (r >= 0x0110u && r <= 0x014Fu && dali_sync_group_busy()) {
                 send_error(MB_ERR_DEVICE_BUSY);
             } else {

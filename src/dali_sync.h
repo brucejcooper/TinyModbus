@@ -150,7 +150,8 @@ typedef struct {
     uint8_t            count;
     uint8_t            err_streak;
     commission_phase_t phase;
-    uint8_t            mode;             // 1 = full, 2 = incremental
+    uint8_t            mode;             // 1 = full, 2 = incremental, 3 = re-provision one addr
+    uint8_t            reprov_addr;      // mode 3: short address whose gear to re-provision
     bool               abort_requested;
     bool               resend_pending;   // bb==0 NO -> resync SEARCHADDR before PROGRAM
     uint16_t           status;
@@ -258,7 +259,9 @@ bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends);
 // (master should re-poll 0x1014 first).  Called from main context via
 // regs_write_holding for 0x1014 writes; the actual phase progression then
 // runs out of the OP_COMMISSION work-selector slot.
-bool dali_sync_arm_commission(uint8_t mode);
+// mode 1 = full, 2 = incremental, 3 = re-provision the gear at short address
+// `target` (only used for mode 3) onto the lowest free short addresses.
+bool dali_sync_arm_commission(uint8_t mode, uint8_t target);
 
 // Arm a group register write (called from modbus.c for 0x0110-0x014F).
 // reg_addr in [0x0110,0x014F]; pending_adds/pending_removes are bit

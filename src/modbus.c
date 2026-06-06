@@ -261,6 +261,31 @@ static void process_fc04(void) {
     buf[2] = (uint8_t)(count * 2u);
     regs_read_input_bulk(addr, (uint8_t)count, buf + 3);
 
+    // present[] (0x0100-0x0103) are uint16_t held in AVR little-endian memory, so
+    // the bulk memcpy above shipped each word low-byte-first — but Modbus
+    // registers are big-endian.  That byte-swap made the master read every
+    // presence bit shifted by 8 (a ballast at short address 0 reported at 8, 1 at
+    // 9, …).  Re-emit each present word high-byte-first, the same big-endian
+    // fix-up dirty[] and raw_cmd_result already get below.  (The per-ballast
+    // block0..3 and group_mask are byte-pair structs, so they were already in
+    // wire order — only these uint16_t bitmask/result words need the swap.)
+    // Fence the LVL1 completion handler (regs_set_present) so the 16-bit reads
+    // cannot tear.
+    if (addr <= FC04_PRESENT_BASE + 3u && addr + count > FC04_PRESENT_BASE) {
+        uint16_t p_start = (addr < FC04_PRESENT_BASE) ? FC04_PRESENT_BASE : addr;
+        uint16_t p_end   = (uint16_t)((addr + count - 1u > FC04_PRESENT_BASE + 3u)
+                                      ? FC04_PRESENT_BASE + 3u : (addr + count - 1u));
+        uint8_t old_tcb = TCB0.INTCTRL;
+        TCB0.INTCTRL = 0;
+        for (uint16_t a = p_start; a <= p_end; a++) {
+            uint16_t v   = g_regs.present[a - FC04_PRESENT_BASE];
+            uint16_t off = (uint16_t)((a - addr) * 2u);
+            buf[3 + off]      = (uint8_t)(v >> 8);
+            buf[3 + off + 1u] = (uint8_t)v;
+        }
+        TCB0.INTCTRL = old_tcb;
+    }
+
     // If the read range covers any dirty-flag words, atomically read-and-clear
     // each one and OVERWRITE the corresponding bytes in buf with the captured
     // value.  Without this overwrite, an ISR setting a new dirty bit between

@@ -33,8 +33,8 @@
 #define DALI_CMD_GOTO_LAST_ACTIVE     0x0Au
 #define DALI_CMD_QUERY_STATUS         0x90u
 #define DALI_CMD_QUERY_ACTUAL_LEVEL   0xA0u
-#define DALI_CMD_QUERY_MIN_LEVEL      0xA1u
-#define DALI_CMD_QUERY_MAX_LEVEL      0xA2u
+#define DALI_CMD_QUERY_MAX_LEVEL      0xA1u   // IEC 62386-102: 0xA1 = QUERY MAX LEVEL
+#define DALI_CMD_QUERY_MIN_LEVEL      0xA2u   //                0xA2 = QUERY MIN LEVEL
 #define DALI_CMD_QUERY_POWER_ON_LEVEL 0xA3u
 #define DALI_CMD_QUERY_FAIL_LEVEL     0xA4u
 // QUERY_FADE_TIME_FADE_RATE returns one byte: high nibble = fade time

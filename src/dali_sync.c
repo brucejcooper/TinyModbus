@@ -845,15 +845,18 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             } else {
                 // QUERY_ACTUAL_LEVEL response.
                 if (type == DALI_RESPONSE_OK) {
-                    uint8_t old_b = g_regs.block0[idx].brightness;
-                    g_regs.block0[idx].brightness = value;
-                    if (old_b != value) mark_dirty(idx);
-                    // If the lamp is still fading, KEEP SYNC_READ_LEVEL set so we
-                    // re-read until it settles, then dirty the final value. Without
-                    // this a level-changing command (GOTO_LAST_ACTIVE / fade) is
-                    // re-read once mid-fade and the settled level is never captured.
-                    // status came from the QUERY_STATUS half of this same read.
-                    if (g_regs.block0[idx].status & DALI_STATUS_FADE_RUNNING)
+                    // 0xFF = MASK: NOT a valid arc level (max is 254). Never store
+                    // it as a brightness — keep the last good value and re-read.
+                    bool valid  = (value != 0xFFu);
+                    bool fading = (g_regs.block0[idx].status & DALI_STATUS_FADE_RUNNING) != 0;
+                    if (valid) {
+                        uint8_t old_b = g_regs.block0[idx].brightness;
+                        g_regs.block0[idx].brightness = value;
+                        if (old_b != value) mark_dirty(idx);
+                    }
+                    // Keep re-reading until the level has settled to a valid value:
+                    // while still fading, or while the answer is invalid (0xFF).
+                    if (fading || !valid)
                         sync_flags_clear(idx, SYNC_RETRY_PENDING);
                     else
                         sync_flags_clear(idx, SYNC_READ_LEVEL | SYNC_RETRY_PENDING);

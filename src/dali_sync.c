@@ -501,8 +501,11 @@ static bool pick_work(void) {
             group_write.reg_addr = 0xFFFFu;
             goto try_writes;
         }
-        // Affected ballast: reg_off (0..3) gives 16-ballast-wide block,
-        // bit (0..15) gives the ballast within that block.
+        // Affected ballast: reg_off (0..3) gives the 16-ballast-wide block,
+        // bit (0..15) the ballast within it.  pending_adds/removes are held in
+        // natural ballast-bit order (byte-swapped from the wire at arm time),
+        // so this is a direct mapping — and it matches the completion's
+        // `bit_in_reg = 1 << (idx % 16)` clear.
         uint8_t ballast_idx = (uint8_t)(reg_off * 16u + bit);
         current_op.op   = OP_GROUP_BIT;
         current_op.addr = ballast_idx;
@@ -714,8 +717,12 @@ bool dali_sync_arm_group_write(uint16_t reg_addr,
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         if (group_write.reg_addr == 0xFFFFu) {
             group_write.reg_addr        = reg_addr;
-            group_write.pending_adds    = pending_adds;
-            group_write.pending_removes = pending_removes;
+            /* The wire register is big-endian (group_mask byte[reg*2] = ballasts
+             * 0-7 of the block sit in the HIGH byte), so byte-swap the pending
+             * masks into natural ballast-bit order here — the issuance and
+             * completion below then index ballasts directly (bit = ballast). */
+            group_write.pending_adds    = (uint16_t)((pending_adds    >> 8) | (pending_adds    << 8));
+            group_write.pending_removes = (uint16_t)((pending_removes >> 8) | (pending_removes << 8));
             armed = true;
         }
     }

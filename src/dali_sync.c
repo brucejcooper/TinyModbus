@@ -674,30 +674,30 @@ bool dali_sync_arm_commission(uint8_t mode, uint8_t target) {
     }
     TCB0.INTCTRL = old_tcb;
 
-    // Per-ballast cache wipe for full mode.  One TCB0+ATOMIC for the
-    // entire 64-iteration sweep is ~32 µs at 20 MHz — well under one
-    // DALI bit time (833 µs at 1200 baud).  TCB0 *captures* edges in
-    // hardware regardless; only ISR delivery is delayed, and the
-    // pulse decoder reads the captured count rather than wall-clock-
-    // of-now, so no corruption.  status=0x0100 is already published
-    // (from the header ATOMIC above) so a concurrent arm() call would
-    // observe "running" and refuse — but no concurrent arm() can
-    // actually run during this ATOMIC anyway since LVL0 is fenced.
+    // Per-ballast cache wipe for full mode.  TCB0.INTCTRL=0 fences the LVL1
+    // DALI completion ISR (the only other writer of the ballast regs/sync_flags)
+    // for the whole sweep, so the wipe is serialised against it.  But global
+    // interrupts must NOT stay off for all 64 iterations: at 10 MHz that window
+    // is long enough to overrun the USART's 2-byte RX FIFO and drop an inbound
+    // Modbus byte — the same class as the 2026-06-05 RX-starvation bug.  So we
+    // wrap only each single clear in ATOMIC and re-enable interrupts between
+    // iterations, letting the LVL0 USART RX ISR drain the FIFO.  A partially
+    // wiped cache is never observable as "complete": status=0x01XX ("running")
+    // is already published from the header ATOMIC above.
     //
-    // Wipe-vs-in-flight-completion race (intentionally benign): when
-    // arm() is called, dali_busy may still be true for a previously
-    // armed op (e.g., a SCAN_TRIGGER full-scan in progress).  Its
-    // completion ISR's writes are serialised by the ATOMIC (LVL1 is
-    // fenced via TCB0.INTCTRL=0).  Either outcome — wipe-then-ISR or
-    // ISR-then-wipe — is harmless: each newly-programmed short address
-    // gets SYNC_READ_FULL after VERIFY-yes (re-fills the cache), and
-    // the master observes status=0x01XX while the run is in flight so
-    // transient gaps don't leak into a "completed" snapshot.
+    // Wipe-vs-in-flight-completion race (intentionally benign): when arm() is
+    // called, dali_busy may still be true for a previously armed op (e.g., a
+    // SCAN_TRIGGER full-scan in progress).  Its completion ISR's writes are
+    // serialised against the wipe by TCB0.INTCTRL=0 (LVL1 fenced).  Either
+    // outcome — wipe-then-ISR or ISR-then-wipe — is harmless: each newly-
+    // programmed short address gets SYNC_READ_FULL after VERIFY-yes (re-fills
+    // the cache), and the master observes status=0x01XX while the run is in
+    // flight so transient gaps don't leak into a "completed" snapshot.
     if (do_wipe) {
         uint8_t ot = TCB0.INTCTRL;
         TCB0.INTCTRL = 0;
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
+        for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
                 regs_clear_ballast(i);
                 sync_flags[i] = 0;
             }

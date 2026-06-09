@@ -2,8 +2,8 @@ CompileFlags:
   Add:
     - "-I/opt/avr-gcc/avr/include/"
     - "-DF_CPU=10000000"
-    - "-D__AVR_ATtiny806__"
+    - "-D__AVR_ATtiny1604__"
     - "-D__AVR_TINY__"
     - "-DSM1"
-    - "-DFW_VER_MAJOR=1"
-    - "-DFW_VER_MINOR=0"
+    - "-DFW_VER_MAJOR=0"
+    - "-DFW_VER_MINOR=2"

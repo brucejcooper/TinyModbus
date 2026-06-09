@@ -217,8 +217,8 @@ static void send_error(mb_err_t err) {
 // Raw-command staging lives in dali_sync.c (raw_cmd_addr / raw_cmd_data and
 // the 0x0108 state machine in g_regs.raw_cmd_result).  Cache invalidation is
 // handled centrally in issue_dali_command for every DALI source — there is
-// no separate classify_raw_cmd step.  Fade tracking is a natural consequence
-// of SYNC_READ_LEVEL being set by the unified invalidation path.
+// no separate raw-command classification step.  Fade tracking is a natural
+// consequence of SYNC_READ_LEVEL being set by the unified invalidation path.
 
 // ---- FC04 - read input registers ----------------------------------------
 

@@ -1095,7 +1095,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             // Each call here is one terminated logical command (twice-
             // sends are coalesced by dali_result_received's repeat
             // re-fire).  So this path always writes a terminal value to
-            // 0x015D and releases the channel.
+            // the raw-cmd result register (0x0108) and releases the channel.
             uint16_t terminal;
             if (type == DALI_RESPONSE_OK) {
                 terminal = RAW_RESULT_OK(value);

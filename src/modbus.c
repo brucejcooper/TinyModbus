@@ -678,37 +678,41 @@ void modbus_tick(void) {
                 initial_silence_observed = true;
                 return;
             }
-            if (frame_is_valid()) {
-                frame_ready = true;
-                USART0.CTRLA = USART_RS485_EXT_gc;  // Disable RX ISRs during processing
-            } else {
-                // Frame discarded on silence.  Count it as a corruption only if
-                // bytes accumulated AND the CRC is non-zero — a foreign slave's
-                // frame has a valid (zero) CRC and just isn't our address, so it
-                // must not inflate the error counter.  Snapshot the bytes for
-                // forensics (what did the mangled frame look like?).
-                if (rx_sz >= 4u && rx_crc != 0u) {
-                    diag_crc_error++;
-                    diag_last_fail_len = rx_sz;
-                    uint8_t n = (rx_sz < sizeof diag_last_fail) ? rx_sz
-                                                                : (uint8_t)sizeof diag_last_fail;
-                    for (uint8_t i = 0; i < n; i++) diag_last_fail[i] = buf[i];
-                }
-                return_to_rx();
-            }
+            // Frame boundary: bytes were captured and t3.5 of silence has now
+            // elapsed.  Hand the frame to the main loop (modbus_process) for CRC,
+            // validation and processing — none of that runs in this timebase ISR.
+            // Disable RX to freeze the captured buffer until the main loop
+            // re-arms it (the master is half-duplex and waiting for our reply, so
+            // it is not transmitting during this window).
+            frame_ready  = true;
+            USART0.CTRLA = USART_RS485_EXT_gc;
         }
     }
 }
 
 void modbus_process(void) {
     if (!frame_ready) return;
-    diag_frames_ok++;   // a valid, CRC-good frame addressed to us reached processing
 
-    // No explicit response delay needed.  modbus_tick gates frame_ready on
-    // silence_ticks reaching 0, which is sized to ≥3.5 char-times per
-    // Modbus §2.5.1.1.  By the time we get here the inter-frame silence
-    // has already elapsed since the master's last byte; the response can
-    // go on the wire immediately.
+    // Validate the captured frame here, in the main loop — NOT in the timebase
+    // ISR.  modbus_tick only detected the t3.5 frame boundary; we compute the CRC
+    // and check length/address now, and drop invalid or foreign-slave frames
+    // without a response.  The inter-frame silence (§2.5.1.1) has already elapsed,
+    // so once a valid frame is confirmed the response can go straight out.
+    if (!frame_is_valid()) {
+        // Count a real CRC failure only — a foreign slave's frame has a valid
+        // (zero) CRC and just isn't our address, so it must not inflate the
+        // counter.  Snapshot the bytes for forensics.
+        if (rx_sz >= 4u && rx_crc != 0u) {
+            diag_crc_error++;
+            diag_last_fail_len = rx_sz;
+            uint8_t n = (rx_sz < sizeof diag_last_fail) ? rx_sz
+                                                        : (uint8_t)sizeof diag_last_fail;
+            for (uint8_t i = 0; i < n; i++) diag_last_fail[i] = buf[i];
+        }
+        return_to_rx();   // discard + re-arm RX (clears frame_ready)
+        return;
+    }
+    diag_frames_ok++;   // a valid, CRC-good frame addressed to us
 
     no_response = (buf[0] == 0);
 

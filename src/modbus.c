@@ -554,6 +554,11 @@ static void process_fc10(void) {
 // Return true if the frame in buf has a correct CRC, valid length for its function code,
 // and is addressed to this slave (or broadcast address 0).
 static bool frame_is_valid(void) {
+    // Deferred CRC: compute it once over the captured frame here, at the silence
+    // timeout — not incrementally in the RX ISR.  Stored in rx_crc so the
+    // discard path can tell a real CRC failure (rx_crc != 0) from a foreign-slave
+    // frame (rx_crc == 0, just not our address).
+    rx_crc = crc16(buf, rx_sz);
     if (rx_crc != 0 || rx_sz < 5) return false;
     if (buf[0] != slave_addr) {
         if (buf[0] != 0) return false;
@@ -785,15 +790,14 @@ ISR(USART0_RXC_vect) {
         if (sh & (USART_FERR_bm | USART_PERR_bm))    diag_frame_error++;
         if (rx_sz < MAX_PKT_SZ) {
             *rx_ptr++ = val;
-            uint8_t idx = val ^ (uint8_t)rx_crc;
-            rx_crc = (rx_crc >> 8) ^ pgm_read_word(&crc_table[idx]);
             rx_sz++;
-            // Frame completion is gated on 3.5-char silence in modbus_tick
-            // (Modbus §2.5.1.1).  We deliberately do NOT mark the frame ready
-            // early on a valid CRC at the last byte: the master must leave t3.5
-            // of silence between frames, and a byte arriving within that window
-            // resets silence_ticks (above) and keeps this frame open.  This costs
-            // ~one t3.5 (≈2 ms @ 19200) of latency but is spec-correct.
+            // No CRC here.  Frame completion is gated on the 3.5-char silence
+            // timeout (Modbus §2.5.1.1, modbus_tick), so the CRC is needed only
+            // once — when the frame is declared complete.  It is computed in one
+            // pass in frame_is_valid() at the timeout, keeping this hot RX ISR to
+            // pure byte capture (best margin against RX-FIFO overrun).  A byte
+            // arriving within the silence window resets silence_ticks (above) and
+            // keeps the frame open; spec-correct, costs ~one t3.5 (~2 ms @ 19200).
         }
     }
 }

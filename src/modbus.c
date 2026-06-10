@@ -56,7 +56,10 @@ static uint16_t baud_reg_for(uint8_t bidx) {
 //   3.5 char @ 19200 = 1.82 ms = 4.37 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
 //   3.5 char @ 38400 = 0.91 ms = 2.19 ticks -> N = 4  -> 3-4  ticks (1.25-1.67 ms)
 static const uint8_t  s_silence_threshold[] = { 10, 6, 4 };
-static volatile uint8_t  s_silence_ticks;
+// Per-baud reload value for the live silence_ticks countdown (set from
+// s_silence_threshold[] on init / baud change; copied into silence_ticks each
+// time a byte arrives).  Named _reload to disambiguate from the countdown.
+static volatile uint8_t  s_silence_reload;
 
 // Modbus §2.5.1.1 initial-silence gate.  After reset (power-on or WDT) the slave must
 // observe 3.5 char of bus silence before treating bytes as the start of a new frame -
@@ -106,8 +109,12 @@ static volatile uint8_t  rx_sz    = 0;
 static volatile uint16_t rx_crc   = 0xFFFF;
 static volatile uint8_t  silence_ticks = 0;
 static volatile bool     frame_ready   = false;
-static          uint8_t  tx_sz    = 0;
-static          bool     no_response   = false;
+// tx_sz is written on the main path (append_crc) and decremented in the DRE
+// ISR, so it must be volatile.  no_response is main-only today (set in
+// modbus_process, read in start_tx), marked volatile for consistency with the
+// other TX-path state and to stay correct if start_tx is ever reached from an ISR.
+static volatile uint8_t  tx_sz    = 0;
+static volatile bool     no_response   = false;
 
 // ---- RX diagnostics (read via FC04 0x0300, 16-register read) --------------
 // Counters to pin down why some Modbus requests go unanswered under load:
@@ -612,7 +619,7 @@ static void apply_pending_config(void) {
     if (mask & APPLY_BAUD) {
         uint8_t bidx = userrow_get_baud_index();
         USART0.BAUD     = baud_reg_for(bidx);
-        s_silence_ticks = s_silence_threshold[bidx];
+        s_silence_reload = s_silence_threshold[bidx];
     }
     if (mask & APPLY_SLAVE) {
         slave_addr = userrow_get_slave_addr();
@@ -646,10 +653,10 @@ void modbus_init(uint8_t addr) {
     initial_silence_observed = false;
 
     uint8_t bidx = userrow_get_baud_index();
-    s_silence_ticks = s_silence_threshold[bidx];
+    s_silence_reload = s_silence_threshold[bidx];
     // Arm the initial 3.5-char silence countdown.  modbus_tick will set
     // initial_silence_observed when it expires without an intervening byte.
-    silence_ticks = s_silence_ticks;
+    silence_ticks = s_silence_reload;
 
     PORTMUX.CTRLB          = PORTMUX_USART0_ALTERNATE_gc;
     RS485_PORT.PIN1CTRL    = PORT_PULLUPEN_bm;
@@ -769,7 +776,7 @@ ISR(USART0_TXC_vect) {
 
 ISR(USART0_RXC_vect) {
     modbus_idle    = false;
-    silence_ticks  = s_silence_ticks;
+    silence_ticks  = s_silence_reload;
     USART0.STATUS  = USART_RXSIF_bm;
 
     if (!initial_silence_observed) {

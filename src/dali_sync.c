@@ -336,15 +336,30 @@ void dali_sync_dispatch_current(void) {
         case OP_RAW: {
             // raw_cmd_addr / raw_cmd_data hold the staged bytes.
             // sends_remaining encoded in the low byte of raw_cmd_result.
-            // For a single send: KIND_QUERY (backward frame may arrive).
-            // For twice: KIND_TWICE with repeat=2 (dali_result_received's
-            // re-fire handles the second send within the 22 TE window).
+            //   twice (rc_lo >= 2): KIND_TWICE, repeat=2 (dali_result_received's
+            //     re-fire handles the second send within the 22 TE window).
+            //   single: classify by the DALI command code —
+            //     KIND_QUERY only if a backward frame can come back; else
+            //     KIND_CMD, which completes immediately (no ~22 TE / ~9 ms wait)
+            //     and frees the raw slot sooner, shrinking the DEVICE_BUSY window
+            //     a back-to-back command (e.g. a second person's fade) sees.
             uint8_t  rc_lo;
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rc_lo = (uint8_t)g_regs.raw_cmd_result; }
-            if (rc_lo >= 2u)
+            if (rc_lo >= 2u) {
                 issue_dali_command(raw_cmd_addr, raw_cmd_data, DALI_KIND_TWICE, 2u);
-            else
-                issue_dali_command(raw_cmd_addr, raw_cmd_data, DALI_KIND_QUERY, 1u);
+            } else {
+                // A reply is expected for standard QUERY/READ opcodes (all >=
+                // 0x90: QUERY_* 0x90-0xA9, READ MEMORY 0xC5, ...) and for any
+                // special command (odd address 0xA1-0xDF — COMPARE / QUERY SHORT
+                // ADDRESS reply; the rest don't, but waiting is harmless and
+                // keeps arbitrary dali_raw queries correct). Everything else
+                // (OFF/UP/DOWN/GOTO/STEP/scene, opcode < 0x90) returns no frame.
+                bool is_query = (raw_cmd_data >= 0x90u)
+                             || (raw_cmd_addr >= 0xA1u && raw_cmd_addr <= 0xDFu
+                                 && (raw_cmd_addr & 0x01u));
+                issue_dali_command(raw_cmd_addr, raw_cmd_data,
+                                   is_query ? DALI_KIND_QUERY : DALI_KIND_CMD, 1u);
+            }
             break;
         }
         case OP_COMMISSION: {

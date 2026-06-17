@@ -19,8 +19,10 @@
 // The retry-pending bit gates the absent-on-NAK transition: a single NAK
 // keeps the read flag set, sets SYNC_RETRY_PENDING, and the work loop
 // retries.  A second consecutive NAK transitions the ballast to absent.
-#define SYNC_READ_LEVEL    (1u << 0)  // QUERY_STATUS + GET_LEVEL
-#define SYNC_READ_FULL     (1u << 1)  // re-fetch all 7 config fields (incl. group memberships)
+#define SYNC_READ_LEVEL    (1u << 0)  // QUERY_STATUS + GET_LEVEL (the live arc level)
+#define SYNC_READ_SETTINGS (1u << 1)  // re-fetch the 7 config fields (min/max/fade/power/fail/
+                                      // groups).  NOTE: settings only — does NOT read the live
+                                      // arc level; pair with SYNC_READ_LEVEL to refresh both.
 #define SYNC_WRITE_LEVEL   (1u << 2)  // DAPC (one DALI command)
 #define SYNC_WRITE_MINMAX  (1u << 3)  // DTR0+SET_MIN(x2)+DTR0+SET_MAX(x2) - 6 sends
 #define SYNC_WRITE_POWER   (1u << 4)  // DTR0+SET_POWER_ON(x2)+DTR0+SET_SYS_FAIL(x2)
@@ -50,7 +52,7 @@ extern volatile bool dali_busy;
 typedef enum __attribute__((packed)) {
     OP_NONE = 0,
     OP_LEVEL_READ,    // SYNC_READ_LEVEL: QUERY_STATUS -> QUERY_ACTUAL_LEVEL
-    OP_FULL_SCAN,     // SYNC_READ_FULL: 7 config queries, yields between steps
+    OP_FULL_SCAN,     // SYNC_READ_SETTINGS: 7 config queries, yields between steps
     OP_WRITE_LEVEL,   // SYNC_WRITE_LEVEL: single DAPC
     OP_WRITE_MINMAX,  // SYNC_WRITE_MINMAX: DTR0/SET_MIN(2x)/DTR0/SET_MAX(2x)
     OP_WRITE_POWER,   // SYNC_WRITE_POWER: DTR0/SET_POWER_ON(2x)/DTR0/SET_SYS_FAIL(2x)
@@ -198,6 +200,9 @@ extern volatile uint8_t raw_cmd_data;   // DALI data byte
 // scan_full_step: which of the 7 config-field queries we're up to.
 extern volatile uint8_t scan_full_addr;
 extern volatile uint8_t scan_full_step;
+
+// Seconds since boot (RTC PIT, ~1 Hz).  Exposed via the FC04 sysinfo block.
+extern volatile uint32_t g_uptime_s;
 
 // ---- Public API ------------------------------------------------------
 

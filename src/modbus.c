@@ -290,6 +290,22 @@ static void process_fc04(void) {
         return;
     }
 
+    // System-info block at FC04_SYSINFO_BLOCK (4-register read, 8 bytes).
+    // uptime/boot-count/reset-reason — see registers.h for the layout.  The
+    // 32-bit uptime read is fenced against the LVL0 PIT ISR so it can't tear.
+    if (addr == FC04_SYSINFO_BLOCK && count == 0x04u) {
+        buf[2] = 8u;
+        uint8_t *p = buf + 3;
+        uint32_t up;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { up = g_uptime_s; }
+        p[0] = (uint8_t)(up >> 24); p[1] = (uint8_t)(up >> 16);
+        p[2] = (uint8_t)(up >> 8);  p[3] = (uint8_t)up;
+        p[4] = (uint8_t)(g_boot_count >> 8); p[5] = (uint8_t)g_boot_count;
+        p[6] = 0;                            p[7] = g_reset_reason;
+        start_tx(11u);
+        return;
+    }
+
     if (count == 0 || count > MAX_REG_RD) {
         send_error(MB_ERR_ILLEGAL_VALUE);
         return;
@@ -404,7 +420,7 @@ static void process_fc03(void) {
 //
 // The only registers that map to a DALI command issued from here are
 // MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel) and
-// MBREG_SCAN_TRIGGER (sets SYNC_READ_FULL on all ballasts).  DTR loads
+// MBREG_SCAN_TRIGGER (sets SYNC_READ_SETTINGS | SYNC_READ_LEVEL on all ballasts).  DTR loads
 // have no convenience register — the master writes 0xA3VV to 0x1000 to
 // load DTR0 with VV (or 0xC3VV / 0xC5VV for DTR1 / DTR2).  Per-ballast
 // bank writes (0x0000-0x00FF) and group register writes (0x0110-0x014F)
@@ -423,11 +439,15 @@ static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
         return 0;
     }
     if (mb_reg == MBREG_SCAN_TRIGGER) {
-        // Set SYNC_READ_FULL on all 64 ballasts.  The work selector
-        // services them one at a time via issue_dali_command.
+        // Set BOTH SYNC_READ_SETTINGS and SYNC_READ_LEVEL on all 64 ballasts.
+        // The work selector services them one at a time via issue_dali_command.
+        // Both are needed: SYNC_READ_SETTINGS re-fetches the 7 config fields,
+        // SYNC_READ_LEVEL re-fetches the live arc level/status.  A master-driven
+        // rescan should refresh everything, so the gateway's cached brightness
+        // tracks reality (mirrors the boot scan in main.c).
         if (val == 0x0001) {
             for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
-                sync_flags_set(i, SYNC_READ_FULL);
+                sync_flags_set(i, SYNC_READ_SETTINGS | SYNC_READ_LEVEL);
         }
         return 0;
     }

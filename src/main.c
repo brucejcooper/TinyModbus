@@ -28,7 +28,36 @@ FUSES = {
     .BOOTEND = FUSE_BOOTEND_DEFAULT,
 };
 
+// ---- Reboot diagnostics (no EEPROM — exposed via the FC04 sysinfo block) ----
+// g_boot_count / s_boot_magic live in .noinit SRAM: the C runtime does NOT clear
+// .noinit, so they survive a WARM reset (watchdog, software RSTCTRL.SWRR, the
+// external RESET pin) but are undefined after a true power-on / brownout where
+// SRAM content is lost.  The magic guard detects that (and PORF) and restarts
+// the count, so g_boot_count means "reboots since the last cold power-on" with
+// ZERO flash/EEPROM wear — safe even under a watchdog crash-loop.  g_reset_reason
+// is the RSTCTRL.RSTFR flag byte latched (and cleared) at boot.
+#define BOOT_MAGIC 0xB007u
+volatile uint16_t g_boot_count __attribute__((section(".noinit")));
+static   uint16_t s_boot_magic __attribute__((section(".noinit")));
+volatile uint8_t  g_reset_reason;
+
 int main(void) {
+    // Latch + clear the reset cause and maintain the warm-reboot counter FIRST,
+    // before anything touches RSTFR or the WDT re-arms.  RSTFR flags are
+    // cumulative until cleared (write-1-to-clear), so capture then clear to keep
+    // each boot's reason distinct.
+    {
+        uint8_t rr = RSTCTRL.RSTFR;
+        RSTCTRL.RSTFR  = rr;            // write-1-to-clear
+        g_reset_reason = rr;
+        // Cold boot (power-on/brownout) or corrupted .noinit magic => restart count.
+        if (s_boot_magic != BOOT_MAGIC || (rr & RSTCTRL_PORF_bm)) {
+            g_boot_count = 0;
+            s_boot_magic = BOOT_MAGIC;
+        }
+        g_boot_count++;
+    }
+
     // Drive DE low immediately - prevents floating pin from enabling RS-485 TX
     // during the startup window before modbus_init() configures the pin.
     PORTA.DIRSET = PIN4_bm;
@@ -48,7 +77,7 @@ int main(void) {
 
     // Hold off bus traffic for 1 s after reset so DALI ballasts on the same
     // supply rail have time to power up and start responding before the
-    // initial SYNC_READ_FULL sweep marks them absent.  Runs after the clock
+    // initial SYNC_READ_SETTINGS sweep marks them absent.  Runs after the clock
     // switch so _delay_ms is calibrated against F_CPU = 10 MHz.
     _delay_ms(1000);
 
@@ -71,11 +100,20 @@ int main(void) {
 
     sei();
 
-    // Initial bus scan: arm SYNC_READ_FULL on every ballast.  The work
-    // selector services them one at a time via the unified DALI
-    // issuance path (which sets the present bit on first OK response).
+    // Initial bus scan: arm BOTH SYNC_READ_SETTINGS and SYNC_READ_LEVEL on every
+    // ballast.  The work selector services them one at a time via the unified
+    // DALI issuance path (which sets the present bit on first OK response).
+    //
+    // Both flags are required because they read disjoint state and regs_init()
+    // zeroed everything: SYNC_READ_SETTINGS fetches the 7 config fields but NOT
+    // the live arc level, while SYNC_READ_LEVEL fetches QUERY_STATUS +
+    // QUERY_ACTUAL_LEVEL.  Without the level read, a ballast that is physically
+    // ON would sit at the boot-zeroed brightness=0 (reported as OFF to the
+    // master) until a command or the slow periodic re-poll cursor happened to
+    // touch it — the "ON but shows 0 after a gateway reboot" bug.  Arming both
+    // makes a freshly-booted gateway converge to true state on its own.
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
-        sync_flags_set(i, SYNC_READ_FULL);
+        sync_flags_set(i, SYNC_READ_SETTINGS | SYNC_READ_LEVEL);
 
     for (;;) {
         modbus_process();

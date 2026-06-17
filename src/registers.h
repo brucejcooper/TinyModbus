@@ -70,6 +70,21 @@ extern register_map_t g_regs;
 //   reg13..15 spare
 #define FC04_DIAG_BLOCK     0x0300u
 
+// System-info block, 4 registers, read-only (4-reg read only).  No persistent
+// storage is used (no EEPROM wear): uptime is a RAM counter, boot count is
+// .noinit SRAM, reset reason is the latched RSTCTRL.RSTFR.  Layout (big-endian):
+//   reg0  uptime_s high word   reg1  uptime_s low word   (32-bit seconds since boot)
+//   reg2  boot_count           (reboots since the last cold power-on; .noinit SRAM)
+//   reg3  reset_reason         (low byte = RSTCTRL.RSTFR flags latched at boot:
+//                               bit0 PORF, 1 BORF, 2 EXTRF, 3 WDRF, 4 SWRF, 5 UPDIRF)
+// A master detects a gateway reboot when uptime_s drops or boot_count changes.
+#define FC04_SYSINFO_BLOCK  0x0310u
+
+// Reboot diagnostics, sourced without EEPROM (defined in main.c).  See the
+// FC04_SYSINFO_BLOCK layout above; g_uptime_s lives in dali_sync.{c,h}.
+extern volatile uint16_t g_boot_count;
+extern volatile uint8_t  g_reset_reason;
+
 // ---- Modbus holding register (FC03/FC06) addresses ------------------------
 
 // Raw DALI forward frame - [15:8]=frame byte 0, [7:0]=frame byte 1

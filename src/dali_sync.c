@@ -67,6 +67,11 @@ volatile uint8_t scan_full_step;
 // PIT round-robin cursor — advances at most one slot per fired tick.
 static volatile uint8_t scan_cursor;
 
+// Seconds since boot.  Incremented once per RTC PIT fire (~1 Hz); exposed via
+// the FC04 sysinfo block so the master can detect a gateway reboot (the value
+// drops back toward 0).  Pure RAM — no persistent storage, no wear.
+volatile uint32_t g_uptime_s = 0;
+
 // Rotating cursor for the work-selector ballast walk.  Same cursor for
 // SYNC_WRITE_* (priority 3) and SYNC_READ_LEVEL (priority 4) — they
 // share the fairness property: each issued command (write or read)
@@ -108,22 +113,22 @@ void dali_sync_init(void) {
 // table is collapsed to four coarse ranges; the user accepted that a
 // few reserved opcodes (notably 0x21 STORE_CURRENT_LEVEL_DTR0 and the
 // gaps in the 0x22..0x29 / 0x30..0x3F / 0x81..0x8F bands) now over-
-// invalidate by triggering a SYNC_READ_FULL.  The cost is one extra
+// invalidate by triggering a SYNC_READ_SETTINGS.  The cost is one extra
 // 7-step background scan per spurious match, which is well within the
 // existing rescan budget — and the simpler classifier is easier to
 // maintain than an exhaustive opcode table.
 //
 //  - DAPC (bit0 of addr clear)              -> SYNC_READ_LEVEL
 //  - 0x00..0x1F (level / scene / step / etc) -> SYNC_READ_LEVEL
-//  - 0x20 RESET                             -> SYNC_READ_LEVEL | SYNC_READ_FULL
-//  - 0x21..0x8F (config + special)          -> SYNC_READ_FULL  [over-invalidates a handful of reserved opcodes]
+//  - 0x20 RESET                             -> SYNC_READ_LEVEL | SYNC_READ_SETTINGS
+//  - 0x21..0x8F (config + special)          -> SYNC_READ_SETTINGS  [over-invalidates a handful of reserved opcodes]
 //  - 0x90..0xFF queries / specials          -> 0
 static uint8_t classify_invalidation(uint8_t addr_byte, uint8_t data_byte) {
     // DAPC: address bit 0 clear -> arc level command.
     if ((addr_byte & DALI_CMD_FLAG) == 0) return SYNC_READ_LEVEL;
     if (data_byte <  0x20u)               return SYNC_READ_LEVEL;
-    if (data_byte == 0x20u)               return SYNC_READ_LEVEL | SYNC_READ_FULL;
-    if (data_byte <  0x90u)               return SYNC_READ_FULL;
+    if (data_byte == 0x20u)               return SYNC_READ_LEVEL | SYNC_READ_SETTINGS;
+    if (data_byte <  0x90u)               return SYNC_READ_SETTINGS;
     return 0;
 }
 
@@ -476,7 +481,7 @@ static uint8_t write_flag_for_op(dali_op_t op) {
 //   4. SYNC_WRITE_*   — per-ballast bank writes (rotating cursor for fairness).
 //   5. SYNC_READ_LEVEL- per-ballast level polls (same cursor).
 //   6. continue full-scan in progress.
-//   7. start a new full-scan from SYNC_READ_FULL.
+//   7. start a new full-scan from SYNC_READ_SETTINGS.
 static bool pick_work(void) {
     // 1. Commissioning state machine (highest priority).  phase != IDLE
     //    means a run is armed or mid-flight; OP_COMMISSION is sticky for
@@ -566,7 +571,7 @@ try_writes:
 
     // 7. Start a new full scan.
     for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++) {
-        if (sync_flags[i] & SYNC_READ_FULL) {
+        if (sync_flags[i] & SYNC_READ_SETTINGS) {
             scan_full_addr  = i;
             scan_full_step  = 0;
             current_op.op   = OP_FULL_SCAN;
@@ -705,7 +710,7 @@ bool dali_sync_arm_commission(uint8_t mode, uint8_t target) {
     // SCAN_TRIGGER full-scan in progress).  Its completion ISR's writes are
     // serialised against the wipe by TCB0.INTCTRL=0 (LVL1 fenced).  Either
     // outcome — wipe-then-ISR or ISR-then-wipe — is harmless: each newly-
-    // programmed short address gets SYNC_READ_FULL after VERIFY-yes (re-fills
+    // programmed short address gets SYNC_READ_SETTINGS after VERIFY-yes (re-fills
     // the cache), and the master observes status=0x01XX while the run is in
     // flight so transient gaps don't leak into a "completed" snapshot.
     if (do_wipe) {
@@ -778,7 +783,7 @@ static void apply_retry_pending(uint8_t idx, uint8_t retry_flag) {
 }
 
 // On any successful response: transition to present + set
-// SYNC_READ_FULL if the ballast was absent.  Returns true if a
+// SYNC_READ_SETTINGS if the ballast was absent.  Returns true if a
 // presence transition occurred.
 static bool note_present_on_ok(uint8_t idx) {
     uint16_t bm   = g_regs.present[idx >> 4];
@@ -786,7 +791,7 @@ static bool note_present_on_ok(uint8_t idx) {
     if (!(bm & bit)) {
         regs_set_present(idx, true);
         // Re-fetch all config on presence transition.
-        sync_flags_set(idx, SYNC_READ_FULL);
+        sync_flags_set(idx, SYNC_READ_SETTINGS);
         mark_dirty(idx);
         return true;
     }
@@ -825,12 +830,12 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             // NAK is the expected outcome and is treated as "step done".
             // Bus errors (anything other than OK/NAK) on a SET step abort
             // the sequence; the cache will be reconfirmed by a follow-up
-            // SYNC_READ_FULL.  DTR0 steps (0, 2) are broadcast-style and
+            // SYNC_READ_SETTINGS.  DTR0 steps (0, 2) are broadcast-style and
             // cannot meaningfully NAK, but a bus error there also aborts.
             if (type != DALI_RESPONSE_OK && type != DALI_RESPONSE_NAK) {
                 // Bus error: abort sequence.
                 sync_flags_clear(idx, flag);
-                apply_retry_pending(idx, SYNC_READ_FULL);
+                apply_retry_pending(idx, SYNC_READ_SETTINGS);
             } else if (step >= 3u) {
                 // Final SET twice-pair done.
                 sync_flags_clear(idx, flag);
@@ -903,7 +908,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 regs_apply_result(idx, scan_steps[s].target, value);
                 scan_full_step = s + 1u;
                 if (scan_full_step >= 7u) {
-                    sync_flags_clear(idx, SYNC_READ_FULL | SYNC_RETRY_PENDING);
+                    sync_flags_clear(idx, SYNC_READ_SETTINGS | SYNC_RETRY_PENDING);
                     scan_full_addr = 0xFFu;
                     scan_full_step = 0;
                 }
@@ -912,7 +917,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 // full scan) unless higher-priority work arrives.
             } else {
                 // NAK or bus error: abort this ballast's scan.
-                sync_flags_clear(idx, SYNC_READ_FULL | SYNC_RETRY_PENDING);
+                sync_flags_clear(idx, SYNC_READ_SETTINGS | SYNC_RETRY_PENDING);
                 scan_full_addr = 0xFFu;
                 scan_full_step = 0;
             }
@@ -1048,14 +1053,14 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                     // not OK.
                     bool ok = (type == DALI_RESPONSE_OK && value == 0xFFu);
                     if (ok) {
-                        // Mark presence + queue background SYNC_READ_FULL
+                        // Mark presence + queue background SYNC_READ_SETTINGS
                         // so the cache fills without manual SCAN_TRIGGER.
                         // next_short_addr advance MUST happen here (not
                         // after WITHDRAW) — otherwise incremental's
                         // lowest-unused re-picks this slot.
                         uint8_t sa = commission_state.next_short_addr;
                         regs_set_present(sa, true);
-                        sync_flags_set(sa, SYNC_READ_FULL);
+                        sync_flags_set(sa, SYNC_READ_SETTINGS);
                         commission_state.count++;
                         commission_state.err_streak = 0;
                         commission_state.status     = COMM_STATUS_RUNNING(commission_state.count);
@@ -1152,6 +1157,8 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 // rescan_interval == 0 disables the cursor entirely (no automatic polls).
 ISR(RTC_PIT_vect) {
     static uint8_t tick = 0;
+
+    g_uptime_s++;   // ~1 Hz wall-clock tick (independent of the rescan cursor)
 
     uint16_t interval = userrow_get_rescan_interval();
     if (interval > 0) {

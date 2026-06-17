@@ -21,6 +21,81 @@ Packed enums (`__attribute__((packed))`) on `cmd_type_t`, `reg_target_t`, `dali_
 Clang (macOS) will report false-positive errors for AVR-specific attributes (`__progmem__`, `__AVR_TINY_PM_BASE_ADDRESS__`, ISR attributes, EEPROM macros). These are harmless - the code targets avr-gcc, not clang.
 
 
+## Power supply — board revision: 12 V → 5 V synchronous buck (2026-06-17)
+
+**Root cause of the gateway reboots.** The current board regulates the 12 V input to
+3.3 V with an **HT7533 LDO** (100 mA, 10 µF output cap). At 12 V the LDO drops 8.7 V,
+so even ~85–100 mA of load dissipates ~0.75–0.9 W in a SOT-89 — under a sustained DALI
+scan the junction reaches **thermal shutdown**, the 3.3 V rail collapses, and the
+ATtiny's 2.6 V BOD fires. It presents as a **brownout (RSTFR `BORF`)**, which is exactly
+how the new FC04 `0x0310` sysinfo diagnostics surfaced it: **13 brownout reboots during
+one `dali_inventory.py --all` scan on bus 3**. It is *not* a transient sag and *not* a
+faulty LDO — it's linear dissipation from a 12 V input. A bigger LDO makes it worse; a
+bulk cap doesn't help a thermal trip.
+
+**Decision.** Replace the LDO with a **synchronous buck** and move the logic rail to
+**5 V**. A buck is ~90 % efficient regardless of output, so the heat problem disappears.
+5 V also lets the ATtiny run **20 MHz** (needs V_DD ≥ 4.5 V) and gives the THVD1450
+**stronger RS-485 drive** (better noise margin — bus 3 was marginal).
+
+**Regulator: MP2331H** (`MP2331HGTL-Z`, **LCSC C6992878**, SOT583-8) — 24 V/2 A, 1.2 MHz,
+**COT** control, V_FB 0.8 V, internal FETs (no catch diode). Chosen over the MP1584EN:
+synchronous (no external Schottky), fixed-frequency (no RFREQ resistor), fewer BOM lines,
+cheaper ($1.80 vs $3.26), smaller; 24 V/2 A is ample for the ~0.1 A load. (The first pick,
+MP2359, is NRND.)
+
+**Power-supply BOM (12 V → 5 V).** `V_OUT = 0.8·(1 + R1/R2) = 4.99 V`.
+
+| Ref | Value | Rating | Footprint | LCSC |
+|---|---|---|---|---|
+| U1 | MP2331HGTL-Z buck | 24 V / 2 A | SOT583-8 | **C6992878** |
+| D1 | SS34 Schottky (reverse-polarity) | 40 V / 3 A | SMA | C8678 † |
+| TVS1 * | SMBJ13A (after D1) | 13 V standoff / ~21 V clamp | SMB | tbd |
+| L1 | FNR4030S4R7MT, 4.7 µH ±20% | 3.2 A I_sat, 2.3 A I_rms, shielded | 4×4×3 mm | **C167874** |
+| Cin1 | 22 µF X7R | 50 V (for 12 V DC-bias derating) | 1210 | tbd |
+| Cin2 | 0.1 µF X7R | 50 V | 0402 | tbd |
+| Cout1,2 | 22 µF X7R/X5R ×2 | 16 V | 0805 | tbd |
+| Cbst | 1 µF X7R | 25 V | 0603 | tbd |
+| Rbst | 20 Ω 1% (series with Cbst) | — | 0402 | tbd |
+| R1 | 40.2 kΩ 1% (FB top) | — | 0402 | tbd |
+| R2 | 7.68 kΩ 1% (FB bottom) | — | 0402 | tbd |
+| Cff | 10 pF **C0G/NP0** (across R1) | 50 V | 0402 | tbd |
+
+† SS34 = C8678 from prior knowledge, not re-verified. `tbd` = fill via the `jlcpcb`
+MCP once the JLCPCB API app is approved (it was "Reviewing" → all calls 403'd).
+**COT note:** the 10 pF C0G Cff is the loop's ripple injection (ceramic Cout has ~no
+ESR) — keep it, and re-tune if L1 changes; don't add output capacitance to "fix" jitter.
+**L1 = 4.7 µH** was chosen over the datasheet's 3.3 µH for ~30 % lower ripple current
+(peak ~0.76 A vs I_sat 3.2 A); since it deviates from the validated value, **scope the
+SW/V_OUT for COT jitter** when the board is first brought up. KiCad symbol/footprint for
+L1 and U1 come from `easyeda2kicad --full --lcsc_id=<C167874|C6992878>` (matches the
+JLCPCB land pattern; the stock `Changjiang_FTX2016…` footprints are a different, smaller
+series and do NOT fit the 4×4 FNR4030).
+
+**Input protection.** Series **SS34** off the connector for reverse polarity (~0.4 V
+drop, negligible at ~0.2 A buck input; the buck's wide V_IN swallows it). Optional
+**SMBJ13A** TVS *after* the diode for positive transients (clamps ~21 V < the 24 V max).
+
+**12 V supply sizing.** Rail feeds 2× gateway logic (~0.05 A each via the buck) + the
+Waveshare 32CH relay board (0.3 W idle / **11.7 W all-on ≈ 0.98 A**). Worst case ~1.1 A.
+A **1.25 A** supply is adequate for this install: boot is all-off and relays are switched
+**one at a time**, so there's no inrush/step load, and **DALI is separately powered** (not
+on this rail). Use 2 A only if all 32 relays will be held on continuously.
+
+**Firmware follow-ups — MUST land together with the 5 V / 20 MHz board:**
+1. `-DF_CPU=20000000` in the Makefile.
+2. Drop the ÷2 clock prescaler in `main.c` (`CLKCTRL.MCLKCTRLB = 0`; the osc is already
+   20 MHz base, currently divided to 10 MHz by `PDIV_2X | PEN`).
+3. **Raise the BOD fuse to ~4.2 V (BODLEVEL7)** — it's at 2.6 V now, which is *unsafe* at
+   20 MHz (V_DD must be ≥ 4.5 V). Without this the MCU runs out-of-spec on a sagging rail.
+4. **Re-verify the DALI bit timing** (TCB0 capture/compare counts) on the scope after the
+   F_CPU change. USART baud and `_delay_ms` scale with F_CPU automatically; the DALI
+   timing is precise and must be checked.
+5. DALI Click 2 → 5 V jumper; confirm no 3.3 V-only nets remain.
+
+**KiCad parts.** `easyeda2kicad --full --lcsc_id=C6992878` pulls the symbol + footprint +
+3D model matching the exact land pattern JLCPCB assembles.
+
 ## Tasks
 
 - the user will format tasks for claude to execute in the `tasks` directrory

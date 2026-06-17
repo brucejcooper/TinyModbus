@@ -462,7 +462,9 @@ The firmware is designed to operate as the sole DALI master on its bus. It can d
 
 ### Power
 
-The device runs at 3.3 V, 10 MHz. It spends the majority of its time in Standby sleep mode, consuming under 1 µA. The watchdog timer resets the device if it hangs for more than 8.2 seconds.
+The current board runs at 3.3 V, 10 MHz. It spends the majority of its time in Standby sleep mode, consuming under 1 µA. The watchdog timer resets the device if it hangs for more than 8.2 seconds.
+
+**Board revision in progress (12 V → 5 V buck).** The present supply — an **HT7533 LDO** dropping 12 V to 3.3 V — **thermally shuts down under sustained DALI activity** (e.g. an inventory scan): 8.7 V × ~0.1 A in a SOT-89 overheats, the rail collapses, and the ATtiny browns out (this is what the new FC04 `0x0310` reset-reason counter exposed — repeated `BORF` reboots during a scan). The fix is a **synchronous buck (MP2331H, LCSC C6992878)** to a **5 V** rail, which also enables 20 MHz operation and stronger RS-485 drive. Full root-cause analysis, the power-supply BOM, the supply-current budget, and the firmware changes the 5 V/20 MHz board needs (F_CPU, clock prescaler, **BOD → 4.2 V**, DALI bit-timing re-verify) are documented in `CLAUDE.md` → "Power supply — board revision".
 
 ---
 

@@ -46,23 +46,28 @@ MP2359, is NRND.)
 
 **Power-supply BOM (12 V → 5 V).** `V_OUT = 0.8·(1 + R1/R2) = 4.99 V`.
 
-| Ref | Value | Rating | Footprint | LCSC |
-|---|---|---|---|---|
-| U1 | MP2331HGTL-Z buck | 24 V / 2 A | SOT583-8 | **C6992878** |
-| D1 | SS34 Schottky (reverse-polarity) | 40 V / 3 A | SMA | C8678 † |
-| TVS1 * | SMBJ13A (after D1) | 13 V standoff / ~21 V clamp | SMB | tbd |
-| L1 | FNR4030S4R7MT, 4.7 µH ±20% | 3.2 A I_sat, 2.3 A I_rms, shielded | 4×4×3 mm | **C167874** |
-| Cin1 | 22 µF X7R | 50 V (for 12 V DC-bias derating) | 1210 | tbd |
-| Cin2 | 0.1 µF X7R | 50 V | 0402 | tbd |
-| Cout1,2 | 22 µF X7R/X5R ×2 | 16 V | 0805 | tbd |
-| Cbst | 1 µF X7R | 25 V | 0603 | tbd |
-| Rbst | 20 Ω 1% (series with Cbst) | — | 0402 | tbd |
-| R1 | 40.2 kΩ 1% (FB top) | — | 0402 | tbd |
-| R2 | 7.68 kΩ 1% (FB bottom) | — | 0402 | tbd |
-| Cff | 10 pF **C0G/NP0** (across R1) | 50 V | 0402 | tbd |
+All LCSC codes below are verified in-stock via the `jlcpcb` MCP and match the
+KiCad PCB BOM (`pcb/MikroeAdapter/.../BOM-MikroeAdapter.csv`). PCB refs in ().
 
-† SS34 = C8678 from prior knowledge, not re-verified. `tbd` = fill via the `jlcpcb`
-MCP once the JLCPCB API app is approved (it was "Reviewing" → all calls 403'd).
+| Ref (PCB) | Value | Rating | Footprint | LCSC |
+|---|---|---|---|---|
+| U1 | MP2331HGTL-Z buck | 24 V / 2 A | SOT-583-8 | **C6992878** ⚠ |
+| D2 | SS34 Schottky (reverse-polarity) | 40 V / 3 A | SMA | **C8678** |
+| D1 | SMBJ13A input TVS (after D2) | 13 V standoff / ~21.5 V clamp | SMB | **C19077567** |
+| L1 | FNR4030S4R7MT, 4.7 µH ±20% | 3.2 A I_sat, 2.3 A I_rms, shielded | 4×4×3 mm | **C167874** |
+| C1,C2,C10 | 22 µF 25 V X7R ×3 (1 input + 2 output) | 25 V (see note) | 1210 | **C2918511** |
+| C6,C8,C9 | 0.1 µF 50 V X7R (HF bypass ×3) | 50 V | 0402 | **C1525** |
+| C3 (Cbst) | 1 µF 50 V X5R | 50 V | 0603 | **C15849** |
+| R4 (Rbst) | 20 Ω 1% (series with Cbst) | — | 0402 | **C5140751** |
+| R1 | 40.2 kΩ 1% (FB top) | — | 0402 | **C25893** |
+| R2 | 7.68 kΩ 1% (FB bottom) | — | 0402 | **C25919** |
+| C5 (Cff) | 10 pF **C0G/NP0** (across R1) | 50 V | 0402 | **C32949** |
+
+⚠ **U1 stock is low (~29 at JLCPCB)** — order early / keep MP2315 (24 V/3 A sync) as a
+fallback. **Cin is 25 V, not 50 V:** 22 µF/1210 isn't stocked above 25 V, so at 12 V bias
+it derates to ~12 µF effective — still ample for this low-ripple input. The PCB merges
+Cin+Cout onto one part (3× C2918511). **R4 fix:** an earlier BOM used C2004 (a 4× 0402
+*array*) for the 20 Ω — corrected to the single-resistor C5140751.
 **COT note:** the 10 pF C0G Cff is the loop's ripple injection (ceramic Cout has ~no
 ESR) — keep it, and re-tune if L1 changes; don't add output capacitance to "fix" jitter.
 **L1 = 4.7 µH** was chosen over the datasheet's 3.3 µH for ~30 % lower ripple current

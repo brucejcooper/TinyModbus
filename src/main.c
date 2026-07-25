@@ -14,13 +14,20 @@
 
 // Fuse configuration.  Emits a `.fuse` section in the ELF; the Makefile's
 // avr-objcopy invocation passes this through into main.hex so pymcuprog
-// programs it on flash.  Brown-out detection is enabled at 2.6 V in active
-// mode - this is the highest-leverage protection against the bus-stuck
-// symptom seen when Vcc dips during DALI activity.  All other fuse bytes
-// are left at their factory defaults.
+// programs it on flash.  Brown-out detection is enabled in active mode - the
+// highest-leverage protection against the bus-stuck symptom seen when Vcc dips
+// during DALI activity.  The level is rail-dependent: on the 5 V board rev
+// (BOARD_5V) the core runs 20 MHz, which requires V_DD >= 4.5 V, so the BOD
+// must catch a sagging rail at ~4.2 V (BODLEVEL7) or the MCU runs out-of-spec;
+// on the legacy 3.3 V board 10 MHz is safe and the BOD sits at 2.6 V
+// (BODLEVEL2).  All other fuse bytes are left at their factory defaults.
 FUSES = {
     .WDTCFG  = FUSE_WDTCFG_DEFAULT,
+#if BOARD_5V
+    .BODCFG  = ACTIVE_ENABLED_gc | LVL_BODLEVEL7_gc,
+#else
     .BODCFG  = ACTIVE_ENABLED_gc | LVL_BODLEVEL2_gc,
+#endif
     .OSCCFG  = FUSE_OSCCFG_DEFAULT,
     .SYSCFG0 = FUSE_SYSCFG0_DEFAULT,
     .SYSCFG1 = FUSE_SYSCFG1_DEFAULT,
@@ -71,14 +78,21 @@ int main(void) {
     PORTB.DIRSET = PIN3_bm;
     PORTB.OUTCLR = PIN3_bm;
 
-    // 10 MHz internal oscillator (safe at 3.3 V, per datasheet)
+    // Core clock from the 20 MHz internal oscillator.  On the 5 V board rev
+    // (BOARD_5V) run it undivided at 20 MHz (V_DD >= 4.5 V, per datasheet);
+    // otherwise divide by 2 to 10 MHz, which is the fastest safe rate at 3.3 V.
     CCP = CCP_IOREG_gc;
+#if BOARD_5V
+    CLKCTRL.MCLKCTRLB = 0;
+#else
     CLKCTRL.MCLKCTRLB = CLKCTRL_PDIV_2X_gc | CLKCTRL_PEN_bm;
+#endif
 
     // Hold off bus traffic for 1 s after reset so DALI ballasts on the same
     // supply rail have time to power up and start responding before the
     // initial SYNC_READ_SETTINGS sweep marks them absent.  Runs after the clock
-    // switch so _delay_ms is calibrated against F_CPU = 10 MHz.
+    // switch so _delay_ms is calibrated against F_CPU (20 MHz on the 5 V rev,
+    // 10 MHz otherwise — both set by the Makefile to match the divider above).
     _delay_ms(1000);
 
     // Initialise subsystems

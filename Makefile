@@ -1,9 +1,22 @@
 DEVICE     	= attiny1604
+
+# Board revision select.  BOARD_5V=1 is the 5 V synchronous-buck board rev:
+# 20 MHz core (osc undivided), OSC20ERR5V trim, BODLEVEL7 (~4.2 V).  BOARD_5V=0
+# is the legacy 3.3 V / HT7533-LDO board: 20 MHz osc divided to 10 MHz,
+# OSC20ERR3V trim, BODLEVEL2 (2.6 V).  The flag is passed into the build so
+# main.c (clock + BOD fuse) and modbus.c (baud_reg_for) select the matching
+# rail-dependent constants.  F_CPU is derived from it, never set by hand.
+BOARD_5V   	?= 1
+ifeq ($(BOARD_5V),1)
+CLOCK      	= 20000000
+else
 CLOCK      	= 10000000
+endif
+
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)
-COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=2 -fstack-usage -ffunction-sections -fdata-sections
+COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=2 -fstack-usage -ffunction-sections -fdata-sections
 LDFLAGS    	= -Wl,--gc-sections
 AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )

@@ -28,20 +28,28 @@ static const uint16_t s_baud_reg[] = {
 //
 // s_baud_reg[] is computed assuming an exact F_CPU, but the internal 20 MHz RC
 // oscillator has a per-unit frequency error.  The factory measured it and stored
-// it — signed, in units of 1/1024 — in the signature row (OSC20ERR3V / 5V).  We
-// clock the core from the 20 MHz oscillator (÷2 → 10 MHz) and run at 3.3 V, so
-// OSC20ERR3V applies.  Scaling the nominal divisor by (1024 + err)/1024 makes the
-// USART sample at the true bit rate regardless of this die's individual error —
-// the fleet-safe equivalent of a hand-tuned per-unit trim (this is what e.g.
-// megaTinyCore's UART setup does, and skipping it is what leaves a marginal link
-// marginal).
+// it — signed, in units of 1/1024 — in the signature row at two supply points,
+// OSC20ERR3V and OSC20ERR5V.  The correction follows the RAIL the oscillator
+// runs on, NOT the clock divider or F_CPU: the ÷2 prescaler that turns the
+// 20 MHz base into the legacy 10 MHz core clock is exact and error-free, so the
+// same OSC20 error applies whether the core sees 10 or 20 MHz — what changes it
+// is V_DD.  On the 5 V board rev (BOARD_5V) we pick OSC20ERR5V; on the legacy
+// 3.3 V board, OSC20ERR3V.  Scaling the nominal divisor by (1024 + err)/1024
+// makes the USART sample at the true bit rate regardless of this die's
+// individual error — the fleet-safe equivalent of a hand-tuned per-unit trim
+// (this is what e.g. megaTinyCore's UART setup does, and skipping it is what
+// leaves a marginal link marginal).
 //
 // Sign convention: a positive error means the oscillator runs fast, so the
 // divisor scales up to compensate.  VERIFY ON THE BENCH — scope the slave's TX
 // bit width, which should land on the nominal period (e.g. 52.08 µs at 19200)
 // once this is applied; if it moves the wrong way, negate `sigerr`.
 static uint16_t baud_reg_for(uint8_t bidx) {
+#if BOARD_5V
+    int8_t   sigerr = (int8_t)SIGROW.OSC20ERR5V;
+#else
     int8_t   sigerr = (int8_t)SIGROW.OSC20ERR3V;
+#endif
     int16_t  scale  = (int16_t)1024 + sigerr;     // 896..1151, always > 0
     uint32_t v = ((uint32_t)s_baud_reg[bidx] * (uint32_t)scale) / 1024u;
     return (uint16_t)v;

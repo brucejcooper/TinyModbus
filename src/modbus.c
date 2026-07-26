@@ -87,6 +87,7 @@ static volatile bool initial_silence_observed = false;
 #define FC_WRITE_SINGLE_REG  0x06
 #define FC_WRITE_COILS       0x0F
 #define FC_WRITE_MULTI_REG   0x10
+#define FC_READ_WRITE_MULTI  0x17   // FC23: write submit window, then read status/holding
 
 typedef enum {
     MB_ERR_ILLEGAL_FUNCTION    = 0x01,
@@ -229,11 +230,12 @@ static void send_error(mb_err_t err) {
     start_tx(3);
 }
 
-// Raw-command staging lives in dali_sync.c (raw_cmd_addr / raw_cmd_data and
-// the 0x0108 state machine in g_regs.raw_cmd_result).  Cache invalidation is
-// handled centrally in issue_dali_command for every DALI source — there is
-// no separate raw-command classification step.  Fade tracking is a natural
-// consequence of SYNC_READ_LEVEL being set by the unified invalidation path.
+// The raw command queue lives in dali_sync.c (gwq[] + result ring + status
+// ids; legacy 0x1000/0x1001 route through it and mirror to g_regs.raw_cmd_result
+// / FC04 0x0108).  Cache invalidation is handled centrally in issue_dali_command
+// for every DALI source — there is no separate raw-command classification step.
+// Fade tracking is a natural consequence of SYNC_READ_LEVEL being set by the
+// unified invalidation path.
 
 // ---- FC04 - read input registers ----------------------------------------
 
@@ -311,6 +313,19 @@ static void process_fc04(void) {
         p[4] = (uint8_t)(g_boot_count >> 8); p[5] = (uint8_t)g_boot_count;
         p[6] = 0;                            p[7] = g_reset_reason;
         start_tx(11u);
+        return;
+    }
+
+    // Raw-command-queue status block at FC04_QSTAT_BASE (0x0400), 1..10
+    // registers.  Not backed by register_map_t — served from the queue module
+    // (dali_sync.c), which fences the reads against the LVL1 completion writer.
+    // A controller reads all 10 (QSTAT+QPROG+QRES[8]); a partial read is fine.
+    if (addr >= FC04_QSTAT_BASE
+        && (uint32_t)addr + count <= (uint32_t)FC04_QSTAT_BASE + GWQ_STATUS_REGS
+        && count >= 1u) {
+        buf[2] = (uint8_t)(count * 2u);
+        gwq_read_status((uint8_t)(addr - FC04_QSTAT_BASE), (uint8_t)count, buf + 3);
+        start_tx(3 + buf[2]);
         return;
     }
 
@@ -396,29 +411,48 @@ static void process_fc04(void) {
 
 // Handle FC03 (Read Holding Registers).  Returns an exception if any address in
 // the requested range is not in the holding register map.
+// Build a holding-register read response body into buf: buf[2] = count*2, then
+// `count` big-endian registers from `addr`.  Returns false (buf half-filled) if
+// any register in the range is unmapped — caller sends ILLEGAL_ADDRESS.  Shared
+// by FC03 and the read half of FC23.
+//
+// Iterate by index, not `reg < addr + count`: with addr=0xFFFF, count=2 the
+// upper bound wraps to 0x0001 and the loop would never run while buf[2] already
+// promised 4 bytes.  Iterating by index keeps the count exact; a wrapped
+// reg_addr that maps nowhere fails regs_read_holding and trips ILLEGAL_ADDRESS.
+static bool read_holding_block(uint16_t addr, uint16_t count) {
+    buf[2] = (uint8_t)(count * 2u);
+    uint8_t *rp = buf + 3;
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t v = 0;
+        if (!regs_read_holding((uint16_t)(addr + i), &v)) return false;
+        *rp++ = (uint8_t)(v >> 8);
+        *rp++ = (uint8_t)v;
+    }
+    return true;
+}
+
+// Validate + execute a write to the raw-command-queue submit window (0x1100),
+// shared by FC10 and the write half of FC23.  `regs` points at wr_count*2 bytes
+// of command-record data in wire order.  Returns a Modbus error code (0 on
+// success): wrong base → ILLEGAL_ADDRESS; odd/zero/too-many registers or a
+// reserved id 0 in any record → ILLEGAL_VALUE; too few free slots → DEVICE_BUSY.
+static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t *regs) {
+    if (wr_addr != MBREG_QCMD_BASE)                             return MB_ERR_ILLEGAL_ADDRESS;
+    if ((wr_count & 1u) || wr_count == 0u || wr_count > 8u)     return MB_ERR_ILLEGAL_VALUE;
+    uint8_t n = (uint8_t)(wr_count / 2u);
+    for (uint8_t i = 0; i < n; i++)
+        if (GWQ_ID(regs[(uint16_t)i * 4u + 2u]) == 0u)          return MB_ERR_ILLEGAL_VALUE;
+    if (!gwq_submit(regs, n))                                   return MB_ERR_DEVICE_BUSY;
+    return 0;
+}
+
 static void process_fc03(void) {
     uint16_t addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
     if (count == 0 || count > MAX_REG_RD) { send_error(MB_ERR_ILLEGAL_VALUE); return; }
-
-    buf[2] = (uint8_t)(count * 2u);
-    uint8_t *response_ptr = buf + 3;
-    // Iterate by offset, not `reg_addr < addr + count`: with addr=0xFFFF and count=2 the
-    // upper bound wraps to 0x0001 in uint16_t and the loop body never runs, but buf[2] has
-    // already been set to 4 - start_tx would then ship 4 bytes of stale buffer.  Iterating
-    // by index keeps the iteration count exact, and any wrapped reg_addr that doesn't map
-    // to a real holding register fails regs_read_holding and triggers ILLEGAL_ADDRESS.
-    for (uint16_t i = 0; i < count; i++) {
-        uint16_t reg_addr = (uint16_t)(addr + i);
-        uint16_t reg_value = 0;
-        if (!regs_read_holding(reg_addr, &reg_value)) {
-            send_error(MB_ERR_ILLEGAL_ADDRESS);
-            return;
-        }
-        *response_ptr++ = (uint8_t)(reg_value >> 8);
-        *response_ptr++ = (uint8_t)reg_value;
-    }
+    if (!read_holding_block(addr, count)) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
     start_tx(3 + buf[2]);
 }
 
@@ -522,6 +556,17 @@ static void process_fc10(void) {
         return;
     }
 
+    // Raw command queue submit window (0x1100-0x1107): the WHOLE FC10 write is
+    // one all-or-nothing submit of count/2 command records.  Handled here,
+    // before the per-register loop, because it is a block operation (the record
+    // count and all-or-nothing free-slot check need the whole write at once).
+    if (addr == MBREG_QCMD_BASE) {
+        mb_err_t e = submit_window(addr, count, buf + 7);
+        if (e) { send_error(e); return; }
+        start_tx(6);   // standard FC10 echo (addr, fc, start, count)
+        return;
+    }
+
     // Group register write rules: only one DALI-actionable group write
     // per FC10 (matches the spec's "restrict FC10 group writes to a
     // single register at a time" option).  Multi-group bunches get
@@ -584,6 +629,42 @@ static void process_fc10(void) {
     start_tx(6);
 }
 
+// ---- FC23 - read/write multiple registers ------------------------------
+
+// Handle FC23 (0x17).  Per the queue design the WRITE executes before the READ:
+// the write range is the command-queue submit window (0x1100), the read range
+// is holding space (typically the 0x1180 status alias) — so one transaction
+// both submits new commands and collects the status/results of earlier ones
+// (the submit-N / collect-N-1 pipeline).  The response carries the post-write
+// read block, exactly like an FC03 read.
+static void process_fc23(void) {
+    uint16_t rd_addr  = ((uint16_t)buf[2] << 8) | buf[3];
+    uint16_t rd_count = ((uint16_t)buf[4] << 8) | buf[5];
+    uint16_t wr_addr  = ((uint16_t)buf[6] << 8) | buf[7];
+    uint16_t wr_count = ((uint16_t)buf[8] << 8) | buf[9];
+    uint8_t  wr_bytes = buf[10];
+
+    if (rd_count == 0 || rd_count > MAX_REG_RD)   { send_error(MB_ERR_ILLEGAL_VALUE); return; }
+    if (wr_bytes != (uint8_t)(wr_count * 2u))     { send_error(MB_ERR_ILLEGAL_VALUE); return; }
+
+    // --- WRITE FIRST ---
+    // The only writable FC23 target is the queue submit window.  wr_count == 0
+    // is allowed: a read-only FC23 (pure status/collect poll, no new submit).
+    // wr_data starts at buf[11]; submit_window (via gwq_submit) copies it out
+    // before we build the response into buf, so the later overwrite is safe.
+    // An exception here replaces the whole response, so nothing is read.
+    if (wr_count > 0u) {
+        mb_err_t e = submit_window(wr_addr, wr_count, buf + 11);
+        if (e) { send_error(e); return; }
+    }
+
+    // --- THEN READ (holding space, incl. the 0x1180 status alias) ---
+    // The write (if any) already executed; a bad read range is a malformed
+    // request (the controller always pairs its submit with a valid status read).
+    if (!read_holding_block(rd_addr, rd_count)) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
+    start_tx(3 + buf[2]);
+}
+
 // ---- Frame validation --------------------------------------------------
 
 // Return true if the frame in buf has a correct CRC, valid length for its function code,
@@ -621,6 +702,15 @@ static bool frame_is_valid(void) {
         case FC_WRITE_COILS:
         case FC_WRITE_MULTI_REG: {
             uint16_t es = 9u + buf[6];
+            expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
+            break;
+        }
+        case FC_READ_WRITE_MULTI: {
+            // addr,fc,rd_start(2),rd_cnt(2),wr_start(2),wr_cnt(2),wr_bytecount,
+            // wr_data[wr_bytecount],crc(2) = 13 + wr_bytecount.  buf[10] is the
+            // write byte count (valid here: a passing CRC means the frame is
+            // complete, same reasoning as the FC16 9+buf[6] case above).
+            uint16_t es = 13u + buf[10];
             expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
             break;
         }
@@ -760,6 +850,7 @@ void modbus_process(void) {
         case FC_READ_HOLDING:      process_fc03(); break;
         case FC_WRITE_SINGLE_REG:  process_fc06(); break;
         case FC_WRITE_MULTI_REG:   process_fc10(); break;
+        case FC_READ_WRITE_MULTI:  process_fc23(); break;
         default:                   send_error(MB_ERR_ILLEGAL_FUNCTION); break;
     }
 

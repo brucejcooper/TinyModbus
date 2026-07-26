@@ -22,21 +22,13 @@ typedef enum __attribute__((packed)) {
     CMD_QUERY,        // single send, backward frame expected
 } cmd_type_t;
 
-// Which config-field a full-scan query response should update.  Used only
-// by the OP_FULL_SCAN completion path in dali_sync.c.
-//
-// Note: there is intentionally no REG_FADE_TIME.  In DALI 1.0, fade time
-// and fade rate are returned as a single byte from QUERY_FADE_TIME_FADE_RATE
-// (0xA5): high nibble = fade time, low nibble = fade rate.  REG_FADE_RATE
-// stores the response byte and regs_apply_result splits the nibbles into
-// block3.fade_time and block3.fade_rate.  (DALI opcode 0xA6 is reserved.)
+// Which cache field a settings-scan query response should update.  Used only
+// by the OP_FULL_SCAN completion path in dali_sync.c.  Since the config-bank
+// retirement (task 04) the settings scan reads group membership only, so the
+// only live targets are REG_GROUP_0_7 / REG_GROUP_8_15 (the min/max/power/
+// sys-fail/fade fields are no longer cached on the gateway).
 typedef enum __attribute__((packed)) {
     REG_NONE,
-    REG_MIN,
-    REG_MAX,
-    REG_POWER_ON,
-    REG_SYS_FAIL,
-    REG_FADE_RATE,
     REG_GROUP_0_7,
     REG_GROUP_8_15,
 } reg_target_t;

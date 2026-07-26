@@ -24,8 +24,9 @@
 //   - dali_busy / current_op / scan_full_*: written by start_next_dali_work
 //     (main, under TCB0+ATOMIC) and by dali_sync_completion (ISR);
 //     reads from main are atomic (1 byte) but compound checks need ATOMIC.
-//   - raw_cmd_addr/data: written by dali_sync_arm_raw (main, ATOMIC),
-//     read by dispatch (main when starting work).
+//   - gwq[]/gwq_head/gwq_count + ring + status ids: written by gwq_submit /
+//     dali_sync_arm_raw (main, under TCB0 fence + ATOMIC) and by the LVL1
+//     completion handler (dequeue + ring write); all compound accesses fenced.
 //   - group_write: same pattern as raw_cmd_*.
 //   - g_regs.raw_cmd_result: 16-bit; ALL RMW under ATOMIC + TCB0 disable
 //     (dali_result_received runs at LVL1).
@@ -58,8 +59,30 @@ volatile dali_group_write_t group_write;
 volatile cmd_entry_t       s_active;
 volatile commission_state_t commission_state;
 
-volatile uint8_t raw_cmd_addr;
-volatile uint8_t raw_cmd_data;
+// ---- Raw command queue (task 04) -------------------------------------
+//
+// 8-deep FIFO fed by the FC 0x10 / FC23 submit window and the legacy
+// 0x1000/0x1001 registers.  gwq_head is the next entry to execute;
+// gwq_count is how many are queued (0..GWQ_DEPTH).  The currently-
+// executing entry is gwq[gwq_head] for the whole of its (possibly
+// multi-frame) sequence, so its command bytes are read straight from the
+// queue at dispatch time — no separate staging slot.
+//
+// Threading: gwq[]/gwq_head/gwq_count and the ring/status bytes are
+// written by gwq_submit (main, under TCB0 fence + ATOMIC) and by the LVL1
+// DALI completion handler (dequeue + ring write).  All compound accesses
+// go through TCB0.INTCTRL=0 + ATOMIC_BLOCK, the same fence the rest of the
+// module uses for main-vs-completion state.
+static volatile gwq_cmd_t gwq[GWQ_DEPTH];
+static volatile uint8_t   gwq_head;
+static volatile uint8_t   gwq_count;
+static volatile gwq_res_t gwq_ring[GWQ_RING];
+
+// Status block (FC04 0x0400-0x0409, aliased into holding at 0x1180-0x1189).
+// 0 = "none": no id has been accepted / executed / completed yet.
+static volatile uint8_t   q_accepted_id;   // last id accepted into the queue
+static volatile uint8_t   q_executing_id;  // id currently on the bus (0 = idle)
+static volatile uint8_t   q_completed_id;  // last id whose result landed in the ring
 
 volatile uint8_t scan_full_addr;
 volatile uint8_t scan_full_step;
@@ -92,8 +115,16 @@ void dali_sync_init(void) {
     group_write.reg_addr        = 0xFFFFu;
     group_write.pending_adds    = 0;
     group_write.pending_removes = 0;
-    raw_cmd_addr   = 0;
-    raw_cmd_data   = 0;
+    // Raw command queue empty; ring cleared; status ids "none".
+    gwq_head  = 0;
+    gwq_count = 0;
+    for (uint8_t i = 0; i < GWQ_RING; i++) {
+        gwq_ring[i].result = 0;
+        gwq_ring[i].answer = 0;
+    }
+    q_accepted_id  = 0;
+    q_executing_id = 0;
+    q_completed_id = 0;
     scan_full_addr = 0xFF;
     scan_full_step = 0;
     scan_cursor    = 0;
@@ -236,67 +267,22 @@ void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
     dali_transmitting_state_enter((const cmd_entry_t *)&s_active);
 }
 
-// ---- Multi-step write helpers ---------------------------------------
-//
-// Each multi-step write is 4 LOGICAL steps (= 6 hardware sends, with
-// the SET twice-sends handled by the repeat-decrement re-fire in
-// dali_result_received — same mechanism the legacy queue used):
-//   step 0: DTR0 = low_byte               (CMD_SEND, repeat=1)
-//   step 1: SET_X                          (CMD_SEND_TWICE, repeat=2)
-//   step 2: DTR0 = high_byte               (CMD_SEND, repeat=1)
-//   step 3: SET_Y                          (CMD_SEND_TWICE, repeat=2)
-//
-// The whole 4-step sequence runs without yielding because DTR0 is
-// shared across all ballasts (an interleaving raw command or another
-// write could clobber DTR0).
-
-__attribute__((noinline, noclone))
-static void issue_write_step(uint8_t op, uint8_t addr, uint8_t step) {
-    uint8_t bidx = addr & 0x3Fu;
-    uint8_t set_x, set_y, low_val, high_val;
-
-    switch (op) {
-        case OP_WRITE_MINMAX:
-            set_x   = DALI_CMD_SET_MIN_LEVEL;
-            set_y   = DALI_CMD_SET_MAX_LEVEL;
-            low_val  = g_regs.block1[bidx].min;
-            high_val = g_regs.block1[bidx].max;
-            break;
-        case OP_WRITE_POWER:
-            set_x   = DALI_CMD_SET_POWER_ON_LEVEL;
-            set_y   = DALI_CMD_SET_SYS_FAIL_LEVEL;
-            low_val  = g_regs.block2[bidx].power_on;
-            high_val = g_regs.block2[bidx].sys_fail;
-            break;
-        case OP_WRITE_FADE:
-        default:
-            set_x   = DALI_CMD_SET_FADE_RATE;
-            set_y   = DALI_CMD_SET_FADE_TIME;
-            low_val  = g_regs.block3[bidx].fade_rate;
-            high_val = g_regs.block3[bidx].fade_time;
-            break;
-    }
-
-    uint8_t short_addr = DALI_SHORT_ADDR(bidx) | DALI_CMD_FLAG;
-    switch (step) {
-        case 0: issue_dali_command(DALI_ADDR_SET_DTR0, low_val,  DALI_KIND_CMD,   1u); break;
-        case 1: issue_dali_command(short_addr,         set_x,    DALI_KIND_TWICE, 2u); break;
-        case 2: issue_dali_command(DALI_ADDR_SET_DTR0, high_val, DALI_KIND_CMD,   1u); break;
-        case 3: issue_dali_command(short_addr,         set_y,    DALI_KIND_TWICE, 2u); break;
-        default: break;
-    }
-}
-
 // ---- Full-scan step table -------------------------------------------
+//
+// (The per-ballast config writes — DTR0/SET_MIN/MAX/POWER/SYS-FAIL/FADE
+// multi-step sequences — were retired with the config banks; the controller
+// now issues those as raw DTR0+SET pairs through the command queue.)
 
 typedef struct { uint8_t cmd; reg_target_t target; } scan_step_t;
 
-static const scan_step_t scan_steps[7] = {
-    { DALI_CMD_QUERY_MIN_LEVEL,            REG_MIN        },
-    { DALI_CMD_QUERY_MAX_LEVEL,            REG_MAX        },
-    { DALI_CMD_QUERY_FADE_TIME_FADE_RATE,  REG_FADE_RATE  },
-    { DALI_CMD_QUERY_POWER_ON_LEVEL,       REG_POWER_ON   },
-    { DALI_CMD_QUERY_FAIL_LEVEL,           REG_SYS_FAIL   },
+// After the config-bank retirement the settings scan reads ONLY group
+// membership.  Presence is established by the first OK response (here or on the
+// SYNC_READ_LEVEL QUERY_STATUS), so dropping the 5 config queries does not
+// affect presence detection — it only removes cache fields the gateway no
+// longer keeps.  Idle DALI budget freed: 5 of the old 7 settings queries per
+// ballast per settings-scan (~71% fewer settings-scan frames).
+#define SCAN_STEPS_N 2u
+static const scan_step_t scan_steps[SCAN_STEPS_N] = {
     { DALI_CMD_QUERY_GROUP_0_7,            REG_GROUP_0_7  },
     { DALI_CMD_QUERY_GROUP_8_15,           REG_GROUP_8_15 },
 };
@@ -317,11 +303,6 @@ void dali_sync_dispatch_current(void) {
             issue_dali_command(dapc_addr, level, DALI_KIND_DAPC, 1u);
             break;
         }
-        case OP_WRITE_MINMAX:
-        case OP_WRITE_POWER:
-        case OP_WRITE_FADE:
-            issue_write_step(op, addr, step);
-            break;
         case OP_LEVEL_READ:
             if (step == 0)
                 issue_dali_command(short_addr, DALI_CMD_QUERY_STATUS,       DALI_KIND_QUERY, 1u);
@@ -339,32 +320,32 @@ void dali_sync_dispatch_current(void) {
             issue_dali_command(short_addr, step, DALI_KIND_TWICE, 2u);
             break;
         case OP_RAW: {
-            // raw_cmd_addr / raw_cmd_data hold the staged bytes.
-            // sends_remaining encoded in the low byte of raw_cmd_result.
-            //   twice (rc_lo >= 2): KIND_TWICE, repeat=2 (dali_result_received's
-            //     re-fire handles the second send within the 22 TE window).
-            //   single: classify by the DALI command code —
-            //     KIND_QUERY only if a backward frame can come back; else
-            //     KIND_CMD, which completes immediately (no ~22 TE / ~9 ms wait)
-            //     and frees the raw slot sooner, shrinking the DEVICE_BUSY window
-            //     a back-to-back command (e.g. a second person's fade) sees.
-            uint8_t  rc_lo;
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { rc_lo = (uint8_t)g_regs.raw_cmd_result; }
-            if (rc_lo >= 2u) {
-                issue_dali_command(raw_cmd_addr, raw_cmd_data, DALI_KIND_TWICE, 2u);
-            } else {
-                // A reply is expected for standard QUERY/READ opcodes (all >=
-                // 0x90: QUERY_* 0x90-0xA9, READ MEMORY 0xC5, ...) and for any
-                // special command (odd address 0xA1-0xDF — COMPARE / QUERY SHORT
-                // ADDRESS reply; the rest don't, but waiting is harmless and
-                // keeps arbitrary dali_raw queries correct). Everything else
-                // (OFF/UP/DOWN/GOTO/STEP/scene, opcode < 0x90) returns no frame.
-                bool is_query = (raw_cmd_data >= 0x90u)
-                             || (raw_cmd_addr >= 0xA1u && raw_cmd_addr <= 0xDFu
-                                 && (raw_cmd_addr & 0x01u));
-                issue_dali_command(raw_cmd_addr, raw_cmd_data,
-                                   is_query ? DALI_KIND_QUERY : DALI_KIND_CMD, 1u);
+            // Execute the queue head entry.  A QF_DTR0 record is a two-step
+            // atomic sequence: step 0 preloads DTR0 (0xA3<dtr0>), step 1 sends
+            // the frame — back-to-back with nothing interleaved, because
+            // dali_busy stays held across the pair (the whole point of keeping
+            // the DTR0 preload in the same queue entry).
+            uint8_t idflags = gwq[gwq_head].idflags;
+            uint8_t flags   = GWQ_FLAGS(idflags);
+            q_executing_id  = GWQ_ID(idflags);   // 8-bit store is atomic on AVR
+
+            if ((flags & QF_DTR0) && step == 0u) {
+                issue_dali_command(DALI_ADDR_SET_DTR0, gwq[gwq_head].dtr0,
+                                   DALI_KIND_CMD, 1u);
+                break;
             }
+            // Terminal frame.  KIND selection from the explicit flags:
+            //   QF_TWICE  → send twice (SET-class / RAW_CMD_TWICE), no answer.
+            //   QF_ANSWER → KIND_QUERY, open the backward-frame window.
+            //   else      → KIND_CMD, completes immediately (no 22 TE wait).
+            uint8_t a = gwq[gwq_head].addr;
+            uint8_t d = gwq[gwq_head].data;
+            if (flags & QF_TWICE)
+                issue_dali_command(a, d, DALI_KIND_TWICE, 2u);
+            else if (flags & QF_ANSWER)
+                issue_dali_command(a, d, DALI_KIND_QUERY, 1u);
+            else
+                issue_dali_command(a, d, DALI_KIND_CMD, 1u);
             break;
         }
         case OP_COMMISSION: {
@@ -446,24 +427,11 @@ static uint8_t lowest_bit_set(uint16_t mask) {
     return 16;
 }
 
-// Map sync_flags write bit -> dali_op_t.
+// Map sync_flags write bit -> dali_op_t.  Only SYNC_WRITE_LEVEL (DAPC via the
+// per-ballast brightness bank) remains after the config-bank retirement.
 static dali_op_t write_op_from_flags(uint8_t flags) {
     if (flags & SYNC_WRITE_LEVEL)  return OP_WRITE_LEVEL;
-    if (flags & SYNC_WRITE_MINMAX) return OP_WRITE_MINMAX;
-    if (flags & SYNC_WRITE_POWER)  return OP_WRITE_POWER;
-    if (flags & SYNC_WRITE_FADE)   return OP_WRITE_FADE;
     return OP_NONE;
-}
-
-// Map dali_op_t back to its corresponding SYNC_WRITE_* bit.
-static uint8_t write_flag_for_op(dali_op_t op) {
-    switch (op) {
-        case OP_WRITE_LEVEL:  return SYNC_WRITE_LEVEL;
-        case OP_WRITE_MINMAX: return SYNC_WRITE_MINMAX;
-        case OP_WRITE_POWER:  return SYNC_WRITE_POWER;
-        case OP_WRITE_FADE:   return SYNC_WRITE_FADE;
-        default: return 0;
-    }
 }
 
 // pick_work() — runs under TCB0-disabled + ATOMIC_BLOCK in
@@ -493,8 +461,11 @@ static bool pick_work(void) {
         return true;
     }
 
-    // 2. Raw command (high byte of raw_cmd_result == 0xFF).
-    if ((uint8_t)(g_regs.raw_cmd_result >> 8) == 0xFFu) {
+    // 2. Raw command queue non-empty.  The head entry executes next; a
+    //    queued command therefore preempts all background polling
+    //    (priorities 4-7) — the gateway's own idle work always yields to
+    //    the queue, so a submitted toggle runs within ~1-2 frame times.
+    if (gwq_count > 0u) {
         current_op.op   = OP_RAW;
         current_op.addr = 0xFFu;
         current_op.step = 0;
@@ -625,24 +596,103 @@ bool start_next_dali_work(void) {
     return launch;
 }
 
-// ---- Raw / group arming ---------------------------------------------
+// ---- Raw command queue ----------------------------------------------
+
+// Append one already-built record to the tail.  Caller holds the TCB0+ATOMIC
+// fence and has verified a free slot exists.  GWQ_DEPTH is a power of two so
+// the tail index is a cheap mask, not a modulo.
+static void gwq_push_locked(uint8_t addr, uint8_t data, uint8_t idflags, uint8_t dtr0) {
+    uint8_t tail = (uint8_t)((gwq_head + gwq_count) & (GWQ_DEPTH - 1u));
+    gwq[tail].addr    = addr;
+    gwq[tail].data    = data;
+    gwq[tail].idflags = idflags;
+    gwq[tail].dtr0    = dtr0;
+    gwq_count++;
+}
+
+uint8_t gwq_free_slots(void) {
+    uint8_t freeslots;
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        freeslots = (uint8_t)(GWQ_DEPTH - gwq_count);
+    }
+    TCB0.INTCTRL = old_tcb;
+    return freeslots;
+}
+
+bool gwq_submit(const uint8_t *regs, uint8_t n) {
+    bool ok = false;
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        // All-or-nothing: enqueue every record or none.
+        if (n > 0u && (uint8_t)(GWQ_DEPTH - gwq_count) >= n) {
+            uint8_t last_id = q_accepted_id;
+            for (uint8_t i = 0; i < n; i++) {
+                const uint8_t *r = regs + (uint16_t)i * 4u;
+                // r[0]=[addr], r[1]=[data], r[2]=[id|flags], r[3]=[dtr0].
+                gwq_push_locked(r[0], r[1], r[2], r[3]);
+                last_id = GWQ_ID(r[2]);
+            }
+            q_accepted_id = last_id;   // id of the LAST record accepted
+            ok = true;
+        }
+    }
+    TCB0.INTCTRL = old_tcb;
+    return ok;
+}
+
+void gwq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
+    uint8_t old_tcb = TCB0.INTCTRL;
+    TCB0.INTCTRL = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        for (uint8_t i = 0; i < count; i++) {
+            uint8_t s = (uint8_t)(sidx + i);
+            uint8_t hi, lo;
+            if (s == 0u) {              // QSTAT  [free_slots | accepted_id]
+                hi = (uint8_t)(GWQ_DEPTH - gwq_count);
+                lo = q_accepted_id;
+            } else if (s == 1u) {       // QPROG  [executing_id | completed_id]
+                hi = q_executing_id;
+                lo = q_completed_id;
+            } else {                    // QRES[s-2]  [result | answer]
+                uint8_t slot = (uint8_t)((s - 2u) & (GWQ_RING - 1u));
+                hi = gwq_ring[slot].result;
+                lo = gwq_ring[slot].answer;
+            }
+            out[(uint16_t)i * 2u]      = hi;
+            out[(uint16_t)i * 2u + 1u] = lo;
+        }
+    }
+    TCB0.INTCTRL = old_tcb;
+}
+
+// ---- Legacy raw arming (0x1000 / 0x1001, routed through the queue) ---
 
 bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends) {
+    // Query-class heuristic, preserved from the pre-queue single-slot path:
+    // a backward frame is expected for standard QUERY/READ opcodes (data byte
+    // >= 0x90) and for special commands (odd address 0xA1..0xDF).  Twice-sends
+    // never expect an answer.
+    bool is_query = (data_byte >= 0x90u)
+                 || (addr_byte >= 0xA1u && addr_byte <= 0xDFu && (addr_byte & 0x01u));
     bool armed = false;
     uint8_t old_tcb = TCB0.INTCTRL;
     TCB0.INTCTRL = 0;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        // Reject only when a previous command is still in flight (high
-        // byte 0xFF).  Any other value — initial 0x0000, OK, NAK, ERR —
-        // is a terminal the master is free to overwrite by issuing a
-        // new RAW_CMD.  The register is not auto-cleared on read, so the
-        // master can re-read the prior outcome as many times as it wants
-        // before deciding to overwrite.
-        if ((uint8_t)(g_regs.raw_cmd_result >> 8) != 0xFFu) {
-            raw_cmd_addr = addr_byte;
-            raw_cmd_data = data_byte;
-            // 0xFF02 (twice) or 0xFF01 (single).  Low byte is consumed
-            // by dali_sync_dispatch_current to pick KIND_TWICE vs KIND_QUERY.
+        // Legacy is single-slot: reject (→ DEVICE_BUSY) if the previous legacy
+        // command is still in flight (0x0108 high byte 0xFF) or the queue has
+        // no free slot.  The result register is not auto-cleared on read, so a
+        // terminal value is free to be overwritten with a fresh PENDING.
+        if ((uint8_t)(g_regs.raw_cmd_result >> 8) != 0xFFu
+            && gwq_count < GWQ_DEPTH) {
+            uint8_t flags = (sends >= 2u) ? QF_TWICE : (is_query ? QF_ANSWER : 0u);
+            // id nibble 0 = legacy: the completion handler mirrors the result
+            // to g_regs.raw_cmd_result (FC04 0x0108) instead of the ring.
+            gwq_push_locked(addr_byte, data_byte, flags, 0u);
+            // Low byte keeps the legacy pending encoding (0xFF01 single /
+            // 0xFF02 twice) until the OP_RAW completion writes the terminal.
             g_regs.raw_cmd_result = (uint16_t)(0xFF00u | (sends & 0xFFu));
             armed = true;
         }
@@ -820,34 +870,6 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             break;
         }
 
-        case OP_WRITE_MINMAX:
-        case OP_WRITE_POWER:
-        case OP_WRITE_FADE: {
-            uint8_t idx  = addr & 0x3Fu;
-            uint8_t flag = write_flag_for_op(op);
-            // 4 logical steps (0..3): DTR0_low / SET_X(twice) / DTR0_high
-            // / SET_Y(twice).  SET commands produce no backward frame, so
-            // NAK is the expected outcome and is treated as "step done".
-            // Bus errors (anything other than OK/NAK) on a SET step abort
-            // the sequence; the cache will be reconfirmed by a follow-up
-            // SYNC_READ_SETTINGS.  DTR0 steps (0, 2) are broadcast-style and
-            // cannot meaningfully NAK, but a bus error there also aborts.
-            if (type != DALI_RESPONSE_OK && type != DALI_RESPONSE_NAK) {
-                // Bus error: abort sequence.
-                sync_flags_clear(idx, flag);
-                apply_retry_pending(idx, SYNC_READ_SETTINGS);
-            } else if (step >= 3u) {
-                // Final SET twice-pair done.
-                sync_flags_clear(idx, flag);
-                mark_dirty(idx);
-            } else {
-                // Advance to next logical step.
-                current_op.step = step + 1u;
-                more = true;
-            }
-            break;
-        }
-
         case OP_LEVEL_READ: {
             uint8_t idx = addr & 0x3Fu;
             if (step == 0) {
@@ -907,7 +929,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 note_present_on_ok(idx);
                 regs_apply_result(idx, scan_steps[s].target, value);
                 scan_full_step = s + 1u;
-                if (scan_full_step >= 7u) {
+                if (scan_full_step >= SCAN_STEPS_N) {
                     sync_flags_clear(idx, SYNC_READ_SETTINGS | SYNC_RETRY_PENDING);
                     scan_full_addr = 0xFFu;
                     scan_full_step = 0;
@@ -1112,22 +1134,52 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         }
 
         case OP_RAW: {
-            // Each call here is one terminated logical command (twice-
-            // sends are coalesced by dali_result_received's repeat
-            // re-fire).  So this path always writes a terminal value to
-            // the raw-cmd result register (0x0108) and releases the channel.
-            uint16_t terminal;
-            if (type == DALI_RESPONSE_OK) {
-                terminal = RAW_RESULT_OK(value);
-            } else if (type == DALI_RESPONSE_NAK) {
-                terminal = RAW_RESULT_NAK;
+            uint8_t idflags = gwq[gwq_head].idflags;
+            uint8_t flags   = GWQ_FLAGS(idflags);
+            uint8_t id      = GWQ_ID(idflags);
+
+            // DTR0 preload step just finished (no backward frame → OK/NAK is
+            // "done").  Advance to the frame; a real bus error aborts the whole
+            // command and falls through to terminal handling.
+            if ((flags & QF_DTR0) && step == 0u
+                && (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK)) {
+                current_op.step = 1u;
+                more = true;
+                break;
+            }
+
+            // Terminal outcome for this command.  `result` reuses the
+            // RAW_RESULT_* high-byte encoding (0x00 OK / 0x01 NAK / 0x02 ERR);
+            // `answer` holds the backward-frame byte on OK, or the error
+            // subtype on ERR (no answer exists in either non-OK case).
+            uint8_t res, ans;
+            if (type == DALI_RESPONSE_OK)       { res = 0x00u; ans = value; }
+            else if (type == DALI_RESPONSE_NAK) { res = 0x01u; ans = 0x00u; }
+            else { res = 0x02u; ans = (uint8_t)((type - DALI_RESPONSE_MALFORMED) + 1u); }
+
+            if (id == 0u) {
+                // Legacy command (0x1000/0x1001): mirror to FC04 0x0108, not the
+                // ring, preserving the exact legacy read semantics.
+                uint16_t terminal = (res == 0x00u) ? RAW_RESULT_OK(ans)
+                                  : (res == 0x01u) ? RAW_RESULT_NAK
+                                                   : RAW_RESULT_ERR(ans);
+                ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_regs.raw_cmd_result = terminal; }
             } else {
-                uint8_t sub = (uint8_t)(type - DALI_RESPONSE_MALFORMED) + 1u;
-                terminal = RAW_RESULT_ERR(sub);
+                // Queue command: land the result in the ring (slot = id & 7)
+                // and advance completed_id so the controller can collect it on
+                // its next status read / FC23 response.
+                uint8_t slot = (uint8_t)(id & (GWQ_RING - 1u));
+                gwq_ring[slot].result = res;
+                gwq_ring[slot].answer = ans;
+                q_completed_id = id;
             }
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                g_regs.raw_cmd_result = terminal;
-            }
+
+            // Dequeue the head and free its slot.
+            gwq_head = (uint8_t)((gwq_head + 1u) & (GWQ_DEPTH - 1u));
+            gwq_count--;
+            q_executing_id = 0u;
+            // more stays false → release dali_busy; the work selector picks the
+            // next queued entry (if any) on the following main-loop pass.
             break;
         }
 

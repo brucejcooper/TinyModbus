@@ -20,14 +20,13 @@
 // keeps the read flag set, sets SYNC_RETRY_PENDING, and the work loop
 // retries.  A second consecutive NAK transitions the ballast to absent.
 #define SYNC_READ_LEVEL    (1u << 0)  // QUERY_STATUS + GET_LEVEL (the live arc level)
-#define SYNC_READ_SETTINGS (1u << 1)  // re-fetch the 7 config fields (min/max/fade/power/fail/
-                                      // groups).  NOTE: settings only — does NOT read the live
-                                      // arc level; pair with SYNC_READ_LEVEL to refresh both.
+#define SYNC_READ_SETTINGS (1u << 1)  // re-fetch group membership (QUERY_GROUPS_0_7/8_15).
+                                      // Since the config-bank retirement this is group
+                                      // membership only — min/max/power/fail/fade are no
+                                      // longer cached on the gateway.  Does NOT read the
+                                      // live arc level; pair with SYNC_READ_LEVEL for both.
 #define SYNC_WRITE_LEVEL   (1u << 2)  // DAPC (one DALI command)
-#define SYNC_WRITE_MINMAX  (1u << 3)  // DTR0+SET_MIN(x2)+DTR0+SET_MAX(x2) - 6 sends
-#define SYNC_WRITE_POWER   (1u << 4)  // DTR0+SET_POWER_ON(x2)+DTR0+SET_SYS_FAIL(x2)
-#define SYNC_WRITE_FADE    (1u << 5)  // DTR0+SET_FADE_RATE(x2)+DTR0+SET_FADE_TIME(x2)
-// bit 6 spare
+// bits 3-6 spare (SYNC_WRITE_MINMAX/POWER/FADE retired with the config banks)
 #define SYNC_RETRY_PENDING (1u << 7)  // first NAK seen on a level read; one retry before marking absent
 
 // ---- Per-ballast sync flag table -------------------------------------
@@ -52,13 +51,10 @@ extern volatile bool dali_busy;
 typedef enum __attribute__((packed)) {
     OP_NONE = 0,
     OP_LEVEL_READ,    // SYNC_READ_LEVEL: QUERY_STATUS -> QUERY_ACTUAL_LEVEL
-    OP_FULL_SCAN,     // SYNC_READ_SETTINGS: 7 config queries, yields between steps
+    OP_FULL_SCAN,     // SYNC_READ_SETTINGS: 2 group-membership queries, yields between steps
     OP_WRITE_LEVEL,   // SYNC_WRITE_LEVEL: single DAPC
-    OP_WRITE_MINMAX,  // SYNC_WRITE_MINMAX: DTR0/SET_MIN(2x)/DTR0/SET_MAX(2x)
-    OP_WRITE_POWER,   // SYNC_WRITE_POWER: DTR0/SET_POWER_ON(2x)/DTR0/SET_SYS_FAIL(2x)
-    OP_WRITE_FADE,    // SYNC_WRITE_FADE:  DTR0/SET_FADE_RATE(2x)/DTR0/SET_FADE_TIME(2x)
     OP_GROUP_BIT,     // single ADD_TO_GROUP / REMOVE_FROM_GROUP (twice)
-    OP_RAW,           // raw cmd staged at raw_cmd_addr / raw_cmd_data
+    OP_RAW,           // head entry of the raw command queue (gwq[gwq_head])
     OP_COMMISSION,    // IEC 62386-102 commissioning state machine (commission_state)
 } dali_op_t;
 
@@ -177,22 +173,60 @@ extern volatile commission_state_t commission_state;
 // also returns).  process_fc06 / process_fc10 distinguish ILLEGAL_VALUE
 // from DEVICE_BUSY by re-checking val > 2.
 
-// ---- Raw command staging ---------------------------------------------
+// ---- Raw command queue (task 04) -------------------------------------
 //
-// Single-command staging.  g_regs.raw_cmd_result holds the outcome of the
-// most recent raw command (or PENDING while one is in flight) until the
-// next RAW_CMD write overwrites it.  Encoding (see RAW_RESULT_* macros):
-//   0x00xx OK (xx = response byte; 0x0000 also = no cmd issued yet),
-//   0x0100 NAK,
-//   0x02xx error (xx = subtype),
-//   0xFFnn pending (nn = DALI sends remaining: 0x01 single / 0x02 twice).
-// The register is NOT auto-cleared on FC04 read — the master can re-read
-// the previous outcome as many times as it likes.  A RAW_CMD write
-// succeeds (overwriting whatever was there with PENDING) whenever the
-// high byte is not 0xFF, otherwise the master gets DEVICE_BUSY and the
-// register is left untouched.
-extern volatile uint8_t raw_cmd_addr;   // DALI address byte
-extern volatile uint8_t raw_cmd_data;   // DALI data byte
+// The single-slot raw channel was replaced by an 8-deep, id-tagged FIFO
+// fed by the FC 0x10 / FC23 submit window (0x1100-0x1107) and the legacy
+// 0x1000/0x1001 registers.  Each entry is one indivisible logical DALI
+// command (a DTR0-preload pair counts as ONE entry).  Execution is strict
+// FIFO; the completion handler writes an [result:8|answer:8] pair into the
+// result ring (slot = id & 7) and advances completed_id.
+//
+// Command-record wire format (2 registers per record):
+//   reg0: [addr:8 | data:8]          16-bit DALI forward frame
+//   reg1: [id:5 | flags:3 | dtr0:8]
+// The id (top 5 bits) and the 3 flag bits (QF_*) pack into one RAM byte
+// (idflags): id in bits 7..3, flags in bits 2..0.  Ids cycle 1..31 (0 = the
+// reserved legacy/internal sentinel); the ring is still 8 slots (id & 7).
+#define GWQ_DEPTH   8u     // queue depth (== submit-window-limited backlog)
+#define GWQ_RING    8u     // result-ring slots; slot = id & 7
+
+#define QF_TWICE    0x01u  // send the forward frame twice (no answer)
+#define QF_DTR0     0x02u  // emit 0xA3<dtr0> back-to-back immediately before the frame
+#define QF_ANSWER   0x04u  // expects a backward frame; capture the 8-bit answer
+// flags is exactly 3 bits wide — no reserved bit (the id occupies the rest).
+
+// One queued command (4 bytes; 8 entries = 32 B).
+typedef struct {
+    uint8_t addr;     // DALI forward frame byte 0 (address byte)
+    uint8_t data;     // DALI forward frame byte 1 (opcode / arc level)
+    uint8_t idflags;  // [id:5 | flags:3] — id 1..31 (0 = legacy/internal), QF_* low 3 bits
+    uint8_t dtr0;     // DTR0 value to preload when QF_DTR0 set
+} gwq_cmd_t;
+
+// One result-ring entry (2 bytes; 8 entries = 16 B).  `result` reuses the
+// RAW_RESULT_* high-byte encoding (0x00 OK, 0x01 NAK, 0x02 ERR); there is no
+// PENDING in the ring — pending is "completed_id has not reached this id".
+typedef struct { uint8_t result; uint8_t answer; } gwq_res_t;
+
+#define GWQ_ID(idflags)     ((uint8_t)((idflags) >> 3))
+#define GWQ_FLAGS(idflags)  ((uint8_t)((idflags) & 0x07u))
+
+// Submit n command records (n = 1..4) atomically (all-or-nothing).  `regs`
+// points at n*2 big-endian registers already in wire order (reg0 then reg1
+// per record).  Returns false and enqueues NOTHING if fewer than n slots
+// are free.  Called from the FC 0x10 / FC23 submit-window handler.
+bool gwq_submit(const uint8_t *regs, uint8_t n);
+
+// Free queue slots right now (GWQ_DEPTH - count).  Used to build QSTAT and
+// to pre-flight the all-or-nothing submit check.
+uint8_t gwq_free_slots(void);
+
+// Fill `out` with `count` status registers (count*2 big-endian bytes),
+// starting at status index `sidx`: 0 = QSTAT [free_slots|accepted_id],
+// 1 = QPROG [executing_id|completed_id], 2..9 = QRES[0..7] [result|answer].
+// Reads are fenced (TCB0 + ATOMIC) against the LVL1 completion writer.
+void gwq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
 
 // ---- Full-scan tracking ----------------------------------------------
 //
@@ -253,9 +287,12 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value);
 // become idle (i.e. the 22 TE inter-frame gap has elapsed).
 void dali_sync_dispatch_current(void);
 
-// Arm a raw command (called from modbus.c when 0x1000/0x1001 is written).
-// Returns false if raw command channel is busy.  sends = 1 (RAW_CMD) or 2
-// (RAW_CMD_TWICE).
+// Arm a legacy raw command (called from modbus.c when 0x1000/0x1001 is
+// written).  Internally enqueues one command with the reserved legacy id 0
+// (result mirrored to g_regs.raw_cmd_result / FC04 0x0108, not the ring).
+// Returns false (→ DEVICE_BUSY) if the previous legacy command is still in
+// flight (raw_cmd_result high byte == 0xFF) or the queue is full.  sends = 1
+// (RAW_CMD, answer captured for query-class opcodes) or 2 (RAW_CMD_TWICE).
 bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends);
 
 // Arm a commissioning run.  mode = 1 for full (INITIALISE_ALL, wipe cache,

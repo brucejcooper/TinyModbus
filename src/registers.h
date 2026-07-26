@@ -5,49 +5,51 @@
 #include <stdbool.h>
 #include "types.h"
 
-// Paired structs - stored high-byte first to match Modbus wire format.
-// Blocks can be memcpy'd directly into FC04 response buffers.
+// Paired struct - stored high-byte first to match Modbus wire format.
+// block0 can be memcpy'd directly into FC04/FC03 response buffers.
 typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
-typedef struct { uint8_t min;       uint8_t max;        } ballast_mm_t;
-typedef struct { uint8_t power_on;  uint8_t sys_fail;   } ballast_pf_t;
-typedef struct { uint8_t fade_rate; uint8_t fade_time;  } ballast_fade_t;
 
-// register_map_t backs both FC03 (holding) and FC04 (input) addressing.  The
-// in-memory byte order matches the Modbus wire (big-endian per register), so
-// the bulk-read paths can memcpy a contiguous slice straight into the response.
+// register_map_t backs FC03 (holding) and FC04 (input) addressing.  The
+// in-memory byte order matches the Modbus wire (big-endian per register).
+//
+// Config banks retired (task 04 / task-03 Phase D): the per-ballast config
+// fields (min/max/power-on/sys-fail/fade) that used to live at 0x0040-0x00FF
+// are GONE — the controller now owns config via raw DALI queries (reads) and
+// DTR0+SET pairs (writes), so the gateway no longer caches or serves them.
+// FC03 reads of 0x0040-0x00FF now return ILLEGAL DATA ADDRESS (see
+// regs_read_holding).  The offset-trick (struct offset == addr*2) that the old
+// contiguous banks provided is retired with them; the remaining fields are
+// addressed by name (see regs_read_input_bulk / regs_read_holding).
+//
+// COMPATIBILITY / DEPLOYMENT ORDER: a gateway running this firmware requires a
+// controller in raw-DALI-config mode (the legacy bank-read/-write path is gone;
+// FC03 0x0040-0x00FF returns exception 0x02).  Roll out CONTROLLER-FIRST: flash
+// controllers that source config over raw DALI before flashing gateways with
+// this build.  A pre-Phase-D controller pointed at this gateway will get
+// ILLEGAL DATA ADDRESS on its config full-scan.
 //
 // FC03/FC06/FC10 holding registers (read-write):
-//   0x0000-0x003F  block0[64]       status | brightness   (write low byte = DAPC level)
-//   0x0040-0x007F  block1[64]       min    | max
-//   0x0080-0x00BF  block2[64]       power_on | sys_fail
-//   0x00C0-0x00FF  block3[64]       fade_rate | fade_time
+//   0x0000-0x003F  block0[64]        status | brightness   (write low byte = DAPC level)
+//   0x0040-0x00FF  (retired)         ILLEGAL DATA ADDRESS — config moved to raw DALI
 //   0x0110-0x014F  group_mask[16][8] 64-bit per-group membership bitmask
 //
 // FC04 input registers (read-only):
 //   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
 //   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
-//   0x0108         raw_cmd_result    high=0x00 ok (low byte = response byte; 0x0000 also = no cmd issued yet),
+//   0x0108         raw_cmd_result    legacy 0x1000/0x1001 result: high=0x00 ok (low
+//                                    byte = response byte; 0x0000 also = no cmd issued yet),
 //                                    0x01 nak, 0x02 err (low byte = error subtype),
-//                                    0xFF pending (low byte = DALI sends remaining: 0x01 single / 0x02 twice).
-//                                    Holds the outcome of the most recent raw command; not cleared on read.
-//                                    A new RAW_CMD write overwrites it (DEVICE_BUSY only when still PENDING).
-//   0x0109-0x010F  (reserved hole)   keeps group_mask anchored at 0x0110 — read returns zeroes
+//                                    0xFF pending (low byte = DALI sends remaining).
+//                                    Not cleared on read.  A new RAW_CMD write overwrites
+//                                    it (DEVICE_BUSY only when still PENDING).
 //   0x0200         version block     16-register special case (see process_fc04)
-//
-// Layout note: present/dirty/raw_cmd_result sit at 0x0100-0x0108 with a 7-register
-// padding hole (_reserved) at 0x0109-0x010F so that group_mask's wire address
-// (0x0110) is preserved across this trim.  The 14-byte cost is intentional: it
-// avoids a second master-visible breaking change to FC03 group-mask reads.
+//   0x0400-0x0409  queue status block (see MBREG_QSTAT_ALIAS / FC04_QSTAT_BASE)
 typedef struct {
-    ballast_bs_t   block0[64];          // 0x0000
-    ballast_mm_t   block1[64];          // 0x0040
-    ballast_pf_t   block2[64];          // 0x0080
-    ballast_fade_t block3[64];          // 0x00C0
-    uint16_t       present[4];          // 0x0100
-    uint16_t       dirty[4];            // 0x0104
-    uint16_t       raw_cmd_result;      // 0x0108, see RAW_RESULT_* below
-    uint16_t       _reserved[7];        // 0x0109-0x010F (anchor group_mask at 0x0110)
-    uint8_t        group_mask[16][8];   // 0x0110-0x014F (FC03 wire address unchanged)
+    ballast_bs_t   block0[64];          // 0x0000  status | brightness (live arc level)
+    uint16_t       present[4];          // 0x0100  present/dirty/raw kept contiguous so
+    uint16_t       dirty[4];            // 0x0104  the 0x0100-0x0108 FC04 ladder is one
+    uint16_t       raw_cmd_result;      // 0x0108  memcpy (see regs_read_input_bulk)
+    uint8_t        group_mask[16][8];   // group membership (0x0110-0x014F)
 } register_map_t;
 
 extern register_map_t g_regs;
@@ -97,6 +99,39 @@ extern volatile uint8_t  g_reset_reason;
 // immediately.
 #define MBREG_RAW_CMD           0x1000u  // single send, waits for response
 #define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
+
+// ---- Raw command queue: submit window + status block (task 04) ------------
+//
+// Submit window (master-write-only; FC 0x10 or FC23 write range).  0-4 command
+// records; the write LENGTH (2/4/6/8 registers) says how many.  Each record is
+// 2 registers:
+//   reg0: [addr:8 | data:8]          16-bit DALI forward frame
+//   reg1: [id:5 | flags:3 | dtr0:8]  id 1..31 (0 reserved for the internal
+//                                    legacy channel), QF_* flags, DTR0 preload
+// All-or-nothing: a write asking for more records than free slots is rejected
+// whole with SLAVE_DEVICE_BUSY (0x06) — nothing is enqueued.
+//
+// Window size = the longest atomic DALI sequence the controller submits in one
+// window write.  Today that is a DTR0-preload pair (one record).  A future DT8
+// colour set (DTR0/DTR1/DTR2 + SET, DALI type-8 device) is still ONE indivisible
+// unit and must submit inside one window write; the 4-record window leaves the
+// headroom.  See tasks/04-fc23-queue.md.
+#define MBREG_QCMD_BASE         0x1100u  // QCMD[0]; window spans 0x1100-0x1107
+#define MBREG_QCMD_END          0x1107u  // 4 records × 2 registers, inclusive
+
+// Status block (gateway-write-only): 10 registers.  Lives in FC04 input space
+// at 0x0400 AND is aliased into holding space at 0x1180 so FC23's read range
+// (holding-only) can target it.  Layout (both mirrors identical):
+//   0x0400 / 0x1180        QSTAT   [free_slots:8 | accepted_id:8]
+//   0x0401 / 0x1181        QPROG   [executing_id:8 | completed_id:8]
+//   0x0402-09 / 0x1182-89  QRES[0..7]  [result:8 | answer:8]   (slot = id & 7)
+// `result` reuses the RAW_RESULT_* high-byte encoding (0x00 OK / 0x01 NAK /
+// 0x02 ERR); `answer` is the backward-frame byte on OK.  There is no PENDING —
+// pending is "completed_id has not yet reached this id".
+#define FC04_QSTAT_BASE         0x0400u  // QSTAT..QRES[7] in FC04 input space
+#define MBREG_QSTAT_ALIAS       0x1180u  // holding-space alias of 0x0400
+#define MBREG_QSTAT_ALIAS_END   0x1189u
+#define GWQ_STATUS_REGS         10u      // QSTAT + QPROG + QRES[8]
 
 // Bus scan - write 0x0001 to trigger a full bus scan
 #define MBREG_SCAN_TRIGGER      0x1010u

@@ -231,9 +231,8 @@ static void send_error(mb_err_t err) {
 }
 
 // The raw command queue lives in dali_sync.c (gwq[] + result ring + status
-// ids; legacy 0x1000/0x1001 route through it and mirror to g_regs.raw_cmd_result
-// / FC04 0x0108).  Cache invalidation is handled centrally in issue_dali_command
-// for every DALI source — there is no separate raw-command classification step.
+// ids).  Cache invalidation is handled centrally in issue_dali_command for
+// every DALI source — there is no separate raw-command classification step.
 // Fade tracking is a natural consequence of SYNC_READ_LEVEL being set by the
 // unified invalidation path.
 
@@ -242,21 +241,21 @@ static void send_error(mb_err_t err) {
 // FC04 input registers (read-only):
 //   0x0100-0x0103  present bitmap                   (4 regs)
 //   0x0104-0x0107  dirty bitmap (read-clears)       (4 regs)
-//   0x0108         async raw command result         (1 reg, terminal-state read-clears)
-//   0x0200         version block (special-cased above; count must be 16)
+//   0x0200         version block (special-cased; count must be 16)
+//   0x0300 diag / 0x0310 sysinfo (special-cased)
+//   0x1010-0x1019  queue status block (also served under FC03; special-cased)
 //
-// The per-ballast banks (0x0000-0x00FF) and group membership masks
-// (0x0110-0x014F) live in FC03/FC06/FC10 holding-register space; reads via
-// FC04 return ILLEGAL_ADDRESS.  present / dirty / raw_cmd_result are packed
-// into the contiguous 0x0100-0x0108 ladder so a master can read presence +
-// dirty in a single 8-register FC04 request.
+// The per-ballast level bank (0x0000-0x003F) and group membership masks
+// (0x0110-0x014F) live in FC03/FC06/FC10 holding space; reads via FC04 return
+// ILLEGAL_ADDRESS.  present + dirty are packed into the contiguous 0x0100-0x0107
+// ladder so a master can read both in one 8-register FC04 request.
 //
 // addr and count come off the wire as 16-bit values; promoting the sum to
 // uint32_t prevents wrap (e.g. addr=0xFFFF, count=1 -> 0) from sneaking
 // through the upper-bound check.
 static bool fc04_range_allowed(uint16_t addr, uint8_t count) {
     uint32_t end = (uint32_t)addr + count;  // exclusive
-    // Single contiguous FC04 ladder: present[4] | dirty[4] | raw_cmd_result.
+    // Single contiguous FC04 ladder: present[4] | dirty[4].
     if (addr >= FC04_PRESENT_BASE && end <= (uint32_t)FC04_INPUT_END + 1u) return true;
     return false;
 }
@@ -316,15 +315,16 @@ static void process_fc04(void) {
         return;
     }
 
-    // Raw-command-queue status block at FC04_QSTAT_BASE (0x0400), 1..10
-    // registers.  Not backed by register_map_t — served from the queue module
-    // (dali_sync.c), which fences the reads against the LVL1 completion writer.
-    // A controller reads all 10 (QSTAT+QPROG+QRES[8]); a partial read is fine.
-    if (addr >= FC04_QSTAT_BASE
-        && (uint32_t)addr + count <= (uint32_t)FC04_QSTAT_BASE + GWQ_STATUS_REGS
+    // Raw-command-queue status block at MBREG_QSTAT_BASE (0x1010), 1..10
+    // registers, served identically under FC04 and FC03.  Not backed by
+    // register_map_t — served from the queue module (dali_sync.c), which fences
+    // the reads against the LVL1 completion writer.  A controller reads all 10
+    // (QSTAT+QPROG+QRES[8]); a partial read is fine.
+    if (addr >= MBREG_QSTAT_BASE
+        && (uint32_t)addr + count <= (uint32_t)MBREG_QSTAT_BASE + GWQ_STATUS_REGS
         && count >= 1u) {
         buf[2] = (uint8_t)(count * 2u);
-        gwq_read_status((uint8_t)(addr - FC04_QSTAT_BASE), (uint8_t)count, buf + 3);
+        gwq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), (uint8_t)count, buf + 3);
         start_tx(3 + buf[2]);
         return;
     }
@@ -346,9 +346,8 @@ static void process_fc04(void) {
     // registers are big-endian.  That byte-swap made the master read every
     // presence bit shifted by 8 (a ballast at short address 0 reported at 8, 1 at
     // 9, …).  Re-emit each present word high-byte-first, the same big-endian
-    // fix-up dirty[] and raw_cmd_result already get below.  (The per-ballast
-    // block0..3 and group_mask are byte-pair structs, so they were already in
-    // wire order — only these uint16_t bitmask/result words need the swap.)
+    // fix-up dirty[] already gets below.  (block0 and group_mask are byte-pair
+    // structs, already in wire order — only these uint16_t bitmask words swap.)
     // Fence the LVL1 completion handler (regs_set_present) so the 16-bit reads
     // cannot tear.
     if (addr <= FC04_PRESENT_BASE + 3u && addr + count > FC04_PRESENT_BASE) {
@@ -385,25 +384,6 @@ static void process_fc04(void) {
         }
     }
 
-    // 0x0108 raw-cmd-result: no read-clears, the register simply holds
-    // the most recent outcome (or PENDING while in flight) until the next
-    // RAW_CMD write overwrites it.  The atomic snapshot is still needed
-    // because regs_read_input_bulk's memcpy reads the two bytes as
-    // separate LDS instructions and the LVL1 completion handler could tear
-    // the read by writing a new value between them.
-    if (addr <= FC04_RAW_RESULT && addr + count > FC04_RAW_RESULT) {
-        uint16_t snap;
-        uint8_t old_tcb = TCB0.INTCTRL;
-        TCB0.INTCTRL = 0;
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            snap = g_regs.raw_cmd_result;
-        }
-        TCB0.INTCTRL = old_tcb;
-        uint16_t buf_off = (uint16_t)(FC04_RAW_RESULT - addr) * 2u;
-        buf[3 + buf_off]      = (uint8_t)(snap >> 8);
-        buf[3 + buf_off + 1u] = (uint8_t)snap;
-    }
-
     start_tx(3 + buf[2]);
 }
 
@@ -432,7 +412,7 @@ static bool read_holding_block(uint16_t addr, uint16_t count) {
     return true;
 }
 
-// Validate + execute a write to the raw-command-queue submit window (0x1100),
+// Validate + execute a write to the raw-command-queue submit window (0x1000),
 // shared by FC10 and the write half of FC23.  `regs` points at wr_count*2 bytes
 // of command-record data in wire order.  Returns a Modbus error code (0 on
 // success): wrong base → ILLEGAL_ADDRESS; odd/zero/too-many registers or a
@@ -460,30 +440,17 @@ static void process_fc03(void) {
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 //
-// The only registers that map to a DALI command issued from here are
-// MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE (the raw command channel) and
-// MBREG_SCAN_TRIGGER (sets SYNC_READ_SETTINGS | SYNC_READ_LEVEL on all ballasts).  DTR loads
-// have no convenience register — the master writes 0xA3VV to 0x1000 to
-// load DTR0 with VV (or 0xC3VV / 0xC5VV for DTR1 / DTR2).  Per-ballast
-// bank writes (0x0000-0x00FF) and group register writes (0x0110-0x014F)
-// are handled directly by regs_write_holding via the SYNC_WRITE_* /
-// group_write paths and do not reach this function.
+// Raw DALI commands go through the command queue (submit window 0x1000), not
+// through here.  This handles the surviving action registers: MBREG_SCAN_TRIGGER
+// (sets SYNC_READ_SETTINGS | SYNC_READ_LEVEL on all ballasts) and
+// MBREG_SYSTEM_RESET.  Per-ballast level writes (0x0000-0x003F) and group
+// register writes (0x0110-0x014F) are handled directly by regs_write_holding
+// via the SYNC_WRITE_LEVEL / group_write paths and do not reach this function.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
-    if (mb_reg == MBREG_RAW_CMD || mb_reg == MBREG_RAW_CMD_TWICE) {
-        // Raw DALI: [15:8]=first frame byte, [7:0]=second frame byte.
-        // The two bytes are sent as-is; they can encode any valid DALI forward
-        // frame (addressed, group, broadcast, or special command).  The
-        // unified issue_dali_command performs cache invalidation as a
-        // property of the command bytes — no separate classification here.
-        uint8_t sends = (mb_reg == MBREG_RAW_CMD_TWICE) ? 2u : 1u;
-        if (!dali_sync_arm_raw((uint8_t)(val >> 8), (uint8_t)val, sends))
-            return MB_ERR_DEVICE_BUSY;
-        return 0;
-    }
     if (mb_reg == MBREG_SCAN_TRIGGER) {
         // Set BOTH SYNC_READ_SETTINGS and SYNC_READ_LEVEL on all 64 ballasts.
         // The work selector services them one at a time via issue_dali_command.
-        // Both are needed: SYNC_READ_SETTINGS re-fetches the 7 config fields,
+        // Both are needed: SYNC_READ_SETTINGS re-fetches group membership,
         // SYNC_READ_LEVEL re-fetches the live arc level/status.  A master-driven
         // rescan should refresh everything, so the gateway's cached brightness
         // tracks reality (mirrors the boot scan in main.c).
@@ -556,7 +523,7 @@ static void process_fc10(void) {
         return;
     }
 
-    // Raw command queue submit window (0x1100-0x1107): the WHOLE FC10 write is
+    // Raw command queue submit window (0x1000-0x1007): the WHOLE FC10 write is
     // one all-or-nothing submit of count/2 command records.  Handled here,
     // before the per-register loop, because it is a block operation (the record
     // count and all-or-nothing free-slot check need the whole write at once).
@@ -580,25 +547,6 @@ static void process_fc10(void) {
             if (r >= 0x0110u && r <= 0x014Fu) group_targets++;
         }
         if (group_targets > 1u) {
-            send_error(MB_ERR_DEVICE_BUSY);
-            return;
-        }
-    }
-
-    // Pre-flight: refuse if more than one register in the FC10 range
-    // is a raw-arming target (MBREG_RAW_CMD / MBREG_RAW_CMD_TWICE) and
-    // the raw channel is busy.  dali_sync_arm_raw enforces single-command
-    // semantics, so we just need to refuse outright if the master
-    // bunched several raw-command registers into one FC10 — only the
-    // first would be staged.
-    {
-        uint8_t arm_targets = 0;
-        for (uint16_t i = 0; i < count; i++) {
-            uint16_t r = addr + i;
-            if (r == MBREG_RAW_CMD || r == MBREG_RAW_CMD_TWICE)
-                arm_targets++;
-        }
-        if (arm_targets > 1u) {
             send_error(MB_ERR_DEVICE_BUSY);
             return;
         }
@@ -632,8 +580,8 @@ static void process_fc10(void) {
 // ---- FC23 - read/write multiple registers ------------------------------
 
 // Handle FC23 (0x17).  Per the queue design the WRITE executes before the READ:
-// the write range is the command-queue submit window (0x1100), the read range
-// is holding space (typically the 0x1180 status alias) — so one transaction
+// the write range is the command-queue submit window (0x1000), the read range
+// is holding space (typically the 0x1010 status block) — so one transaction
 // both submits new commands and collects the status/results of earlier ones
 // (the submit-N / collect-N-1 pipeline).  The response carries the post-write
 // read block, exactly like an FC03 read.
@@ -658,7 +606,7 @@ static void process_fc23(void) {
         if (e) { send_error(e); return; }
     }
 
-    // --- THEN READ (holding space, incl. the 0x1180 status alias) ---
+    // --- THEN READ (holding space, incl. the 0x1010 status block) ---
     // The write (if any) already executed; a bad read range is a malformed
     // request (the controller always pairs its submit with a valid status read).
     if (!read_holding_block(rd_addr, rd_count)) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }

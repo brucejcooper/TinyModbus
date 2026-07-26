@@ -24,12 +24,11 @@
 //   - dali_busy / current_op / scan_full_*: written by start_next_dali_work
 //     (main, under TCB0+ATOMIC) and by dali_sync_completion (ISR);
 //     reads from main are atomic (1 byte) but compound checks need ATOMIC.
-//   - gwq[]/gwq_head/gwq_count + ring + status ids: written by gwq_submit /
-//     dali_sync_arm_raw (main, under TCB0 fence + ATOMIC) and by the LVL1
-//     completion handler (dequeue + ring write); all compound accesses fenced.
-//   - group_write: same pattern as raw_cmd_*.
-//   - g_regs.raw_cmd_result: 16-bit; ALL RMW under ATOMIC + TCB0 disable
-//     (dali_result_received runs at LVL1).
+//   - gwq[]/gwq_head/gwq_count + ring + status ids: written by gwq_submit
+//     (main, under TCB0 fence + ATOMIC) and by the LVL1 completion handler
+//     (dequeue + ring write, ring-slot BEFORE completed_id); all compound
+//     accesses fenced (readers set TCB0=0, so they see a consistent snapshot).
+//   - group_write: same TCB0+ATOMIC pattern.
 //   - g_regs.dirty[]: ISR-set, main-cleared via regs_read_clear_dirty
 //     (already atomic).
 //   - commission_state: written from main only inside
@@ -668,39 +667,6 @@ void gwq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
     TCB0.INTCTRL = old_tcb;
 }
 
-// ---- Legacy raw arming (0x1000 / 0x1001, routed through the queue) ---
-
-bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends) {
-    // Query-class heuristic, preserved from the pre-queue single-slot path:
-    // a backward frame is expected for standard QUERY/READ opcodes (data byte
-    // >= 0x90) and for special commands (odd address 0xA1..0xDF).  Twice-sends
-    // never expect an answer.
-    bool is_query = (data_byte >= 0x90u)
-                 || (addr_byte >= 0xA1u && addr_byte <= 0xDFu && (addr_byte & 0x01u));
-    bool armed = false;
-    uint8_t old_tcb = TCB0.INTCTRL;
-    TCB0.INTCTRL = 0;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        // Legacy is single-slot: reject (→ DEVICE_BUSY) if the previous legacy
-        // command is still in flight (0x0108 high byte 0xFF) or the queue has
-        // no free slot.  The result register is not auto-cleared on read, so a
-        // terminal value is free to be overwritten with a fresh PENDING.
-        if ((uint8_t)(g_regs.raw_cmd_result >> 8) != 0xFFu
-            && gwq_count < GWQ_DEPTH) {
-            uint8_t flags = (sends >= 2u) ? QF_TWICE : (is_query ? QF_ANSWER : 0u);
-            // id nibble 0 = legacy: the completion handler mirrors the result
-            // to g_regs.raw_cmd_result (FC04 0x0108) instead of the ring.
-            gwq_push_locked(addr_byte, data_byte, flags, 0u);
-            // Low byte keeps the legacy pending encoding (0xFF01 single /
-            // 0xFF02 twice) until the OP_RAW completion writes the terminal.
-            g_regs.raw_cmd_result = (uint16_t)(0xFF00u | (sends & 0xFFu));
-            armed = true;
-        }
-    }
-    TCB0.INTCTRL = old_tcb;
-    return armed;
-}
-
 bool dali_sync_arm_commission(uint8_t mode, uint8_t target) {
     bool armed   = false;
     bool do_wipe = false;
@@ -1148,31 +1114,23 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 break;
             }
 
-            // Terminal outcome for this command.  `result` reuses the
-            // RAW_RESULT_* high-byte encoding (0x00 OK / 0x01 NAK / 0x02 ERR);
-            // `answer` holds the backward-frame byte on OK, or the error
-            // subtype on ERR (no answer exists in either non-OK case).
+            // Terminal outcome for this command.  `result` is 0x00 OK / 0x01
+            // NAK / 0x02 ERR; `answer` holds the backward-frame byte on OK, or
+            // the error subtype on ERR (no answer exists in either non-OK case).
             uint8_t res, ans;
             if (type == DALI_RESPONSE_OK)       { res = 0x00u; ans = value; }
             else if (type == DALI_RESPONSE_NAK) { res = 0x01u; ans = 0x00u; }
             else { res = 0x02u; ans = (uint8_t)((type - DALI_RESPONSE_MALFORMED) + 1u); }
 
-            if (id == 0u) {
-                // Legacy command (0x1000/0x1001): mirror to FC04 0x0108, not the
-                // ring, preserving the exact legacy read semantics.
-                uint16_t terminal = (res == 0x00u) ? RAW_RESULT_OK(ans)
-                                  : (res == 0x01u) ? RAW_RESULT_NAK
-                                                   : RAW_RESULT_ERR(ans);
-                ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { g_regs.raw_cmd_result = terminal; }
-            } else {
-                // Queue command: land the result in the ring (slot = id & 7)
-                // and advance completed_id so the controller can collect it on
-                // its next status read / FC23 response.
-                uint8_t slot = (uint8_t)(id & (GWQ_RING - 1u));
-                gwq_ring[slot].result = res;
-                gwq_ring[slot].answer = ans;
-                q_completed_id = id;
-            }
+            // Land the result in the ring (slot = id & 7), THEN advance
+            // completed_id.  This order is load-bearing: a fenced Modbus status
+            // read (gwq_read_status) must never see completed_id reach an id
+            // whose ring slot is not yet written.  Runs in ISR (LVL1); the
+            // readers fence LVL1 (TCB0=0), so they see a consistent snapshot.
+            uint8_t slot = (uint8_t)(id & (GWQ_RING - 1u));
+            gwq_ring[slot].result = res;
+            gwq_ring[slot].answer = ans;
+            q_completed_id = id;
 
             // Dequeue the head and free its slot.
             gwq_head = (uint8_t)((gwq_head + 1u) & (GWQ_DEPTH - 1u));

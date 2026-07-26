@@ -134,11 +134,11 @@ static void bm_set(uint16_t *words, uint8_t idx, bool val) {
 // ---- FC04 bulk read ----------------------------------------------------
 
 void regs_read_input_bulk(uint16_t addr, uint8_t count, uint8_t *buf) {
-    // FC04 input ladder 0x0100-0x0108 = present[4] | dirty[4] | raw_cmd_result,
-    // a contiguous run of big-endian uint16_t in register_map_t.  With the
-    // config banks retired the old "struct offset == addr*2" identity no longer
-    // holds, so index from the named field base instead.  Caller (process_fc04)
-    // only reaches here for FC04_PRESENT_BASE..FC04_INPUT_END.
+    // FC04 input ladder 0x0100-0x0107 = present[4] | dirty[4], a contiguous run
+    // of big-endian uint16_t in register_map_t.  With the config banks retired
+    // the old "struct offset == addr*2" identity no longer holds, so index from
+    // the named field base instead.  Caller (process_fc04) only reaches here for
+    // FC04_PRESENT_BASE..FC04_INPUT_END.
     const uint8_t *source_ptr = (const uint8_t *)&g_regs.present[0]
                               + (uint16_t)(addr - FC04_PRESENT_BASE) * 2u;
     memcpy(buf, source_ptr, (uint16_t)count * 2u);
@@ -166,22 +166,21 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         *val = ((uint16_t)p[0] << 8) | p[1];
         return true;
     }
-    // Raw-command-queue status block, holding-space alias of FC04 0x0400
-    // (0x1180-0x1189).  FC23's read range is holding-only, so the gateway-
-    // written status is mirrored here.  Served one register at a time from the
-    // queue module (the FC03/FC23 read loop calls this per register); each
-    // register is independently fenced, and a tear between QPROG and a QRES is
-    // benign (completed_id gates which QRES entries the master trusts).
-    if (addr >= MBREG_QSTAT_ALIAS && addr <= MBREG_QSTAT_ALIAS_END) {
+    // Raw-command-queue status block at 0x1010-0x1019 (served identically under
+    // FC03 and FC04; FC23's read range is holding-only, so it targets this).
+    // Served one register at a time from the queue module (the FC03/FC23 read
+    // loop calls this per register); each register is independently fenced, and
+    // a tear between QPROG and a QRES is benign (completed_id gates which QRES
+    // entries the master trusts).
+    if (addr >= MBREG_QSTAT_BASE && addr <= MBREG_QSTAT_END) {
         uint8_t out[2];
-        gwq_read_status((uint8_t)(addr - MBREG_QSTAT_ALIAS), 1u, out);
+        gwq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), 1u, out);
         *val = ((uint16_t)out[0] << 8) | out[1];
         return true;
     }
 
     switch (addr) {
         // Action / control registers read as 0 (write-only by convention)
-        case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
         case MBREG_SCAN_TRIGGER:
             *val = 0;
             return true;
@@ -190,8 +189,7 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         case MBREG_BAUD_INDEX:      *val = userrow_get_baud_index();      return true;
         case MBREG_COMMISSION: {
             // Read-clears semantics on TERMINAL high bytes (0x02 complete,
-            // 0x03 error/aborted) — same shape as the FC04 0x0108 raw
-            // command result.  Idle (0x00) and running (0x01) values stay
+            // 0x03 error/aborted).  Idle (0x00) and running (0x01) values stay
             // put so the master can poll progress without losing state.
             // Capture must be atomic w.r.t. the OP_COMMISSION ISR that
             // writes commission_state.status; TCB0 fence guards LVL1,
@@ -272,8 +270,7 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
             return userrow_set_slave_addr((uint8_t)val);
         case MBREG_BAUD_INDEX:
             return userrow_set_baud_index((uint8_t)val);
-        // Raw / scan-trigger: caller (dispatch_action_reg) handles DALI dispatch
-        case MBREG_RAW_CMD:    case MBREG_RAW_CMD_TWICE:
+        // Scan-trigger: caller (dispatch_action_reg) handles the DALI dispatch.
         case MBREG_SCAN_TRIGGER:
             return true;
         case MBREG_SYSTEM_RESET:

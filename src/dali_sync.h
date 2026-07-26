@@ -175,19 +175,19 @@ extern volatile commission_state_t commission_state;
 
 // ---- Raw command queue (task 04) -------------------------------------
 //
-// The single-slot raw channel was replaced by an 8-deep, id-tagged FIFO
-// fed by the FC 0x10 / FC23 submit window (0x1100-0x1107) and the legacy
-// 0x1000/0x1001 registers.  Each entry is one indivisible logical DALI
-// command (a DTR0-preload pair counts as ONE entry).  Execution is strict
-// FIFO; the completion handler writes an [result:8|answer:8] pair into the
-// result ring (slot = id & 7) and advances completed_id.
+// 8-deep, id-tagged FIFO fed by the FC 0x10 / FC23 submit window
+// (0x1000-0x1007).  Each entry is one indivisible logical DALI command (a
+// DTR0-preload pair counts as ONE entry).  Execution is strict FIFO; the
+// completion handler writes an [result:8|answer:8] pair into the result ring
+// (slot = id & 7) and THEN advances completed_id (ordering the status read
+// relies on).
 //
 // Command-record wire format (2 registers per record):
 //   reg0: [addr:8 | data:8]          16-bit DALI forward frame
 //   reg1: [id:5 | flags:3 | dtr0:8]
 // The id (top 5 bits) and the 3 flag bits (QF_*) pack into one RAM byte
 // (idflags): id in bits 7..3, flags in bits 2..0.  Ids cycle 1..31 (0 = the
-// reserved legacy/internal sentinel); the ring is still 8 slots (id & 7).
+// reserved none/idle sentinel; no command ever carries id 0); ring 8 slots.
 #define GWQ_DEPTH   8u     // queue depth (== submit-window-limited backlog)
 #define GWQ_RING    8u     // result-ring slots; slot = id & 7
 
@@ -200,13 +200,13 @@ extern volatile commission_state_t commission_state;
 typedef struct {
     uint8_t addr;     // DALI forward frame byte 0 (address byte)
     uint8_t data;     // DALI forward frame byte 1 (opcode / arc level)
-    uint8_t idflags;  // [id:5 | flags:3] — id 1..31 (0 = legacy/internal), QF_* low 3 bits
+    uint8_t idflags;  // [id:5 | flags:3] — id 1..31 (0 reserved), QF_* low 3 bits
     uint8_t dtr0;     // DTR0 value to preload when QF_DTR0 set
 } gwq_cmd_t;
 
-// One result-ring entry (2 bytes; 8 entries = 16 B).  `result` reuses the
-// RAW_RESULT_* high-byte encoding (0x00 OK, 0x01 NAK, 0x02 ERR); there is no
-// PENDING in the ring — pending is "completed_id has not reached this id".
+// One result-ring entry (2 bytes; 8 entries = 16 B).  `result` is 0x00 OK /
+// 0x01 NAK / 0x02 ERR; there is no PENDING in the ring — pending is
+// "completed_id has not reached this id".
 typedef struct { uint8_t result; uint8_t answer; } gwq_res_t;
 
 #define GWQ_ID(idflags)     ((uint8_t)((idflags) >> 3))
@@ -286,14 +286,6 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value);
 // dali_idle_state_enter when dali_busy is true and the bus has just
 // become idle (i.e. the 22 TE inter-frame gap has elapsed).
 void dali_sync_dispatch_current(void);
-
-// Arm a legacy raw command (called from modbus.c when 0x1000/0x1001 is
-// written).  Internally enqueues one command with the reserved legacy id 0
-// (result mirrored to g_regs.raw_cmd_result / FC04 0x0108, not the ring).
-// Returns false (→ DEVICE_BUSY) if the previous legacy command is still in
-// flight (raw_cmd_result high byte == 0xFF) or the queue is full.  sends = 1
-// (RAW_CMD, answer captured for query-class opcodes) or 2 (RAW_CMD_TWICE).
-bool dali_sync_arm_raw(uint8_t addr_byte, uint8_t data_byte, uint8_t sends);
 
 // Arm a commissioning run.  mode = 1 for full (INITIALISE_ALL, wipe cache,
 // assign 0..N-1) or 2 for incremental (INITIALISE without short addr,

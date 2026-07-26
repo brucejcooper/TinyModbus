@@ -36,19 +36,12 @@ typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
 // FC04 input registers (read-only):
 //   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
 //   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
-//   0x0108         raw_cmd_result    legacy 0x1000/0x1001 result: high=0x00 ok (low
-//                                    byte = response byte; 0x0000 also = no cmd issued yet),
-//                                    0x01 nak, 0x02 err (low byte = error subtype),
-//                                    0xFF pending (low byte = DALI sends remaining).
-//                                    Not cleared on read.  A new RAW_CMD write overwrites
-//                                    it (DEVICE_BUSY only when still PENDING).
 //   0x0200         version block     16-register special case (see process_fc04)
-//   0x0400-0x0409  queue status block (see MBREG_QSTAT_ALIAS / FC04_QSTAT_BASE)
+//   0x1010-0x1019  queue status block (see MBREG_QSTAT_BASE; also served under FC03)
 typedef struct {
     ballast_bs_t   block0[64];          // 0x0000  status | brightness (live arc level)
-    uint16_t       present[4];          // 0x0100  present/dirty/raw kept contiguous so
-    uint16_t       dirty[4];            // 0x0104  the 0x0100-0x0108 FC04 ladder is one
-    uint16_t       raw_cmd_result;      // 0x0108  memcpy (see regs_read_input_bulk)
+    uint16_t       present[4];          // 0x0100  present/dirty kept contiguous so the
+    uint16_t       dirty[4];            // 0x0104  0x0100-0x0107 FC04 ladder is one memcpy
     uint8_t        group_mask[16][8];   // group membership (0x0110-0x014F)
 } register_map_t;
 
@@ -59,8 +52,7 @@ extern register_map_t g_regs;
 #define FC04_PRESENT_BASE   0x0100u  // first FC04 input register (start of contiguous ladder)
 #define FC04_DIRTY_BASE     0x0104u  // first dirty word register (4 words: 0x0104-0x0107)
 #define FC04_DIRTY_END      0x0107u  // last dirty word register
-#define FC04_RAW_RESULT     0x0108u  // async raw DALI command result (see RAW_RESULT_*)
-#define FC04_INPUT_END      0x0108u  // inclusive end of the contiguous FC04 ladder
+#define FC04_INPUT_END      0x0107u  // inclusive end of the contiguous FC04 ladder
 
 // ---- FC04 / FC03 special block addresses ----------------------------------
 
@@ -87,27 +79,22 @@ extern register_map_t g_regs;
 extern volatile uint16_t g_boot_count;
 extern volatile uint8_t  g_reset_reason;
 
-// ---- Modbus holding register (FC03/FC06) addresses ------------------------
-
-// Raw DALI forward frame - [15:8]=frame byte 0, [7:0]=frame byte 1
+// ---- Modbus register map (task 04, relocated to a round 0x1000 base) --------
 //
-// All DALI commands the master might want to issue (GOTO_LAST_ACTIVE,
-// OFF, UP, DOWN, STEP_*, RECALL_*, ADD_TO_GROUP, RESET, etc.) go through
-// these raw registers — there is no per-command holding-register facade.
-// Per-ballast level changes are more easily done via the per-ballast
-// brightness bank (0x0000-0x003F) which arms SYNC_WRITE_LEVEL and ACKs
-// immediately.
-#define MBREG_RAW_CMD           0x1000u  // single send, waits for response
-#define MBREG_RAW_CMD_TWICE     0x1001u  // send twice, no response expected
-
-// ---- Raw command queue: submit window + status block (task 04) ------------
+// One number space for the queue, addressed the same under FC03 (holding) and
+// FC04 (input).  The legacy single-slot raw channel (old 0x1000/0x1001 +
+// FC04 0x0108) is REMOVED — those addresses are reused by the submit window,
+// and every other pre-queue address (config banks, old raw result) returns
+// ILLEGAL DATA ADDRESS.
+//
+// ---- Raw command queue: submit window + status block ----------------------
 //
 // Submit window (master-write-only; FC 0x10 or FC23 write range).  0-4 command
 // records; the write LENGTH (2/4/6/8 registers) says how many.  Each record is
 // 2 registers:
 //   reg0: [addr:8 | data:8]          16-bit DALI forward frame
-//   reg1: [id:5 | flags:3 | dtr0:8]  id 1..31 (0 reserved for the internal
-//                                    legacy channel), QF_* flags, DTR0 preload
+//   reg1: [id:5 | flags:3 | dtr0:8]  id 1..31 (0 reserved sentinel),
+//                                    QF_* flags, DTR0 preload
 // All-or-nothing: a write asking for more records than free slots is rejected
 // whole with SLAVE_DEVICE_BUSY (0x06) — nothing is enqueued.
 //
@@ -116,39 +103,41 @@ extern volatile uint8_t  g_reset_reason;
 // colour set (DTR0/DTR1/DTR2 + SET, DALI type-8 device) is still ONE indivisible
 // unit and must submit inside one window write; the 4-record window leaves the
 // headroom.  See tasks/04-fc23-queue.md.
-#define MBREG_QCMD_BASE         0x1100u  // QCMD[0]; window spans 0x1100-0x1107
-#define MBREG_QCMD_END          0x1107u  // 4 records × 2 registers, inclusive
+#define MBREG_QCMD_BASE         0x1000u  // QCMD[0]; window spans 0x1000-0x1007
+#define MBREG_QCMD_END          0x1007u  // 4 records × 2 registers, inclusive
 
-// Status block (gateway-write-only): 10 registers.  Lives in FC04 input space
-// at 0x0400 AND is aliased into holding space at 0x1180 so FC23's read range
-// (holding-only) can target it.  Layout (both mirrors identical):
-//   0x0400 / 0x1180        QSTAT   [free_slots:8 | accepted_id:8]
-//   0x0401 / 0x1181        QPROG   [executing_id:8 | completed_id:8]
-//   0x0402-09 / 0x1182-89  QRES[0..7]  [result:8 | answer:8]   (slot = id & 7)
-// `result` reuses the RAW_RESULT_* high-byte encoding (0x00 OK / 0x01 NAK /
-// 0x02 ERR); `answer` is the backward-frame byte on OK.  There is no PENDING —
-// pending is "completed_id has not yet reached this id".
-#define FC04_QSTAT_BASE         0x0400u  // QSTAT..QRES[7] in FC04 input space
-#define MBREG_QSTAT_ALIAS       0x1180u  // holding-space alias of 0x0400
-#define MBREG_QSTAT_ALIAS_END   0x1189u
+// Status block (gateway-write-only): 10 registers at 0x1010, served at the SAME
+// numeric addresses by BOTH FC03 (holding view — FC23's read range targets it)
+// and FC04 (input view).  Layout:
+//   0x1010        QSTAT   [free_slots:8 | accepted_id:8]
+//   0x1011        QPROG   [executing_id:8 | completed_id:8]
+//   0x1012-0x1019 QRES[0..7]  [result:8 | answer:8]   (slot = id & 7)
+// `result` is 0x00 OK / 0x01 NAK / 0x02 ERR; `answer` is the backward-frame byte
+// on OK (or error subtype on ERR).  There is no PENDING — pending is
+// "completed_id has not yet reached this id".  The gateway writes the ring slot
+// (result+answer) BEFORE advancing completed_id, so a fenced Modbus read never
+// sees completed_id reach an id whose result is not yet written.
+#define MBREG_QSTAT_BASE        0x1010u  // QSTAT..QRES[7], FC03 + FC04 (same addr)
+#define MBREG_QSTAT_END         0x1019u
 #define GWQ_STATUS_REGS         10u      // QSTAT + QPROG + QRES[8]
 
+// ---- Action / config registers (relocated to 0x1F00+) ---------------------
+
 // Bus scan - write 0x0001 to trigger a full bus scan
-#define MBREG_SCAN_TRIGGER      0x1010u
+#define MBREG_SCAN_TRIGGER      0x1F00u
 
 // Configuration registers - all persisted to USERROW (survives chip erase +
 // reflash so a re-flashed unit keeps its address / baud / rescan interval).
 // Each write triggers a NVMCTRL page-erase-write (~3.4 ms, CPU halted) and
 // is skipped if the value already matches.  Runtime baud/slave switches are
 // deferred until the FC06/FC10 response has cleared the wire.
-#define MBREG_RESCAN_INTERVAL   0x1011u  // seconds between periodic bus rescans; 0 = disabled
-#define MBREG_SLAVE_ADDR        0x1012u  // Modbus slave address, 1-247
-#define MBREG_BAUD_INDEX        0x1013u  // 0=9600 1=19200 2=38400
+#define MBREG_RESCAN_INTERVAL   0x1F01u  // seconds between periodic bus rescans; 0 = disabled
+#define MBREG_SLAVE_ADDR        0x1F02u  // Modbus slave address, 1-247
+#define MBREG_BAUD_INDEX        0x1F03u  // 0=9600 1=19200 2=38400
 
 // IEC 62386-102 commissioning channel.  Write triggers a run, read returns
-// the live status word with read-clears semantics on terminal high bytes
-// (mirrors the FC04 0x0108 raw-command-result pattern).  See dali_sync.h
-// COMM_STATUS_* macros for the wire-format encoding.
+// the live status word with read-clears semantics on terminal high bytes.
+// See dali_sync.h COMM_STATUS_* macros for the wire-format encoding.
 //
 //   Write 0x0000 — abort (no-op if idle / already terminal)
 //   Write 0x0001 — start full commissioning (wipes existing addresses)
@@ -158,7 +147,7 @@ extern volatile uint8_t  g_reset_reason;
 //                  leaves all other gear untouched)
 //   Write any other value → ILLEGAL_VALUE
 //   Write a valid command while already running → DEVICE_BUSY
-#define MBREG_COMMISSION        0x1014u
+#define MBREG_COMMISSION        0x1F04u
 
 #define MBREG_COMM_REPROV_BASE  0x0300u   // OR with the target short address (0..63)
 // True if `v` is a syntactically valid MBREG_COMMISSION write command.  Used by
@@ -171,24 +160,10 @@ extern volatile uint8_t  g_reset_reason;
 // write has cleared the wire.  Any other value is rejected (ILLEGAL_ADDRESS).
 // A recovery hatch so a Modbus master can power-cycle the gateway logic without
 // physical access (used by the controller's `gw_reboot` command).
-#define MBREG_SYSTEM_RESET       0x1015u
+#define MBREG_SYSTEM_RESET       0x1F05u
 #define MBREG_SYSTEM_RESET_MAGIC 0xA5A5u
 
 #define DALI_STATUS_FADE_RUNNING 0x10
-
-// raw_cmd_result encoding (FC04 0x0108).  Holds the outcome of the most
-// recent raw command, or PENDING while one is in flight.  Not cleared on
-// FC04 read; each new RAW_CMD write overwrites whatever was there, so a
-// master can re-read the last result as many times as it likes.  The
-// initial value (0x0000, set by regs_init's memset) is indistinguishable
-// from RAW_RESULT_OK(0); that's intentional — a master that hasn't issued
-// any raw commands sees the same value as one whose last command returned
-// 0, and the only rejection signal a master cares about is the Modbus
-// DEVICE_BUSY exception returned when the channel is currently PENDING.
-#define RAW_RESULT_OK(b)        ((uint16_t)(uint8_t)(b))     // 0x00xx — response byte (0x0000 also = no cmd issued yet)
-#define RAW_RESULT_NAK          0x0100u                       // completed, no backward frame (normal for send-twice)
-#define RAW_RESULT_ERR(e)       (0x0200u | (uint8_t)(e))      // bus/timing error; low byte = error subtype
-#define RAW_RESULT_PENDING      0xFF00u                       // command in flight; OR with sends-remaining for the low byte
 
 // Initialise the register map to zeroed defaults.  All persisted config
 // (slave addr, baud, rescan interval) lives in USERROW and is read on demand

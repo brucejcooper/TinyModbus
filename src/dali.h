@@ -55,9 +55,9 @@
 #define DALI_CMD_SET_FADE_RATE        0x2Fu
 
 // DTR0 set: addr byte = opcode 0xA3, cmd byte = value to load.  Used by the
-// internal multi-step write sequences (DTR0 -> SET_X(twice) -> DTR0 ->
-// SET_Y(twice)) in dali_sync.c.  DTR1/DTR2 setters (0xC3 / 0xC5) are
-// reachable from the master via the MBREG_RAW_CMD raw channel.
+// DTR0-preload queue records (the QF_DTR0 flag emits 0xA3<dtr0> before the
+// frame).  DTR1/DTR2 setters (0xC3 / 0xC5) are reachable from the master by
+// submitting them as ordinary command-queue records.
 #define DALI_ADDR_SET_DTR0  0xA3u
 
 // ---- Commissioning special-command opcodes (IEC 62386-102) -------------

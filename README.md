@@ -349,9 +349,9 @@ Slave address, baud rate, and rescan interval all live in USERROW so they surviv
 
 | Code | Name | Description |
 |------|------|-------------|
-| 0x03 | Read Holding Registers | Read per-ballast level cache, group masks, gateway config, and the queue status alias (max 16 regs per request) |
-| 0x04 | Read Input Registers | Read presence + dirty bitmaps, legacy raw-command result, queue status block, version block |
-| 0x06 | Write Single Holding Register | Update per-ballast level cache, group mask, legacy raw command, or gateway config |
+| 0x03 | Read Holding Registers | Read per-ballast level cache, group masks, the queue status block, and USERROW config registers (max 16 regs per request) |
+| 0x04 | Read Input Registers | Read presence + dirty bitmaps, the queue status block, version/diag/sysinfo blocks |
+| 0x06 | Write Single Holding Register | Update per-ballast level cache, group mask, or an action/config register (0x1F00+) |
 | 0x10 | Write Multiple Holding Registers | Write a contiguous holding block — including the command-queue submit window (0x1000–0x1007) |
 | 0x17 | Read/Write Multiple Registers | Submit queue commands (write range) and collect status/results (read range) in one transaction — see "Raw Command Queue" |
 

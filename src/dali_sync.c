@@ -60,8 +60,8 @@ volatile commission_state_t commission_state;
 
 // ---- Raw command queue (task 04) -------------------------------------
 //
-// 8-deep FIFO fed by the FC 0x10 / FC23 submit window and the legacy
-// 0x1000/0x1001 registers.  gwq_head is the next entry to execute;
+// 8-deep FIFO fed by the FC 0x10 / FC23 submit window (0x1000-0x1007).
+// gwq_head is the next entry to execute;
 // gwq_count is how many are queued (0..GWQ_DEPTH).  The currently-
 // executing entry is gwq[gwq_head] for the whole of its (possibly
 // multi-frame) sequence, so its command bytes are read straight from the
@@ -77,7 +77,7 @@ static volatile uint8_t   gwq_head;
 static volatile uint8_t   gwq_count;
 static volatile gwq_res_t gwq_ring[GWQ_RING];
 
-// Status block (FC04 0x0400-0x0409, aliased into holding at 0x1180-0x1189).
+// Status block (0x1010-0x1019, served under both FC03 and FC04; MBREG_QSTAT_BASE).
 // 0 = "none": no id has been accepted / executed / completed yet.
 static volatile uint8_t   q_accepted_id;   // last id accepted into the queue
 static volatile uint8_t   q_executing_id;  // id currently on the bus (0 = idle)

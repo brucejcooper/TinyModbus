@@ -82,7 +82,7 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 | 1  | group (0–15) | 1 | Command to group |
 | 1  | 111111 | 0/1 | Broadcast (A0=0 → DAPC, A0=1 → command) |
 
-The per-ballast holding-register banks in this firmware use short addresses (0–63). The raw command registers (0x1000 / 0x1001) accept any valid DALI address byte, so group and broadcast commands are also supported through them.
+The per-ballast level bank in this firmware uses short addresses (0–63). Command-queue records accept any valid DALI address byte, so group and broadcast commands are also supported through the queue.
 
 ### Command Types
 
@@ -173,7 +173,7 @@ New or reset devices generate a 24-bit random address. A controller discovers an
 4. Issue `PROGRAM SHORT ADDRESS` to assign the next free address
 5. Issue `YES` to confirm, then loop until no devices respond
 
-This firmware **implements control-gear commissioning** — see `Commissioning (FC03/FC06 0x1014)` under the Modbus Interface section for the master-facing surface. Master writes 0x0001 to `MBREG_COMMISSION` for full re-addressing or 0x0002 for incremental (assigns short addresses only to gears that don't already have one); reads the same register to poll status. Out of scope for this firmware: 24-bit forward frames (DALI-2 control-device addressing), memory-bank reads, and DT1/DT8 device-type extensions.
+This firmware **implements control-gear commissioning** — see `Commissioning (FC03/FC06 0x1F04)` under the Modbus Interface section for the master-facing surface. Master writes 0x0001 to `MBREG_COMMISSION` for full re-addressing or 0x0002 for incremental (assigns short addresses only to gears that don't already have one); reads the same register to poll status. Out of scope for this firmware: 24-bit forward frames (DALI-2 control-device addressing), memory-bank reads, and DT1/DT8 device-type extensions.
 
 ---
 
@@ -316,7 +316,7 @@ Each ballast has one byte in `sync_flags[64]` (`dali_sync.c`) tracking pending r
 
 ### Periodic Rescan
 
-The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator).  Each PIT tick increments both the `uptime_s` counter (exposed via FC04 0x0310) and the rescan counter; once the rescan counter reaches `RESCAN_INTERVAL` (0x1011), the firmware sets `SYNC_READ_LEVEL` on **one** ballast at the cursor position and advances the cursor (mod 64).  `RESCAN_INTERVAL = 0` disables the cursor entirely.  Writing 0x0001 to `SCAN_TRIGGER` (0x1010) sets `SYNC_READ_SETTINGS | SYNC_READ_LEVEL` on all 64 ballasts in one pass, kicking off a full re-discovery of group membership and live level.
+The RTC Periodic Interrupt Timer fires every ~1 second (1024 cycles of the 1 kHz internal oscillator).  Each PIT tick increments both the `uptime_s` counter (exposed via FC04 0x0310) and the rescan counter; once the rescan counter reaches `RESCAN_INTERVAL` (0x1F01), the firmware sets `SYNC_READ_LEVEL` on **one** ballast at the cursor position and advances the cursor (mod 64).  `RESCAN_INTERVAL = 0` disables the cursor entirely.  Writing 0x0001 to `SCAN_TRIGGER` (0x1F00) sets `SYNC_READ_SETTINGS | SYNC_READ_LEVEL` on all 64 ballasts in one pass, kicking off a full re-discovery of group membership and live level.
 
 The boot scan (`main.c`) arms the same two flags on all ballasts. Both are required because they read disjoint state: after a reset `regs_init()` zeroes the brightness cache, and the settings scan never reads the live arc level — so without `SYNC_READ_LEVEL` a physically-ON ballast would report brightness 0 (OFF) until a command or the slow periodic cursor happened to touch it. Arming both makes a freshly-booted or rescanned gateway converge to true state on its own.
 
@@ -343,7 +343,7 @@ The firmware detects transmissions from other DALI masters on the bus: if a risi
 
 Modbus RTU, RS-485, **9600 baud, 8N1**.
 
-Slave address, baud rate, and rescan interval all live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud / 64 s rescan. Writes to holding registers 0x1011 / 0x1012 / 0x1013 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
+Slave address, baud rate, and rescan interval all live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud / 64 s rescan. Writes to holding registers 0x1F01 / 0x1F02 / 0x1F03 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
 
 ### Function Codes
 
@@ -352,10 +352,10 @@ Slave address, baud rate, and rescan interval all live in USERROW so they surviv
 | 0x03 | Read Holding Registers | Read per-ballast level cache, group masks, gateway config, and the queue status alias (max 16 regs per request) |
 | 0x04 | Read Input Registers | Read presence + dirty bitmaps, legacy raw-command result, queue status block, version block |
 | 0x06 | Write Single Holding Register | Update per-ballast level cache, group mask, legacy raw command, or gateway config |
-| 0x10 | Write Multiple Holding Registers | Write a contiguous holding block — including the command-queue submit window (0x1100–0x1107) |
+| 0x10 | Write Multiple Holding Registers | Write a contiguous holding block — including the command-queue submit window (0x1000–0x1007) |
 | 0x17 | Read/Write Multiple Registers | Submit queue commands (write range) and collect status/results (read range) in one transaction — see "Raw Command Queue" |
 
-Coils (FC01 / FC05 / FC0F) were retired in subtask 5: per-ballast on/off / level changes go through the per-ballast brightness bank (0x0000-0x003F) which arms the asynchronous DALI work selector and ACKs immediately; broadcast / group / specialty DALI sends go through the **raw command queue** (submit window 0x1100–0x1107 via FC10/FC23, or the legacy 0x1000 / 0x1001 single-slot registers).  Frames using the retired function codes get an ILLEGAL_FUNCTION exception reply.
+Coils (FC01 / FC05 / FC0F) were retired in subtask 5: per-ballast on/off / level changes go through the per-ballast brightness bank (0x0000-0x003F) which arms the asynchronous DALI work selector and ACKs immediately; broadcast / group / specialty DALI sends go through the **raw command queue** (submit window 0x1000–0x1007 via FC10/FC23).  Frames using the retired function codes get an ILLEGAL_FUNCTION exception reply.
 
 ### FC04 — Input Register Map
 
@@ -365,13 +365,12 @@ Read-only state derived from DALI traffic. Registers are 16-bit, addressed from 
 |---------------|-------|---------|
 | 0x0100–0x0103 | 4 regs | Present bitmask — one bit per ballast, 1 = responding |
 | 0x0104–0x0107 | 4 regs | Dirty bitmask — set on any block0 change, cleared when read |
-| 0x0108 | 1 reg | Legacy raw command result (see "Legacy raw command channel"). Not used by the queue path — queue results live in the status block below / holding alias 0x1180. |
-| 0x0400–0x0409 | 10 regs | **Command-queue status block** (also aliased into holding at 0x1180–0x1189 for FC23 reads). `0x0400` QSTAT `[free_slots:8 \| accepted_id:8]`, `0x0401` QPROG `[executing_id:8 \| completed_id:8]`, `0x0402–0x0409` QRES[0..7] `[result:8 \| answer:8]`. See "Raw Command Queue". A partial read (e.g. just QSTAT+QPROG) is allowed. |
+| 0x1010–0x1019 | 10 regs | **Command-queue status block** — served identically here (FC04) and in holding space (FC03; FC23's read range targets it). `0x1010` QSTAT `[free_slots:8 \| accepted_id:8]`, `0x1011` QPROG `[executing_id:8 \| completed_id:8]`, `0x1012–0x1019` QRES[0..7] `[result:8 \| answer:8]`. See "Raw Command Queue". A partial read (e.g. just QSTAT+QPROG) is allowed. |
 | 0x0200–0x020F | 16 regs | Version string: `DALI v<maj>.<min> <10-byte-serial-as-20-hex-chars>` — read exactly 16 registers |
 | 0x0300–0x030F | 16 regs | RX diagnostics — read exactly 16 registers. `reg0` rx_overflow, `reg1` frame_error, `reg2` crc_error, `reg3` frames_ok, `reg4` last_fail_len, `reg5–12` bytes of the last CRC-failed frame. Counters zeroed on reset. |
 | 0x0310–0x0313 | 4 regs | System info / reboot diagnostics — read exactly 4 registers. `reg0–1` uptime_s (32-bit, big-endian, seconds since boot), `reg2` boot_count (reboots since the last cold power-on), `reg3` reset_reason (low byte = `RSTCTRL.RSTFR`: bit0 PORF, 1 BORF, 2 EXTRF, 3 WDRF, 4 SWRF, 5 UPDIRF). No EEPROM is used — uptime is a RAM counter, boot_count is `.noinit` SRAM (guarded by a magic word, survives warm resets, restarts on cold power-on), reset_reason is the hardware-latched RSTFR. A master detects a gateway reboot when uptime_s drops or boot_count changes. |
 
-A master can fetch presence + dirty in a single 8-register FC04 read at 0x0100. The 0x0200 and 0x0300 blocks are special-cased and must be read as exactly 16 registers; the 0x0310 block as exactly 4; the 0x0400 status block accepts 1–10 registers. Other lengths at those addresses fall through to the range check. FC04 reads outside these ranges return `ILLEGAL_ADDRESS`. The per-ballast level bank formerly split across 0x0000–0x00FF and the group membership masks formerly at 0x0110–0x014F live in the holding-register map below; the per-ballast **config** banks (min/max/power-on/sys-fail/fade) that used to occupy 0x0040–0x00FF have been **retired** (see the holding map) — both are breaking changes from earlier firmware revisions.
+A master can fetch presence + dirty in a single 8-register FC04 read at 0x0100. The 0x0200 and 0x0300 blocks are special-cased and must be read as exactly 16 registers; the 0x0310 block as exactly 4; the 0x1010 status block accepts 1–10 registers. Other lengths at those addresses fall through to the range check. FC04 reads outside these ranges return `ILLEGAL_ADDRESS`. The per-ballast level bank formerly split across 0x0000–0x00FF and the group membership masks formerly at 0x0110–0x014F live in the holding-register map below; the per-ballast **config** banks (min/max/power-on/sys-fail/fade) that used to occupy 0x0040–0x00FF have been **retired** (see the holding map) — both are breaking changes from earlier firmware revisions.
 
 ### FC03/FC06/FC10 — Holding Register Map
 
@@ -382,22 +381,23 @@ Per-ballast cached DALI state (read-write) and gateway control registers.
 | 0x0000–0x003F | 64 regs | Per-ballast status \| brightness (the live arc level). FC03 returns the cached `[status:brightness]` pair. FC06/FC10 write: low byte = DAPC level (0–254 valid; 255 = "no change" per DALI), high byte ignored. |
 | 0x0040–0x00FF | (retired) | Per-ballast config banks (min/max, power-on/sys-fail, fade rate/time) — **retired**. The gateway no longer caches config; the controller owns it via raw DALI queries (reads) and DTR0+SET pairs (writes). FC03 reads and FC06/FC10 writes here return **ILLEGAL DATA ADDRESS (0x02)**. |
 | 0x0110–0x014F | 64 regs | Group membership masks — 16 groups × 4 registers (64-bit bitmask per group). Writes are predictively cached and propagate per-bit via ADD_TO_GROUP / REMOVE_FROM_GROUP DALI commands by the work selector. |
-| 0x1100–0x1107 | ≤8 regs | **Command-queue submit window** (write-only; FC10 or FC23 write range). 0–4 command records; the write length (2/4/6/8 regs) says how many. See "Raw Command Queue". |
-| 0x1180–0x1189 | 10 regs | **Command-queue status block** — holding-space alias of FC04 0x0400 (so FC23's holding-only read range can target it). Same layout as 0x0400. |
+| 0x1000–0x1007 | ≤8 regs | **Command-queue submit window** (write-only; FC10 or FC23 write range). 0–4 command records; the write length (2/4/6/8 regs) says how many. See "Raw Command Queue". |
+| 0x1010–0x1019 | 10 regs | **Command-queue status block** — served identically under FC03 and FC04 (FC23's holding-only read range targets it). Layout as in the FC04 map above. |
 
 **Per-ballast bank writes ACK immediately at the Modbus layer.**  The actual DALI command that pushes the change to the ballast is dispatched asynchronously by the sync-flag work selector — the master no longer blocks waiting for DALI propagation.  To detect when reconciliation has completed, poll the dirty bitmap (FC04 0x0104-0x0107, read-clears semantics).  This is a behavioural change vs pre-refactor firmware where writes blocked until DALI completion.
 
+Action / config registers, relocated to 0x1F00+ in task 04:
+
 | Address | Name | Read | Write |
 |---------|------|------|-------|
-| 0x1000 | RAW_CMD | 0 | *Legacy single-slot channel* (now internally routed through the command queue — see below). `[15:8]` = first DALI frame byte, `[7:0]` = second byte. Single send; waits for backward frame. Result in FC04 0x0108. Returns DEVICE_BUSY only if a previous legacy command is still in flight (high byte of 0x0108 == 0xFF) or the queue is full. |
-| 0x1001 | RAW_CMD_TWICE | 0 | *Legacy.* Same frame format as 0x1000 but sent twice within the DALI 100 ms re-send window (used for SET / INITIALISE / RANDOMISE). |
-| 0x1010 | SCAN_TRIGGER | 0 | Write 0x0001 to set `SYNC_READ_SETTINGS | SYNC_READ_LEVEL` on all 64 ballasts (re-discovery: group membership + live arc level/status). Since the config-bank retirement `SYNC_READ_SETTINGS` reads only group membership. |
-| 0x1011 | RESCAN_INTERVAL | R/W | Seconds between single-ballast level re-polls (round-robin cursor). Default 64; full cycle = `RESCAN_INTERVAL × 64` seconds. Write 0 to disable. See "Periodic Rescan" above for the semantic change vs pre-refactor firmware. |
-| 0x1012 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to USERROW on write. |
-| 0x1013 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to USERROW on write. |
-| 0x1014 | COMMISSION | status word | Trigger / abort / poll the IEC 62386-102 control-gear commissioning state machine. See "Commissioning (FC03/FC06 0x1014)" below. |
+| 0x1F00 | SCAN_TRIGGER | 0 | Write 0x0001 to set `SYNC_READ_SETTINGS | SYNC_READ_LEVEL` on all 64 ballasts (re-discovery: group membership + live arc level/status). Since the config-bank retirement `SYNC_READ_SETTINGS` reads only group membership. |
+| 0x1F01 | RESCAN_INTERVAL | R/W | Seconds between single-ballast level re-polls (round-robin cursor). Default 64; full cycle = `RESCAN_INTERVAL × 64` seconds. Write 0 to disable. See "Periodic Rescan" above. |
+| 0x1F02 | SLAVE_ADDR | R/W | Modbus slave address 1–247. Persisted to USERROW on write. |
+| 0x1F03 | BAUD_INDEX | R/W | 0 = 9600, 1 = 19200, 2 = 38400. Persisted to USERROW on write. |
+| 0x1F04 | COMMISSION | status word | Trigger / abort / poll the IEC 62386-102 control-gear commissioning state machine. See "Commissioning" below. |
+| 0x1F05 | SYSTEM_RESET | 0 | Write magic 0xA5A5 to software-reset the gateway once the ACK has cleared the wire. |
 
-The DALI address byte for the raw command channels can be any valid DALI address byte — short address, group address, broadcast (0xFE), or special command (e.g. 0xA3 SET_DTR0).  Cache invalidation runs uniformly on every issued command via `issue_dali_command`, regardless of the master's choice between the per-ballast bank shortcut, the command queue, and the legacy single-slot registers — no path needs explicit invalidation logic at the call site.
+Every pre-queue address not listed above (the removed legacy raw registers, the retired config banks) returns ILLEGAL DATA ADDRESS.  The DALI address byte inside a command record can be any valid DALI address byte — short address, group address, broadcast (0xFE), or special command (e.g. 0xA3 SET_DTR0).  Cache invalidation runs uniformly on every issued command via `issue_dali_command`, regardless of the master's choice between the per-ballast bank shortcut and the command queue.
 
 ### Raw Command Queue
 
@@ -411,59 +411,46 @@ reg1:  [id:5   | flags:3 | dtr0:8]
 ```
 
 - `addr` / `data` are the two forward-frame bytes (any DALI address byte, as above).
-- `id` (bits 15–11 of reg1) is the **controller-assigned** command id, cycling **1–31** (0 is reserved for the internal legacy channel).
+- `id` (bits 15–11 of reg1) is the **controller-assigned** command id, cycling **1–31** (0 is the reserved none/idle sentinel — no command carries id 0).
 - `flags` (bits 10–8): `bit0 send-twice` (send the forward frame twice, no answer — SET/INITIALISE/RANDOMISE); `bit1 send-DTR0-first` (emit `0xA3<dtr0>` immediately before the frame, back-to-back as one atomic queue entry — used for DTR0+SET config writes); `bit2 expects-answer` (open the backward-frame window and capture the 8-bit answer into the result ring). Only these three flags exist.
 - `dtr0` (low byte of reg1) is the value preloaded into DTR0 when `send-DTR0-first` is set; ignored otherwise.
 
-**Submit window** (holding 0x1100–0x1107, write-only): write 0–4 records with FC10 or the FC23 write range. The register count (2/4/6/8) is the record count. The submit is **all-or-nothing**: if it asks for more slots than are free, the gateway rejects the *entire* write with exception **0x06 (SLAVE_DEVICE_BUSY)** and enqueues nothing. A record carrying the reserved id 0 is rejected with ILLEGAL DATA VALUE.
+**Submit window** (holding 0x1000–0x1007, write-only): write 0–4 records with FC10 or the FC23 write range. The register count (2/4/6/8) is the record count. The submit is **all-or-nothing**: if it asks for more slots than are free, the gateway rejects the *entire* write with exception **0x06 (SLAVE_DEVICE_BUSY)** and enqueues nothing. A record carrying the reserved id 0 is rejected with ILLEGAL DATA VALUE.
 
 **Execution** is strict FIFO in submit order. A `send-DTR0-first` record's two frames land back-to-back with nothing interleaved (the queue holds the bus for the pair). After a level-changing frame the gateway marks the target ballast dirty for a priority re-query (group frames fan out to members via the group masks). A queued command **preempts the gateway's idle-time polling** — a submitted command runs within ~1–2 DALI frame times of arrival.
 
-**Status block** (FC04 0x0400–0x0409, aliased into holding at 0x1180–0x1189):
+**Status block** (0x1010–0x1019, served identically under FC03 and FC04):
 
 | Reg | Name | Layout |
 |-----|------|--------|
-| 0x0400 / 0x1180 | QSTAT | `[free_slots:8 \| accepted_id:8]` — free_slots = queue space now; accepted_id = id of the last record accepted |
-| 0x0401 / 0x1181 | QPROG | `[executing_id:8 \| completed_id:8]` — id on the bus now (0 = idle); id of the last result written to the ring |
-| 0x0402–0x0409 / 0x1182–0x1189 | QRES[0..7] | `[result:8 \| answer:8]` — result 0x00 OK / 0x01 NAK / 0x02 ERR (answer = backward-frame byte on OK, error subtype on ERR) |
+| 0x1010 | QSTAT | `[free_slots:8 \| accepted_id:8]` — free_slots = queue space now; accepted_id = id of the last record accepted |
+| 0x1011 | QPROG | `[executing_id:8 \| completed_id:8]` — id on the bus now (0 = idle); id of the last result written to the ring |
+| 0x1012–0x1019 | QRES[0..7] | `[result:8 \| answer:8]` — result 0x00 OK / 0x01 NAK / 0x02 ERR (answer = backward-frame byte on OK, error subtype on ERR) |
 
-**Result-ring convention:** the result for id *N* lives at `0x0402 + (N mod 8)` (holding alias `0x1182 + (N mod 8)`), and is valid once `completed_id` has reached *N*. There is no PENDING state in the ring — "pending" is simply *completed_id has not yet reached this id*.
+**Result-ring convention:** the result for id *N* lives at `0x1012 + (N mod 8)`, and is valid once `completed_id` has reached *N*. There is no PENDING state in the ring — "pending" is simply *completed_id has not yet reached this id*. The gateway writes the ring slot (result + answer) **before** advancing `completed_id`, and the completion runs at a level a Modbus status read fences out, so a read never sees `completed_id` reach an id whose result is not yet written.
 
 **Id rules / invariant:** ids are controller-assigned, 1–31, 0 reserved. Because a ring slot is `id & 7`, the controller must keep **at most 7 results uncollected** at any time so a fresh result never overwrites an uncollected one — trivially satisfied when collection rides every FC23 response (queue depth is only 8).
 
-**FC23 (0x17) pipeline:** the write executes **before** the read, so one FC23 confirms *acceptance of this submit* (via QSTAT `accepted_id` / `free_slots`) and returns *the results of earlier commands* (QPROG `completed_id` + the QRES ring) — the submit-N / collect-N−1 pattern. The write range is the submit window (0x1100); the read range is holding space, normally the 0x1180 status alias (FC23's read range is holding-only, which is why the status block is mirrored there). A read-only FC23 (write count 0) is accepted as a pure status/collect poll.
+**FC23 (0x17) pipeline:** the write executes **before** the read, so one FC23 confirms *acceptance of this submit* (via QSTAT `accepted_id` / `free_slots`) and returns *the results of earlier commands* (QPROG `completed_id` + the QRES ring) — the submit-N / collect-N−1 pattern. The write range is the submit window (0x1000); the read range is holding space, normally the 0x1010 status block (FC23's read range is holding-only). A read-only FC23 (write count 0) is accepted as a pure status/collect poll.
 
-### Legacy raw command channel (0x1000 / 0x1001 / 0x0108)
+> **Changelog:** the pre-queue single-slot raw channel (old 0x1000/0x1001 RAW_CMD + FC04 0x0108 result register) was **removed** in task 04 — those addresses are reused by the submit window, and old raw reads/writes return ILLEGAL DATA ADDRESS. The controller and this gateway are a **matched firmware set** (introduced together in task 04); a pre-queue master cannot drive this firmware and vice versa. Deploy both together.
 
-> **Deprecated.** Retained for the CLI `dali_raw` and pre-queue masters. New masters should use the command queue above. This path is internally routed through the same queue via the reserved id 0, so it shares the 8 queue slots — but its result is mirrored to 0x0108 (below), not the ring, and it stays single-slot (one legacy command in flight at a time).
+### Commissioning (FC03/FC06 0x1F04)
 
-After writing to 0x1000 (RAW_CMD) or 0x1001 (RAW_CMD_TWICE), poll FC04 register 0x0108 for the result.  The register simply holds the outcome of the most recent legacy raw command (or PENDING while one is in flight); it is NOT cleared by reads, so the master can re-read the same outcome as many times as it wants.  A subsequent RAW_CMD write overwrites whatever was there with a fresh PENDING — the states that block a new write are PENDING itself and a full queue.
+`MBREG_COMMISSION` (holding register 0x1F04) drives the IEC 62386-102 control-gear commissioning state machine — the bisect-based discovery + addressing protocol that lets the gateway assign short addresses (0–63) to fresh ballasts without an external commissioning tool.
 
-| High byte | Low byte | Meaning |
-|-----------|----------|---------|
-| 0x00 | response byte | OK — backward frame received; the low byte is the response. `0x0000` is also the initial value before any raw command has been issued (a master that hasn't issued one sees the same thing as one whose last command returned 0). |
-| 0x01 | 0x00 | NAK — no backward frame received within the 22 Te response window |
-| 0x02 | error subtype | Error — bus/timing fault (1 = malformed, 2 = pulse too short, 3 = pulse in middle, 4 = pulse too long) |
-| 0xFF | sends remaining | Pending — high byte 0xFF, low byte = number of DALI sends remaining at arming (0x02 right after writing 0x1001; 0x01 right after writing 0x1000). The low byte does NOT decrement mid-twice-send: a RAW_CMD_TWICE stays at `0xFF02` from arming until both sends have completed and a terminal value is written. The two sends are coalesced into a single completion (the bit-level state machine handles the inter-send 22 Te re-fire) for simpler completion semantics — masters only need to distinguish "pending" from "terminal", not count sends. Match the high byte for the pending check (`(value & 0xFF00) == 0xFF00`); the only visible mid-pending value is `0xFF02`, but treating any `0xFFxx` as pending is the safe rule. |
-
-Sequencing: a RAW_CMD write submitted while the legacy channel is in flight (0x0108 high byte 0xFF) is rejected with a Modbus `DEVICE_BUSY` exception and `0x0108` is left untouched, so the master keeps its in-flight visibility. The same `DEVICE_BUSY` is returned if the shared 8-deep queue happens to be full. A RAW_CMD write submitted at any other time succeeds: it enqueues one command with the reserved id 0 and flips `0x0108` to PENDING, silently overwriting whatever terminal value was sitting there.
-
-### Commissioning (FC03/FC06 0x1014)
-
-`MBREG_COMMISSION` (holding register 0x1014) drives the IEC 62386-102 control-gear commissioning state machine — the bisect-based discovery + addressing protocol that lets the gateway assign short addresses (0–63) to fresh ballasts without an external commissioning tool.
-
-**Write encoding** (FC06 to 0x1014):
+**Write encoding** (FC06 to 0x1F04):
 
 | Value | Action |
 |-------|--------|
-| 0x0000 | Abort: send TERMINATE, return to idle. No-op when already idle or in a terminal state (master must read 0x1014 to clear those). |
+| 0x0000 | Abort: send TERMINATE, return to idle. No-op when already idle or in a terminal state (master must read 0x1F04 to clear those). |
 | 0x0001 | Start **full** commissioning: INITIALISE(all), wipe existing per-ballast cache, assign 0..N−1 to discovered ballasts. **Destructive** — overwrites any existing addressing. |
 | 0x0002 | Start **incremental** commissioning: INITIALISE(without short addr), only address ballasts that don't currently have one. Already-addressed ballasts are not disturbed; new gear takes the lowest unused short addresses. |
 | anything else | ILLEGAL_VALUE |
 
 Writing 0x0001 or 0x0002 while a run is already in progress returns DEVICE_BUSY. 0x0000 always succeeds (no-op when idle / terminal).
 
-**Read encoding** (FC03 of 0x1014) — high byte encodes phase, low byte encodes count or error subtype:
+**Read encoding** (FC03 of 0x1F04) — high byte encodes phase, low byte encodes count or error subtype:
 
 | High byte | Low byte | Meaning |
 |-----------|----------|---------|
@@ -472,11 +459,11 @@ Writing 0x0001 or 0x0002 while a run is already in progress returns DEVICE_BUSY.
 | 0x02 | total | Complete — `total` short addresses assigned this run (read-clears) |
 | 0x03 | subtype | Error / aborted (read-clears). Subtype: 0x01 = aborted by master, 0x02 = no ballasts found, 0x03 = >3 consecutive verify failures, 0x04 = ran out of short addresses (more ballasts than free slots), 0x05 = bus shorted longer than 200 TE during commissioning (run aborted) |
 
-**Read-clears semantics on terminal states**: reading 0x1014 when the high byte is 0x02 or 0x03 returns the value AND resets the underlying state to 0x0000 atomically — same shape as FC04 0x0108. Idle (0x00) and running (0x01) reads are non-clearing so masters can poll progress.
+**Read-clears semantics on terminal states**: reading 0x1F04 when the high byte is 0x02 or 0x03 returns the value AND resets the underlying state to 0x0000 atomically — same shape as FC04 0x0108. Idle (0x00) and running (0x01) reads are non-clearing so masters can poll progress.
 
 **Concurrency**: OP_COMMISSION is the highest-priority work-selector slot — concurrent raw commands and per-ballast bank writes that arrive mid-run are queued and execute after the run finishes. Successful PROGRAM_SHORT_ADDRESS additionally arms `SYNC_READ_SETTINGS` on the just-addressed ballast, so the config cache populates without a manual SCAN_TRIGGER.
 
-**Timing**: a full-bus commissioning of 64 ballasts takes ~3 minutes at 1200 baud (~3 s/ballast for the bisect chain — 24 search rounds × 4 sends + program/verify/withdraw). The master can poll 0x1014 at any rate; the count low byte advances monotonically as PROGRAM/VERIFY rounds succeed.
+**Timing**: a full-bus commissioning of 64 ballasts takes ~3 minutes at 1200 baud (~3 s/ballast for the bisect chain — 24 search rounds × 4 sends + program/verify/withdraw). The master can poll 0x1F04 at any rate; the count low byte advances monotonically as PROGRAM/VERIFY rounds succeed.
 
 **Aborting**: writing 0x0000 mid-run latches an abort request — the next dispatch boundary forces TERMINATE, then idle. Status latches to 0x0301 before TERMINATE issues so a master poll between abort-request and TERMINATE-completion still observes the aborted state.
 
@@ -554,7 +541,7 @@ The flag-driven refactor (branch `task-1-flag-driven`) introduces several wire-p
 - **FC04 input register layout cleaned up (subtask 8).** Present, dirty, and raw-command-result moved down to a contiguous block at 0x0100–0x0108: present[4] at 0x0100–0x0103, dirty[4] at 0x0104–0x0107, raw_cmd_result at 0x0108. The fading bitmap (formerly 0x0155–0x0158), group_status array (formerly 0x0100–0x010F), and scan_status (formerly 0x0150) are removed entirely — they were derivable from the per-ballast status byte / group_mask, or vestigial from the pre-flag-driven era. Masters that read presence/dirty/raw_result must update their addresses; the master-visible group_mask range at FC03 0x0110–0x014F is intentionally preserved by a 14-byte padding hole inside `register_map_t`. Fade-running detection switches from the removed bitmap to bit 4 of the per-ballast status byte at FC03 0x0000–0x003F (high byte).
 - **Raw command result high-byte encoding revamped and FC04 read-clears removed.** OK was `0x02xx`; it is now `0x00xx` (the register value is just the response byte, with `0x0000` doing double duty as "no command issued yet"). ERR was `0x03xx`; it is now `0x02xx` with the same error-subtype low byte. PENDING (`0xFFxx`) and NAK (`0x0100`) are unchanged. Reads of FC04 0x0108 no longer clear the register — the outcome of the last raw command persists until the next RAW_CMD write overwrites it. The arm gate now only checks PENDING: any other state is silently overwritten on the next RAW_CMD write (so masters that want to preserve a prior outcome must read it before re-arming).
 - **Config banks (0x0040–0x00FF) retired (task 04).** The per-ballast min/max, power-on/sys-fail, and fade banks no longer exist; FC03 reads and FC06/FC10 writes there return `ILLEGAL DATA ADDRESS`. Config is owned by the controller over raw DALI. A gateway on this firmware requires a raw-config controller — see "Config-bank retirement". Deploy controller-first.
-- **Command queue added (task 04).** New submit window at holding 0x1100–0x1107 (FC10 or FC23 write range) and status block at FC04 0x0400–0x0409 / holding alias 0x1180–0x1189, plus **FC23 (0x17)** support. The legacy 0x1000/0x1001/0x0108 single-slot channel still works (routed through the queue via reserved id 0) but is deprecated. See "Raw Command Queue".
+- **Command queue + register-map relocation (task 04) — supersedes the several raw-channel bullets above.** The legacy single-slot raw channel (0x1000/0x1001 RAW_CMD + FC04 0x0108 result) is **removed**; all raw DALI now goes through the id-tagged command queue. The register map moved to a round 0x1000 base: submit window 0x1000–0x1007 (FC10/FC23 write range), status block 0x1010–0x1019 (served under both FC03 and FC04), **FC23 (0x17)** support; and the action/config registers relocated to 0x1F00+ (scan 0x1F00, rescan 0x1F01, slave 0x1F02, baud 0x1F03, commission 0x1F04, reset 0x1F05). Every pre-queue raw/config-bank address returns ILLEGAL DATA ADDRESS. This gateway and the controller are now a **matched firmware set** — no mixed-version operation; deploy both together. See "Raw Command Queue".
 
 ## Known Limitations
 

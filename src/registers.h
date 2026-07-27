@@ -37,7 +37,7 @@ typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
 //   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
 //   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
 //   0x0200         version block     16-register special case (see process_fc04)
-//   0x1010-0x1019  queue status block (see MBREG_SLOT_STATUS_BASE; also served under FC03)
+//   0x1010-0x1017  queue status block, 8 slots (see MBREG_SLOT_STATUS_BASE; also served under FC03)
 typedef struct {
     ballast_bs_t   block0[64];          // 0x0000  status | brightness (live arc level)
     uint16_t       present[4];          // 0x0100  present/dirty kept contiguous so the

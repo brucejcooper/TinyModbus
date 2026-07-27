@@ -1,0 +1,64 @@
+#pragma once
+// mbq_slots.h — generic self-describing slot command queue (task 06, queue v2).
+//
+// A DALI-AGNOSTIC Modbus command-queue. It carries OPAQUE fixed-size commands to
+// the master and reports an 8-bit response + a lifecycle status per slot. It has
+// NO knowledge of the payload: the meaning of the command bytes, of the response8
+// values, and of the failure codes belongs to the caller (the DALI issuance
+// adapter). Do not add DALI (or any payload) semantics to this module — the
+// generic pattern is documented in controller/docs/modbus-command-queue.md.
+//
+// Wire ABI (see registers.h for the register addresses):
+//   Command block (master-write): 0x1000 + 2*slot, one 32-bit opaque command per
+//     slot (2 Modbus registers, wire order = MBQ_CMD_BYTES bytes).
+//   Status block (gateway-write, FC03+FC04): 0x1010 + slot, one register per slot
+//     = [status:8 | response8:8].
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define MBQ_SLOTS      8u   // number of self-describing slots
+#define MBQ_CMD_BYTES  4u   // opaque command size (32-bit)
+
+// Lifecycle status (the hi byte of a slot's status register).
+enum {
+    MBQ_S_IDLE      = 0u,   // free; writable
+    MBQ_S_PENDING   = 1u,   // accepted, waiting to execute
+    MBQ_S_EXECUTING = 2u,   // in flight
+    MBQ_S_COMPLETE  = 3u,   // terminal; response8 = value
+    MBQ_S_FAILED    = 4u,   // terminal; response8 = code
+};
+
+#define MBQ_NONE  0xFFu   // "no slot" sentinel from mbq_next_pending
+
+// Reset all slots to idle and the accept sequence to 0. Call once at boot; a
+// reboot naturally leaves every slot idle (the "idle means gone" signal to the
+// master). No cross-reboot state is kept.
+void mbq_init(void);
+
+// Modbus submit: arm `n_slots` contiguous slots starting at `first_slot` from
+// `regs` (n_slots * 2 big-endian registers, wire order). ALL-OR-NOTHING: if ANY
+// targeted slot is active (pending/executing) nothing changes and this returns
+// false (the caller raises SLAVE_DEVICE_BUSY 0x06). Otherwise each targeted slot
+// is armed to PENDING with the opaque command and a fresh accept sequence stamped
+// in ascending slot order. Fenced. Returns false on an out-of-range range too.
+bool mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots);
+
+// Serve `count` status registers starting at slot index `sidx` into `out`
+// (count * 2 big-endian bytes, [status:8 | response8:8] per slot). Reads past the
+// last slot yield zero. Fenced so each slot's status+response8 pair is atomic
+// against the completion writer.
+void mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
+
+// Arbiter hook: the lowest accept-sequence PENDING slot (0..MBQ_SLOTS-1), or
+// MBQ_NONE if none is pending. Wrap-aware over the small live window.
+uint8_t mbq_next_pending(void);
+
+// Arbiter hook: copy `slot`'s opaque command (MBQ_CMD_BYTES) into `out4` and mark
+// the slot EXECUTING. The caller (payload adapter) interprets the bytes.
+void mbq_begin(uint8_t slot, uint8_t *out4);
+
+// Completion hook (called from the payload adapter's completion path): set the
+// slot terminal. `status` is MBQ_S_COMPLETE or MBQ_S_FAILED; `response8` is the
+// value or code. Writes response8 before status (the load-bearing ordering).
+void mbq_complete(uint8_t slot, uint8_t status, uint8_t response8);

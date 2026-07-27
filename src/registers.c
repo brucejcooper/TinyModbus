@@ -3,6 +3,7 @@
 #include <util/atomic.h>
 #include "registers.h"
 #include "dali_sync.h"
+#include "mbq_slots.h"
 
 register_map_t g_regs;
 
@@ -166,15 +167,15 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
         *val = ((uint16_t)p[0] << 8) | p[1];
         return true;
     }
-    // Raw-command-queue status block at 0x1010-0x1019 (served identically under
-    // FC03 and FC04; FC23's read range is holding-only, so it targets this).
-    // Served one register at a time from the queue module (the FC03/FC23 read
-    // loop calls this per register); each register is independently fenced, and
-    // a tear between QPROG and a QRES is benign (completed_id gates which QRES
-    // entries the master trusts).
+    // Slot status block at 0x1010-0x1017 (served identically under FC03 and FC04;
+    // FC23's read range is holding-only, so it targets this).  Served one register
+    // (one slot's [status|response8]) at a time from the generic queue module; each
+    // slot register is independently fenced and self-describing, so a tear across
+    // slots is benign (slots reconcile independently).  0x1018-0x1019 fall through
+    // to ILLEGAL DATA ADDRESS (retired v1 QRES[6/7]).
     if (addr >= MBREG_QSTAT_BASE && addr <= MBREG_QSTAT_END) {
         uint8_t out[2];
-        gwq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), 1u, out);
+        mbq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), 1u, out);
         *val = ((uint16_t)out[0] << 8) | out[1];
         return true;
     }

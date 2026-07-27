@@ -18,30 +18,34 @@
 // read matter. Compound/main-context accesses use ATOMIC_BLOCK (a brief global
 // cli, which also blocks the DALI completion ISR); single-byte status reads are
 // naturally atomic on the AVR.
+//
+// State is kept as separate byte arrays (structure-of-arrays), not an array of
+// structs: on the 8-bit AVR a byte-array index is a cheap add, whereas a 7-byte
+// struct stride costs a multiply on every access — the same power-of-two
+// discipline v1's 4-/2-byte records used.
+
+// Size-optimise this module: it is not on any hot path (called a few times per
+// ~28 ms DALI transaction, never in a bit-timing ISR), and the ATtiny1604 flash
+// is tight — -Os here reclaims the -O3 code-gen bloat without any latency cost.
+#pragma GCC optimize("Os")
 
 #include "mbq_slots.h"
 #include <util/atomic.h>
 
-// Per-slot state. cmd[] is the opaque wire-order command (never interpreted here).
-// seq is the accept sequence, meaningful only while status == PENDING.
-typedef struct {
-    uint8_t cmd[MBQ_CMD_BYTES];  // opaque command bytes, wire order
-    uint8_t status;              // MBQ_S_* lifecycle
-    uint8_t response8;           // value on COMPLETE / code on FAILED
-    uint8_t seq;                 // accept sequence (wrap-aware; valid when PENDING)
-} mbq_slot_t;
-
-static volatile mbq_slot_t s_slot[MBQ_SLOTS];
-static volatile uint8_t    s_seq;   // monotonic accept-sequence counter
+static volatile uint8_t s_cmd[MBQ_SLOTS][MBQ_CMD_BYTES];  // opaque command bytes, wire order
+static volatile uint8_t s_status[MBQ_SLOTS];              // MBQ_S_* lifecycle
+static volatile uint8_t s_resp[MBQ_SLOTS];               // value on COMPLETE / code on FAILED
+static volatile uint8_t s_seq[MBQ_SLOTS];                // accept sequence (valid when PENDING)
+static volatile uint8_t s_seq_ctr;                       // monotonic accept-sequence counter
 
 void mbq_init(void) {
     for (uint8_t i = 0; i < MBQ_SLOTS; i++) {
-        for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) s_slot[i].cmd[b] = 0;
-        s_slot[i].status    = MBQ_S_IDLE;
-        s_slot[i].response8 = 0;
-        s_slot[i].seq       = 0;
+        for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) s_cmd[i][b] = 0;
+        s_status[i] = MBQ_S_IDLE;
+        s_resp[i]   = 0;
+        s_seq[i]    = 0;
     }
-    s_seq = 0;
+    s_seq_ctr = 0;
 }
 
 static inline bool slot_active(uint8_t st) {
@@ -56,19 +60,19 @@ bool mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots) {
         // (pending/executing) — a stale-cache write must not clobber in-flight work.
         bool any_active = false;
         for (uint8_t i = 0; i < n_slots; i++) {
-            if (slot_active(s_slot[first_slot + i].status)) { any_active = true; break; }
+            if (slot_active(s_status[first_slot + i])) { any_active = true; break; }
         }
         if (!any_active) {
             // Arm each targeted slot to PENDING with the opaque command and a fresh
             // accept sequence, stamped in ascending slot order so execution order ==
             // the master's intended submit order for a multi-slot write.
             for (uint8_t i = 0; i < n_slots; i++) {
-                volatile mbq_slot_t *sl = &s_slot[first_slot + i];
-                const uint8_t *r = regs + (uint16_t)i * (MBQ_CMD_BYTES);  // 2 regs = 4 bytes
-                for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) sl->cmd[b] = r[b];
-                sl->response8 = 0;
-                sl->seq       = s_seq++;
-                sl->status    = MBQ_S_PENDING;
+                uint8_t s = (uint8_t)(first_slot + i);
+                const uint8_t *r = regs + (uint16_t)i * MBQ_CMD_BYTES;  // 2 regs = 4 bytes
+                for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) s_cmd[s][b] = r[b];
+                s_resp[s]   = 0;
+                s_seq[s]    = s_seq_ctr++;
+                s_status[s] = MBQ_S_PENDING;
             }
             ok = true;
         }
@@ -83,7 +87,7 @@ void mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
         for (uint8_t i = 0; i < count; i++) {
             uint8_t s = (uint8_t)(sidx + i);
             uint8_t st = 0, r8 = 0;
-            if (s < MBQ_SLOTS) { st = s_slot[s].status; r8 = s_slot[s].response8; }
+            if (s < MBQ_SLOTS) { st = s_status[s]; r8 = s_resp[s]; }
             out[(uint16_t)i * 2u]      = st;   // hi byte = status
             out[(uint16_t)i * 2u + 1u] = r8;   // lo byte = response8
         }
@@ -97,8 +101,8 @@ uint8_t mbq_next_pending(void) {
     uint8_t best = MBQ_NONE;
     uint8_t best_seq = 0;
     for (uint8_t i = 0; i < MBQ_SLOTS; i++) {
-        if (s_slot[i].status != MBQ_S_PENDING) continue;
-        uint8_t sq = s_slot[i].seq;
+        if (s_status[i] != MBQ_S_PENDING) continue;
+        uint8_t sq = s_seq[i];
         if (best == MBQ_NONE || (int8_t)(sq - best_seq) < 0) { best = i; best_seq = sq; }
     }
     return best;
@@ -106,8 +110,8 @@ uint8_t mbq_next_pending(void) {
 
 void mbq_begin(uint8_t slot, uint8_t *out4) {
     if (slot >= MBQ_SLOTS) return;
-    for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) out4[b] = s_slot[slot].cmd[b];
-    s_slot[slot].status = MBQ_S_EXECUTING;   // single-byte store, atomic
+    for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) out4[b] = s_cmd[slot][b];
+    s_status[slot] = MBQ_S_EXECUTING;   // single-byte store, atomic
 }
 
 void mbq_complete(uint8_t slot, uint8_t status, uint8_t response8) {
@@ -115,6 +119,6 @@ void mbq_complete(uint8_t slot, uint8_t status, uint8_t response8) {
     // ORDERING (load-bearing): publish the value BEFORE publishing that it is ready.
     // A fenced reader (mbq_read_status) therefore never sees a terminal status with
     // a stale response8.
-    s_slot[slot].response8 = response8;
-    s_slot[slot].status    = status;   // MBQ_S_COMPLETE or MBQ_S_FAILED
+    s_resp[slot]   = response8;
+    s_status[slot] = status;   // MBQ_S_COMPLETE or MBQ_S_FAILED
 }

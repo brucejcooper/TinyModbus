@@ -54,7 +54,7 @@ typedef enum __attribute__((packed)) {
     OP_FULL_SCAN,     // SYNC_READ_SETTINGS: 2 group-membership queries, yields between steps
     OP_WRITE_LEVEL,   // SYNC_WRITE_LEVEL: single DAPC
     OP_GROUP_BIT,     // single ADD_TO_GROUP / REMOVE_FROM_GROUP (twice)
-    OP_RAW,           // head entry of the raw command queue (gwq[gwq_head])
+    OP_RAW,           // the executing slot of the generic queue (mbq_slots)
     OP_COMMISSION,    // IEC 62386-102 commissioning state machine (commission_state)
 } dali_op_t;
 
@@ -173,60 +173,29 @@ extern volatile commission_state_t commission_state;
 // also returns).  process_fc06 / process_fc10 distinguish ILLEGAL_VALUE
 // from DEVICE_BUSY by re-checking val > 2.
 
-// ---- Raw command queue (task 04) -------------------------------------
+// ---- Raw command queue (task 06, queue v2) — DALI adapter contract ----
 //
-// 8-deep, id-tagged FIFO fed by the FC 0x10 / FC23 submit window
-// (0x1000-0x1007).  Each entry is one indivisible logical DALI command (a
-// DTR0-preload pair counts as ONE entry).  Execution is strict FIFO; the
-// completion handler writes an [result:8|answer:8] pair into the result ring
-// (slot = id & 7) and THEN advances completed_id (ordering the status read
-// relies on).
+// The generic slot queue is in mbq_slots.c (opaque 32-bit command in,
+// [status:8|response8:8] out — DALI-agnostic).  These are the DALI ADAPTER's
+// payload contract for it: the meaning of the opaque command bytes and of the
+// response8 codes.  The adapter itself is the OP_RAW arms in dali_sync.c.
 //
-// Command-record wire format (2 registers per record):
-//   reg0: [addr:8 | data:8]          16-bit DALI forward frame
-//   reg1: [id:5 | flags:3 | dtr0:8]
-// The id (top 5 bits) and the 3 flag bits (QF_*) pack into one RAM byte
-// (idflags): id in bits 7..3, flags in bits 2..0.  Ids cycle 1..31 (0 = the
-// reserved none/idle sentinel; no command ever carries id 0); ring 8 slots.
-#define GWQ_DEPTH   8u     // queue depth (== submit-window-limited backlog)
-#define GWQ_RING    8u     // result-ring slots; slot = id & 7
-
+// Command (32-bit, wire order = 2 Modbus regs):
+//   byte0 addr | byte1 data | byte2 flags | byte3 dtr0
+//   flags: bit0 send-twice, bit1 send-DTR0-first (0xA3<dtr0>), bit2 expects-answer;
+//   bits 3-7 reserved 0 (room for future DT8 multi-frame flags).  No id field —
+//   the slot is the identity and the gateway assigns the accept sequence.
 #define QF_TWICE    0x01u  // send the forward frame twice (no answer)
 #define QF_DTR0     0x02u  // emit 0xA3<dtr0> back-to-back immediately before the frame
-#define QF_ANSWER   0x04u  // expects a backward frame; capture the 8-bit answer
-// flags is exactly 3 bits wide — no reserved bit (the id occupies the rest).
+#define QF_ANSWER   0x04u  // expects a backward frame; response8 = the 8-bit answer
 
-// One queued command (4 bytes; 8 entries = 32 B).
-typedef struct {
-    uint8_t addr;     // DALI forward frame byte 0 (address byte)
-    uint8_t data;     // DALI forward frame byte 1 (opcode / arc level)
-    uint8_t idflags;  // [id:5 | flags:3] — id 1..31 (0 reserved), QF_* low 3 bits
-    uint8_t dtr0;     // DTR0 value to preload when QF_DTR0 set
-} gwq_cmd_t;
-
-// One result-ring entry (2 bytes; 8 entries = 16 B).  `result` is 0x00 OK /
-// 0x01 NAK / 0x02 ERR; there is no PENDING in the ring — pending is
-// "completed_id has not reached this id".
-typedef struct { uint8_t result; uint8_t answer; } gwq_res_t;
-
-#define GWQ_ID(idflags)     ((uint8_t)((idflags) >> 3))
-#define GWQ_FLAGS(idflags)  ((uint8_t)((idflags) & 0x07u))
-
-// Submit n command records (n = 1..4) atomically (all-or-nothing).  `regs`
-// points at n*2 big-endian registers already in wire order (reg0 then reg1
-// per record).  Returns false and enqueues NOTHING if fewer than n slots
-// are free.  Called from the FC 0x10 / FC23 submit-window handler.
-bool gwq_submit(const uint8_t *regs, uint8_t n);
-
-// Free queue slots right now (GWQ_DEPTH - count).  Used to build QSTAT and
-// to pre-flight the all-or-nothing submit check.
-uint8_t gwq_free_slots(void);
-
-// Fill `out` with `count` status registers (count*2 big-endian bytes),
-// starting at status index `sidx`: 0 = QSTAT [free_slots|accepted_id],
-// 1 = QPROG [executing_id|completed_id], 2..9 = QRES[0..7] [result|answer].
-// Reads are fenced (TCB0 + ATOMIC) against the LVL1 completion writer.
-void gwq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
+// response8 on a FAILED slot (a COMPLETE slot's response8 is the backward-frame
+// answer, or 0 for a no-answer command).  The any-on probe needs NAK (silence →
+// "none on") DISTINCT from COLLISION (garbled backward frame → "≥1 on"); a genuine
+// bus fault is a third code so it can't be misread as a collision.
+#define DALI_RESP_NAK        0x01u  // no / short backward frame where one was expected
+#define DALI_RESP_COLLISION  0x02u  // garbled/malformed backward frame (≥1 gear answered)
+#define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse etc.)
 
 // ---- Full-scan tracking ----------------------------------------------
 //

@@ -87,39 +87,31 @@ extern volatile uint8_t  g_reset_reason;
 // and every other pre-queue address (config banks, old raw result) returns
 // ILLEGAL DATA ADDRESS.
 //
-// ---- Raw command queue: submit window + status block ----------------------
+// ---- Command queue v2: slot command block + slot status block --------------
 //
-// Submit window (master-write-only; FC 0x10 or FC23 write range).  0-4 command
-// records; the write LENGTH (2/4/6/8 registers) says how many.  Each record is
-// 2 registers:
-//   reg0: [addr:8 | data:8]          16-bit DALI forward frame
-//   reg1: [id:5 | flags:3 | dtr0:8]  id 1..31 (0 reserved sentinel),
-//                                    QF_* flags, DTR0 preload
-// All-or-nothing: a write asking for more records than free slots is rejected
-// whole with SLAVE_DEVICE_BUSY (0x06) — nothing is enqueued.
+// A self-describing 8-slot lifecycle queue (task 06).  See mbq_slots.h and
+// controller/docs/modbus-command-queue.md.  The v1 id-ledger (QSTAT
+// [free_slots|accepted_id], QPROG [executing_id|completed_id], QRES[8] ring) is
+// GONE — and with it, 0x1018-0x1019 are now ILLEGAL DATA ADDRESS.
 //
-// Window size = the longest atomic DALI sequence the controller submits in one
-// window write.  Today that is a DTR0-preload pair (one record).  A future DT8
-// colour set (DTR0/DTR1/DTR2 + SET, DALI type-8 device) is still ONE indivisible
-// unit and must submit inside one window write; the 4-record window leaves the
-// headroom.  See tasks/04-fc23-queue.md.
-#define MBREG_QCMD_BASE         0x1000u  // QCMD[0]; window spans 0x1000-0x1007
-#define MBREG_QCMD_END          0x1007u  // 4 records × 2 registers, inclusive
+// Command block (master-write; FC 0x10 or FC23 write range): 8 slots × 2 regs.
+//   0x1000 + 2*slot = a 32-bit OPAQUE command (2 regs).  The queue does not
+//   interpret it; the DALI adapter packs/unpacks (dali_sync.h QF_* contract).
+// A write covers 1..8 contiguous slots and is ALL-OR-NOTHING: if ANY targeted
+// slot is ACTIVE (pending/executing) the whole write is rejected with
+// SLAVE_DEVICE_BUSY (0x06).  idle + collected-terminal slots are writable.
+#define MBREG_QCMD_BASE         0x1000u  // slot 0 command; block spans 0x1000-0x100F
+#define MBREG_QCMD_END          0x100Fu  // 8 slots × 2 registers, inclusive
 
-// Status block (gateway-write-only): 10 registers at 0x1010, served at the SAME
-// numeric addresses by BOTH FC03 (holding view — FC23's read range targets it)
-// and FC04 (input view).  Layout:
-//   0x1010        QSTAT   [free_slots:8 | accepted_id:8]
-//   0x1011        QPROG   [executing_id:8 | completed_id:8]
-//   0x1012-0x1019 QRES[0..7]  [result:8 | answer:8]   (slot = id & 7)
-// `result` is 0x00 OK / 0x01 NAK / 0x02 ERR; `answer` is the backward-frame byte
-// on OK (or error subtype on ERR).  There is no PENDING — pending is
-// "completed_id has not yet reached this id".  The gateway writes the ring slot
-// (result+answer) BEFORE advancing completed_id, so a fenced Modbus read never
-// sees completed_id reach an id whose result is not yet written.
-#define MBREG_QSTAT_BASE        0x1010u  // QSTAT..QRES[7], FC03 + FC04 (same addr)
-#define MBREG_QSTAT_END         0x1019u
-#define GWQ_STATUS_REGS         10u      // QSTAT + QPROG + QRES[8]
+// Status block (gateway-write; served at the SAME addresses under FC03 holding —
+// FC23's read range targets it — and FC04 input): 8 slots × 1 reg.
+//   0x1010 + slot = [status:8 | response8:8].  status = lifecycle 0 idle /
+//   1 pending / 2 executing / 3 complete / 4 failed.  response8 = the value on
+//   complete (backward-frame answer, or 0 for a no-answer command) or the code
+//   on failed.  The gateway writes response8 BEFORE status under the read fence,
+//   so a fenced read never sees a terminal status with a stale response8.
+#define MBREG_QSTAT_BASE        0x1010u  // slot 0 status; block spans 0x1010-0x1017
+#define MBREG_QSTAT_END         0x1017u  // 8 slots × 1 register, inclusive
 
 // ---- Action / config registers (relocated to 0x1F00+) ---------------------
 

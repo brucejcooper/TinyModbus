@@ -24,10 +24,10 @@
 //   - dali_busy / current_op / scan_full_*: written by start_next_dali_work
 //     (main, under TCB0+ATOMIC) and by dali_sync_completion (ISR);
 //     reads from main are atomic (1 byte) but compound checks need ATOMIC.
-//   - gwq[]/gwq_head/gwq_count + ring + status ids: written by gwq_submit
-//     (main, under TCB0 fence + ATOMIC) and by the LVL1 completion handler
-//     (dequeue + ring write, ring-slot BEFORE completed_id); all compound
-//     accesses fenced (readers set TCB0=0, so they see a consistent snapshot).
+//   - the generic slot queue (mbq_slots.c): submit/status served in main; the
+//     terminal write (mbq_complete — response8 BEFORE status) runs in the LVL1
+//     completion handler; mbq_read_status fences each slot's read (ATOMIC_BLOCK)
+//     so it never sees a terminal status with a stale response8.
 //   - group_write: same TCB0+ATOMIC pattern.
 //   - g_regs.dirty[]: ISR-set, main-cleared via regs_read_clear_dirty
 //     (already atomic).
@@ -47,6 +47,7 @@
 
 #include "dali.h"
 #include "dali_sync.h"
+#include "mbq_slots.h"
 #include "registers.h"
 
 // ---- Globals ---------------------------------------------------------
@@ -58,30 +59,18 @@ volatile dali_group_write_t group_write;
 volatile cmd_entry_t       s_active;
 volatile commission_state_t commission_state;
 
-// ---- Raw command queue (task 04) -------------------------------------
+// ---- Raw command queue (task 06, queue v2) ---------------------------
 //
-// 8-deep FIFO fed by the FC 0x10 / FC23 submit window (0x1000-0x1007).
-// gwq_head is the next entry to execute;
-// gwq_count is how many are queued (0..GWQ_DEPTH).  The currently-
-// executing entry is gwq[gwq_head] for the whole of its (possibly
-// multi-frame) sequence, so its command bytes are read straight from the
-// queue at dispatch time — no separate staging slot.
-//
-// Threading: gwq[]/gwq_head/gwq_count and the ring/status bytes are
-// written by gwq_submit (main, under TCB0 fence + ATOMIC) and by the LVL1
-// DALI completion handler (dequeue + ring write).  All compound accesses
-// go through TCB0.INTCTRL=0 + ATOMIC_BLOCK, the same fence the rest of the
-// module uses for main-vs-completion state.
-static volatile gwq_cmd_t gwq[GWQ_DEPTH];
-static volatile uint8_t   gwq_head;
-static volatile uint8_t   gwq_count;
-static volatile gwq_res_t gwq_ring[GWQ_RING];
-
-// Status block (0x1010-0x1019, served under both FC03 and FC04; MBREG_QSTAT_BASE).
-// 0 = "none": no id has been accepted / executed / completed yet.
-static volatile uint8_t   q_accepted_id;   // last id accepted into the queue
-static volatile uint8_t   q_executing_id;  // id currently on the bus (0 = idle)
-static volatile uint8_t   q_completed_id;  // last id whose result landed in the ring
+// The generic 8-slot lifecycle queue lives in mbq_slots.c (DALI-agnostic:
+// opaque 32-bit command in, [status|response8] out).  This module is the DALI
+// ADAPTER: it picks the next pending slot, unpacks the 32-bit command into a
+// DALI frame (issue_dali_command), and maps the DALI terminal back to a
+// (status, response8) via mbq_complete.  The only state kept here is the slot +
+// unpacked command of the raw op currently on the bus, held across the DTR0
+// two-step and into completion.  OP_RAW is single-in-flight: dali_busy gates the
+// arbiter, so these are only rewritten when the next slot begins.
+static uint8_t s_raw_slot;                 // mbq slot index of the executing OP_RAW
+static uint8_t s_raw_cmd[MBQ_CMD_BYTES];   // its opaque command: [addr,data,flags,dtr0]
 
 volatile uint8_t scan_full_addr;
 volatile uint8_t scan_full_step;
@@ -114,16 +103,10 @@ void dali_sync_init(void) {
     group_write.reg_addr        = 0xFFFFu;
     group_write.pending_adds    = 0;
     group_write.pending_removes = 0;
-    // Raw command queue empty; ring cleared; status ids "none".
-    gwq_head  = 0;
-    gwq_count = 0;
-    for (uint8_t i = 0; i < GWQ_RING; i++) {
-        gwq_ring[i].result = 0;
-        gwq_ring[i].answer = 0;
-    }
-    q_accepted_id  = 0;
-    q_executing_id = 0;
-    q_completed_id = 0;
+    // Generic slot queue: all slots idle (a reboot's "idle means gone" signal
+    // to the controller — no cross-reboot queue state is kept).
+    mbq_init();
+    s_raw_slot = 0;
     scan_full_addr = 0xFF;
     scan_full_step = 0;
     scan_cursor    = 0;
@@ -319,26 +302,24 @@ void dali_sync_dispatch_current(void) {
             issue_dali_command(short_addr, step, DALI_KIND_TWICE, 2u);
             break;
         case OP_RAW: {
-            // Execute the queue head entry.  A QF_DTR0 record is a two-step
-            // atomic sequence: step 0 preloads DTR0 (0xA3<dtr0>), step 1 sends
-            // the frame — back-to-back with nothing interleaved, because
-            // dali_busy stays held across the pair (the whole point of keeping
-            // the DTR0 preload in the same queue entry).
-            uint8_t idflags = gwq[gwq_head].idflags;
-            uint8_t flags   = GWQ_FLAGS(idflags);
-            q_executing_id  = GWQ_ID(idflags);   // 8-bit store is atomic on AVR
+            // DALI adapter: unpack the executing slot's opaque command
+            // [addr, data, flags, dtr0] and issue it.  A QF_DTR0 command is a
+            // two-step atomic sequence — step 0 preloads DTR0 (0xA3<dtr0>), step 1
+            // sends the frame — back-to-back with nothing interleaved because
+            // dali_busy stays held across the pair (one slot's lifecycle).
+            uint8_t flags = s_raw_cmd[2];
 
             if ((flags & QF_DTR0) && step == 0u) {
-                issue_dali_command(DALI_ADDR_SET_DTR0, gwq[gwq_head].dtr0,
+                issue_dali_command(DALI_ADDR_SET_DTR0, s_raw_cmd[3],
                                    DALI_KIND_CMD, 1u);
                 break;
             }
-            // Terminal frame.  KIND selection from the explicit flags:
-            //   QF_TWICE  → send twice (SET-class / RAW_CMD_TWICE), no answer.
+            // Terminal frame.  KIND selection from the flags byte:
+            //   QF_TWICE  → send twice (SET-class), no answer.
             //   QF_ANSWER → KIND_QUERY, open the backward-frame window.
             //   else      → KIND_CMD, completes immediately (no 22 TE wait).
-            uint8_t a = gwq[gwq_head].addr;
-            uint8_t d = gwq[gwq_head].data;
+            uint8_t a = s_raw_cmd[0];
+            uint8_t d = s_raw_cmd[1];
             if (flags & QF_TWICE)
                 issue_dali_command(a, d, DALI_KIND_TWICE, 2u);
             else if (flags & QF_ANSWER)
@@ -460,15 +441,21 @@ static bool pick_work(void) {
         return true;
     }
 
-    // 2. Raw command queue non-empty.  The head entry executes next; a
-    //    queued command therefore preempts all background polling
-    //    (priorities 4-7) — the gateway's own idle work always yields to
-    //    the queue, so a submitted toggle runs within ~1-2 frame times.
-    if (gwq_count > 0u) {
-        current_op.op   = OP_RAW;
-        current_op.addr = 0xFFu;
-        current_op.step = 0;
-        return true;
+    // 2. Generic slot queue has a pending command.  It preempts all background
+    //    polling (priorities 4-7) — the gateway's own idle work always yields to
+    //    the queue, so a submitted toggle runs within ~1-2 frame times.  Begin the
+    //    lowest accept-sequence pending slot: mbq_begin marks it EXECUTING and
+    //    copies its opaque command for the DALI adapter (dispatch) to unpack.
+    {
+        uint8_t slot = mbq_next_pending();
+        if (slot != MBQ_NONE) {
+            mbq_begin(slot, s_raw_cmd);
+            s_raw_slot      = slot;
+            current_op.op   = OP_RAW;
+            current_op.addr = 0xFFu;
+            current_op.step = 0;
+            return true;
+        }
     }
 
     // 3. Group bit-change pending.
@@ -596,76 +583,12 @@ bool start_next_dali_work(void) {
 }
 
 // ---- Raw command queue ----------------------------------------------
-
-// Append one already-built record to the tail.  Caller holds the TCB0+ATOMIC
-// fence and has verified a free slot exists.  GWQ_DEPTH is a power of two so
-// the tail index is a cheap mask, not a modulo.
-static void gwq_push_locked(uint8_t addr, uint8_t data, uint8_t idflags, uint8_t dtr0) {
-    uint8_t tail = (uint8_t)((gwq_head + gwq_count) & (GWQ_DEPTH - 1u));
-    gwq[tail].addr    = addr;
-    gwq[tail].data    = data;
-    gwq[tail].idflags = idflags;
-    gwq[tail].dtr0    = dtr0;
-    gwq_count++;
-}
-
-uint8_t gwq_free_slots(void) {
-    uint8_t freeslots;
-    uint8_t old_tcb = TCB0.INTCTRL;
-    TCB0.INTCTRL = 0;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        freeslots = (uint8_t)(GWQ_DEPTH - gwq_count);
-    }
-    TCB0.INTCTRL = old_tcb;
-    return freeslots;
-}
-
-bool gwq_submit(const uint8_t *regs, uint8_t n) {
-    bool ok = false;
-    uint8_t old_tcb = TCB0.INTCTRL;
-    TCB0.INTCTRL = 0;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        // All-or-nothing: enqueue every record or none.
-        if (n > 0u && (uint8_t)(GWQ_DEPTH - gwq_count) >= n) {
-            uint8_t last_id = q_accepted_id;
-            for (uint8_t i = 0; i < n; i++) {
-                const uint8_t *r = regs + (uint16_t)i * 4u;
-                // r[0]=[addr], r[1]=[data], r[2]=[id|flags], r[3]=[dtr0].
-                gwq_push_locked(r[0], r[1], r[2], r[3]);
-                last_id = GWQ_ID(r[2]);
-            }
-            q_accepted_id = last_id;   // id of the LAST record accepted
-            ok = true;
-        }
-    }
-    TCB0.INTCTRL = old_tcb;
-    return ok;
-}
-
-void gwq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
-    uint8_t old_tcb = TCB0.INTCTRL;
-    TCB0.INTCTRL = 0;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        for (uint8_t i = 0; i < count; i++) {
-            uint8_t s = (uint8_t)(sidx + i);
-            uint8_t hi, lo;
-            if (s == 0u) {              // QSTAT  [free_slots | accepted_id]
-                hi = (uint8_t)(GWQ_DEPTH - gwq_count);
-                lo = q_accepted_id;
-            } else if (s == 1u) {       // QPROG  [executing_id | completed_id]
-                hi = q_executing_id;
-                lo = q_completed_id;
-            } else {                    // QRES[s-2]  [result | answer]
-                uint8_t slot = (uint8_t)((s - 2u) & (GWQ_RING - 1u));
-                hi = gwq_ring[slot].result;
-                lo = gwq_ring[slot].answer;
-            }
-            out[(uint16_t)i * 2u]      = hi;
-            out[(uint16_t)i * 2u + 1u] = lo;
-        }
-    }
-    TCB0.INTCTRL = old_tcb;
-}
+//
+// The generic slot queue (submit / status / accept-sequence / lifecycle) moved
+// to mbq_slots.c for queue v2.  The DALI adapter for it is the OP_RAW arms of
+// pick_work / dali_sync_dispatch_current / dali_sync_completion above, which
+// unpack a slot's opaque command into DALI frames and map the DALI terminal to
+// (status, response8) via mbq_complete.
 
 bool dali_sync_arm_commission(uint8_t mode, uint8_t target) {
     bool armed   = false;
@@ -1100,13 +1023,11 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         }
 
         case OP_RAW: {
-            uint8_t idflags = gwq[gwq_head].idflags;
-            uint8_t flags   = GWQ_FLAGS(idflags);
-            uint8_t id      = GWQ_ID(idflags);
+            uint8_t flags = s_raw_cmd[2];
 
             // DTR0 preload step just finished (no backward frame → OK/NAK is
-            // "done").  Advance to the frame; a real bus error aborts the whole
-            // command and falls through to terminal handling.
+            // "done").  Advance to the frame within the SAME slot lifecycle; a real
+            // bus error falls through to terminal handling below.
             if ((flags & QF_DTR0) && step == 0u
                 && (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK)) {
                 current_op.step = 1u;
@@ -1114,30 +1035,21 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 break;
             }
 
-            // Terminal outcome for this command.  `result` is 0x00 OK / 0x01
-            // NAK / 0x02 ERR; `answer` holds the backward-frame byte on OK, or
-            // the error subtype on ERR (no answer exists in either non-OK case).
-            uint8_t res, ans;
-            if (type == DALI_RESPONSE_OK)       { res = 0x00u; ans = value; }
-            else if (type == DALI_RESPONSE_NAK) { res = 0x01u; ans = 0x00u; }
-            else { res = 0x02u; ans = (uint8_t)((type - DALI_RESPONSE_MALFORMED) + 1u); }
-
-            // Land the result in the ring (slot = id & 7), THEN advance
-            // completed_id.  This order is load-bearing: a fenced Modbus status
-            // read (gwq_read_status) must never see completed_id reach an id
-            // whose ring slot is not yet written.  Runs in ISR (LVL1); the
-            // readers fence LVL1 (TCB0=0), so they see a consistent snapshot.
-            uint8_t slot = (uint8_t)(id & (GWQ_RING - 1u));
-            gwq_ring[slot].result = res;
-            gwq_ring[slot].answer = ans;
-            q_completed_id = id;
-
-            // Dequeue the head and free its slot.
-            gwq_head = (uint8_t)((gwq_head + 1u) & (GWQ_DEPTH - 1u));
-            gwq_count--;
-            q_executing_id = 0u;
-            // more stays false → release dali_busy; the work selector picks the
-            // next queued entry (if any) on the following main-loop pass.
+            // Terminal.  Map the DALI outcome to the slot's (status, response8):
+            //   OK        → COMPLETE, response8 = backward-frame answer (0 if none)
+            //   NAK       → FAILED,   DALI_RESP_NAK       (no/short backward frame)
+            //   MALFORMED → FAILED,   DALI_RESP_COLLISION (garbled backward frame)
+            //   other     → FAILED,   DALI_RESP_BUSFAULT  (transport-level fault)
+            // mbq_complete writes response8 BEFORE status under the read fence, so a
+            // fenced status read never sees a terminal status with a stale value.
+            uint8_t st, r8;
+            if      (type == DALI_RESPONSE_OK)        { st = MBQ_S_COMPLETE; r8 = value; }
+            else if (type == DALI_RESPONSE_NAK)       { st = MBQ_S_FAILED;   r8 = DALI_RESP_NAK; }
+            else if (type == DALI_RESPONSE_MALFORMED) { st = MBQ_S_FAILED;   r8 = DALI_RESP_COLLISION; }
+            else                                      { st = MBQ_S_FAILED;   r8 = DALI_RESP_BUSFAULT; }
+            mbq_complete(s_raw_slot, st, r8);
+            // more stays false → release dali_busy; the arbiter picks the next
+            // pending slot (if any) on the following main-loop pass.
             break;
         }
 

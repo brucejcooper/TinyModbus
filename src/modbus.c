@@ -9,6 +9,7 @@
 
 #include "modbus.h"
 #include "registers.h"
+#include "mbq_slots.h"
 #include "dali.h"
 #include "dali_sync.h"
 
@@ -230,9 +231,10 @@ static void send_error(mb_err_t err) {
     start_tx(3);
 }
 
-// The raw command queue lives in dali_sync.c (gwq[] + result ring + status
-// ids).  Cache invalidation is handled centrally in issue_dali_command for
-// every DALI source — there is no separate raw-command classification step.
+// The generic slot command queue lives in mbq_slots.c; its DALI adapter (unpack +
+// issue + terminal mapping) is the OP_RAW arms of dali_sync.c.  Cache invalidation
+// is handled centrally in issue_dali_command for every DALI source — there is no
+// separate raw-command classification step.
 // Fade tracking is a natural consequence of SYNC_READ_LEVEL being set by the
 // unified invalidation path.
 
@@ -315,16 +317,15 @@ static void process_fc04(void) {
         return;
     }
 
-    // Raw-command-queue status block at MBREG_QSTAT_BASE (0x1010), 1..10
-    // registers, served identically under FC04 and FC03.  Not backed by
-    // register_map_t — served from the queue module (dali_sync.c), which fences
-    // the reads against the LVL1 completion writer.  A controller reads all 10
-    // (QSTAT+QPROG+QRES[8]); a partial read is fine.
+    // Slot status block at MBREG_QSTAT_BASE (0x1010), 1..8 registers, served
+    // identically under FC04 and FC03.  Not backed by register_map_t — served
+    // from the generic queue module (mbq_slots.c), which fences each slot's
+    // [status|response8] read against the LVL1 completion writer.
     if (addr >= MBREG_QSTAT_BASE
-        && (uint32_t)addr + count <= (uint32_t)MBREG_QSTAT_BASE + GWQ_STATUS_REGS
+        && (uint32_t)addr + count <= (uint32_t)MBREG_QSTAT_BASE + MBQ_SLOTS
         && count >= 1u) {
         buf[2] = (uint8_t)(count * 2u);
-        gwq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), (uint8_t)count, buf + 3);
+        mbq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), (uint8_t)count, buf + 3);
         start_tx(3 + buf[2]);
         return;
     }
@@ -412,18 +413,22 @@ static bool read_holding_block(uint16_t addr, uint16_t count) {
     return true;
 }
 
-// Validate + execute a write to the raw-command-queue submit window (0x1000),
-// shared by FC10 and the write half of FC23.  `regs` points at wr_count*2 bytes
-// of command-record data in wire order.  Returns a Modbus error code (0 on
-// success): wrong base → ILLEGAL_ADDRESS; odd/zero/too-many registers or a
-// reserved id 0 in any record → ILLEGAL_VALUE; too few free slots → DEVICE_BUSY.
+// Validate + execute a write to the v2 slot command block (0x1000-0x100F),
+// shared by FC10 and the write half of FC23.  A write covers 1..8 CONTIGUOUS
+// slots: wr_addr = MBREG_QCMD_BASE + 2*first_slot, wr_count = 2*n_slots.  `regs`
+// points at wr_count*2 bytes of opaque command data in wire order.  Returns a
+// Modbus error (0 on success): out-of-range / mis-aligned base → ILLEGAL_ADDRESS;
+// odd/zero register count → ILLEGAL_VALUE; any targeted slot active → DEVICE_BUSY
+// (all-or-nothing — mbq_submit changes nothing on a reject).
 static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t *regs) {
-    if (wr_addr != MBREG_QCMD_BASE)                             return MB_ERR_ILLEGAL_ADDRESS;
-    if ((wr_count & 1u) || wr_count == 0u || wr_count > 8u)     return MB_ERR_ILLEGAL_VALUE;
-    uint8_t n = (uint8_t)(wr_count / 2u);
-    for (uint8_t i = 0; i < n; i++)
-        if (GWQ_ID(regs[(uint16_t)i * 4u + 2u]) == 0u)          return MB_ERR_ILLEGAL_VALUE;
-    if (!gwq_submit(regs, n))                                   return MB_ERR_DEVICE_BUSY;
+    if (wr_addr < MBREG_QCMD_BASE || wr_addr > MBREG_QCMD_END)  return MB_ERR_ILLEGAL_ADDRESS;
+    uint16_t off = (uint16_t)(wr_addr - MBREG_QCMD_BASE);
+    if (off & 1u)                                              return MB_ERR_ILLEGAL_ADDRESS;  // slot boundary
+    if ((wr_count & 1u) || wr_count == 0u)                     return MB_ERR_ILLEGAL_VALUE;
+    if ((uint32_t)wr_addr + wr_count > (uint32_t)MBREG_QCMD_END + 1u) return MB_ERR_ILLEGAL_ADDRESS;
+    uint8_t first_slot = (uint8_t)(off / 2u);
+    uint8_t n_slots    = (uint8_t)(wr_count / 2u);
+    if (!mbq_submit(first_slot, regs, n_slots))               return MB_ERR_DEVICE_BUSY;
     return 0;
 }
 
@@ -598,7 +603,7 @@ static void process_fc23(void) {
     // --- WRITE FIRST ---
     // The only writable FC23 target is the queue submit window.  wr_count == 0
     // is allowed: a read-only FC23 (pure status/collect poll, no new submit).
-    // wr_data starts at buf[11]; submit_window (via gwq_submit) copies it out
+    // wr_data starts at buf[11]; submit_window (via mbq_submit) copies it out
     // before we build the response into buf, so the later overwrite is safe.
     // An exception here replaces the whole response, so nothing is read.
     if (wr_count > 0u) {

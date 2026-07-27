@@ -37,7 +37,7 @@ typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
 //   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
 //   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
 //   0x0200         version block     16-register special case (see process_fc04)
-//   0x1010-0x1019  queue status block (see MBREG_QSTAT_BASE; also served under FC03)
+//   0x1010-0x1019  queue status block (see MBREG_SLOT_STATUS_BASE; also served under FC03)
 typedef struct {
     ballast_bs_t   block0[64];          // 0x0000  status | brightness (live arc level)
     uint16_t       present[4];          // 0x0100  present/dirty kept contiguous so the
@@ -100,8 +100,8 @@ extern volatile uint8_t  g_reset_reason;
 // A write covers 1..8 contiguous slots and is ALL-OR-NOTHING: if ANY targeted
 // slot is ACTIVE (pending/executing) the whole write is rejected with
 // SLAVE_DEVICE_BUSY (0x06).  idle + collected-terminal slots are writable.
-#define MBREG_QCMD_BASE         0x1000u  // slot 0 command; block spans 0x1000-0x100F
-#define MBREG_QCMD_END          0x100Fu  // 8 slots × 2 registers, inclusive
+#define MBREG_SLOT_CMD_BASE         0x1000u  // slot 0 command; block spans 0x1000-0x100F
+#define MBREG_SLOT_CMD_END          0x100Fu  // 8 slots × 2 registers, inclusive
 
 // Status block (gateway-write; served at the SAME addresses under FC03 holding —
 // FC23's read range targets it — and FC04 input): 8 slots × 1 reg.
@@ -110,8 +110,8 @@ extern volatile uint8_t  g_reset_reason;
 //   complete (backward-frame answer, or 0 for a no-answer command) or the code
 //   on failed.  The gateway writes response8 BEFORE status under the read fence,
 //   so a fenced read never sees a terminal status with a stale response8.
-#define MBREG_QSTAT_BASE        0x1010u  // slot 0 status; block spans 0x1010-0x1017
-#define MBREG_QSTAT_END         0x1017u  // 8 slots × 1 register, inclusive
+#define MBREG_SLOT_STATUS_BASE        0x1010u  // slot 0 status; block spans 0x1010-0x1017
+#define MBREG_SLOT_STATUS_END         0x1017u  // 8 slots × 1 register, inclusive
 
 // ---- Action / config registers (relocated to 0x1F00+) ---------------------
 

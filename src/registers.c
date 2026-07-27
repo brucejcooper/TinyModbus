@@ -173,9 +173,9 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
     // slot register is independently fenced and self-describing, so a tear across
     // slots is benign (slots reconcile independently).  0x1018-0x1019 fall through
     // to ILLEGAL DATA ADDRESS (retired v1 QRES[6/7]).
-    if (addr >= MBREG_QSTAT_BASE && addr <= MBREG_QSTAT_END) {
+    if (addr >= MBREG_SLOT_STATUS_BASE && addr <= MBREG_SLOT_STATUS_END) {
         uint8_t out[2];
-        mbq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), 1u, out);
+        mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE), 1u, out);
         *val = ((uint16_t)out[0] << 8) | out[1];
         return true;
     }

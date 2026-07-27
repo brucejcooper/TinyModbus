@@ -317,15 +317,15 @@ static void process_fc04(void) {
         return;
     }
 
-    // Slot status block at MBREG_QSTAT_BASE (0x1010), 1..8 registers, served
+    // Slot status block at MBREG_SLOT_STATUS_BASE (0x1010), 1..8 registers, served
     // identically under FC04 and FC03.  Not backed by register_map_t — served
     // from the generic queue module (mbq_slots.c), which fences each slot's
     // [status|response8] read against the LVL1 completion writer.
-    if (addr >= MBREG_QSTAT_BASE
-        && (uint32_t)addr + count <= (uint32_t)MBREG_QSTAT_BASE + MBQ_SLOTS
+    if (addr >= MBREG_SLOT_STATUS_BASE
+        && (uint32_t)addr + count <= (uint32_t)MBREG_SLOT_STATUS_BASE + MBQ_SLOTS
         && count >= 1u) {
         buf[2] = (uint8_t)(count * 2u);
-        mbq_read_status((uint8_t)(addr - MBREG_QSTAT_BASE), (uint8_t)count, buf + 3);
+        mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE), (uint8_t)count, buf + 3);
         start_tx(3 + buf[2]);
         return;
     }
@@ -415,17 +415,17 @@ static bool read_holding_block(uint16_t addr, uint16_t count) {
 
 // Validate + execute a write to the v2 slot command block (0x1000-0x100F),
 // shared by FC10 and the write half of FC23.  A write covers 1..8 CONTIGUOUS
-// slots: wr_addr = MBREG_QCMD_BASE + 2*first_slot, wr_count = 2*n_slots.  `regs`
+// slots: wr_addr = MBREG_SLOT_CMD_BASE + 2*first_slot, wr_count = 2*n_slots.  `regs`
 // points at wr_count*2 bytes of opaque command data in wire order.  Returns a
 // Modbus error (0 on success): out-of-range / mis-aligned base → ILLEGAL_ADDRESS;
 // odd/zero register count → ILLEGAL_VALUE; any targeted slot active → DEVICE_BUSY
 // (all-or-nothing — mbq_submit changes nothing on a reject).
 static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t *regs) {
-    if (wr_addr < MBREG_QCMD_BASE || wr_addr > MBREG_QCMD_END)  return MB_ERR_ILLEGAL_ADDRESS;
-    uint16_t off = (uint16_t)(wr_addr - MBREG_QCMD_BASE);
+    if (wr_addr < MBREG_SLOT_CMD_BASE || wr_addr > MBREG_SLOT_CMD_END)  return MB_ERR_ILLEGAL_ADDRESS;
+    uint16_t off = (uint16_t)(wr_addr - MBREG_SLOT_CMD_BASE);
     if (off & 1u)                                              return MB_ERR_ILLEGAL_ADDRESS;  // slot boundary
     if ((wr_count & 1u) || wr_count == 0u)                     return MB_ERR_ILLEGAL_VALUE;
-    if ((uint32_t)wr_addr + wr_count > (uint32_t)MBREG_QCMD_END + 1u) return MB_ERR_ILLEGAL_ADDRESS;
+    if ((uint32_t)wr_addr + wr_count > (uint32_t)MBREG_SLOT_CMD_END + 1u) return MB_ERR_ILLEGAL_ADDRESS;
     uint8_t first_slot = (uint8_t)(off / 2u);
     uint8_t n_slots    = (uint8_t)(wr_count / 2u);
     if (!mbq_submit(first_slot, regs, n_slots))               return MB_ERR_DEVICE_BUSY;
@@ -532,7 +532,7 @@ static void process_fc10(void) {
     // one all-or-nothing submit of count/2 command records.  Handled here,
     // before the per-register loop, because it is a block operation (the record
     // count and all-or-nothing free-slot check need the whole write at once).
-    if (addr == MBREG_QCMD_BASE) {
+    if (addr == MBREG_SLOT_CMD_BASE) {
         mb_err_t e = submit_window(addr, count, buf + 7);
         if (e) { send_error(e); return; }
         start_tx(6);   // standard FC10 echo (addr, fc, start, count)

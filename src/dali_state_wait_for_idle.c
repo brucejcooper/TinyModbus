@@ -41,12 +41,11 @@ static void on_idle_bus(void) {
 static void bus_stuck_timeout(void) {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     dali_cancel_edge_detect();
-    dali_busy = false;
-    current_op.op = OP_NONE;
-    if (commission_state.phase != COM_IDLE) {
-        commission_state.status = COMM_STATUS_ERR_BUS_STUCK;
-        commission_state.phase  = COM_IDLE;
-    }
+    // Fail the in-flight queue command with a bus-fault code. TASK 05: this
+    // used to abort a gateway-side commissioning run; commissioning now lives on
+    // the controller, and what must not happen is leaving a slot EXECUTING
+    // forever — the controller would wait on a command that can never finish.
+    dali_sync_abort_busfault();
     dali_idle_state_enter();
 }
 

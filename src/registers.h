@@ -38,21 +38,17 @@ typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
 //   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
 //   0x0200         version block     16-register special case (see process_fc04)
 //   0x1010-0x1017  queue status block, 8 slots (see MBREG_SLOT_STATUS_BASE; also served under FC03)
-typedef struct {
-    ballast_bs_t   block0[64];          // 0x0000  status | brightness (live arc level)
-    uint16_t       present[4];          // 0x0100  present/dirty kept contiguous so the
-    uint16_t       dirty[4];            // 0x0104  0x0100-0x0107 FC04 ladder is one memcpy
-    uint8_t        group_mask[16][8];   // group membership (0x0110-0x014F)
-} register_map_t;
-
-extern register_map_t g_regs;
-
-// ---- FC04 input register addresses ----------------------------------------
-
-#define FC04_PRESENT_BASE   0x0100u  // first FC04 input register (start of contiguous ladder)
-#define FC04_DIRTY_BASE     0x0104u  // first dirty word register (4 words: 0x0104-0x0107)
-#define FC04_DIRTY_END      0x0107u  // last dirty word register
-#define FC04_INPUT_END      0x0107u  // inclusive end of the contiguous FC04 ladder
+// TASK 05 — STATELESS PIPE: there is no register map any more.
+//
+// block0 (arc/status), present[], dirty[] and group_mask[] are DELETED. They
+// were the gateway's cache of the bus, and the whole point of the strip is that
+// the gateway caches nothing: the controller interrogates the ballasts and holds
+// the only copy. That removes ~672 B of SRAM and makes a gateway reboot
+// consequence-free, since there is no longer any state to lose.
+//
+// Their addresses (0x0000-0x00FF, 0x0100-0x0107, 0x0110-0x014F) now return
+// ILLEGAL DATA ADDRESS. A client still reading them is a version mismatch and
+// should fail loudly rather than receive plausible zeros.
 
 // ---- FC04 / FC03 special block addresses ----------------------------------
 
@@ -115,37 +111,11 @@ extern volatile uint8_t  g_reset_reason;
 
 // ---- Action / config registers (relocated to 0x1F00+) ---------------------
 
-// Bus scan - write 0x0001 to trigger a full bus scan
-#define MBREG_SCAN_TRIGGER      0x1F00u
 
-// Configuration registers - all persisted to USERROW (survives chip erase +
-// reflash so a re-flashed unit keeps its address / baud / rescan interval).
-// Each write triggers a NVMCTRL page-erase-write (~3.4 ms, CPU halted) and
-// is skipped if the value already matches.  Runtime baud/slave switches are
-// deferred until the FC06/FC10 response has cleared the wire.
-#define MBREG_RESCAN_INTERVAL   0x1F01u  // seconds between periodic bus rescans; 0 = disabled
 #define MBREG_SLAVE_ADDR        0x1F02u  // Modbus slave address, 1-247
 #define MBREG_BAUD_INDEX        0x1F03u  // 0=9600 1=19200 2=38400
 
-// IEC 62386-102 commissioning channel.  Write triggers a run, read returns
-// the live status word with read-clears semantics on terminal high bytes.
-// See dali_sync.h COMM_STATUS_* macros for the wire-format encoding.
-//
-//   Write 0x0000 — abort (no-op if idle / already terminal)
-//   Write 0x0001 — start full commissioning (wipes existing addresses)
-//   Write 0x0002 — start incremental commissioning (preserves addressed gear)
-//   Write 0x03YY — re-provision the gear currently at short address YY (0..63)
-//                  onto the lowest free addresses (fixes a collision at YY;
-//                  leaves all other gear untouched)
-//   Write any other value → ILLEGAL_VALUE
-//   Write a valid command while already running → DEVICE_BUSY
-#define MBREG_COMMISSION        0x1F04u
 
-#define MBREG_COMM_REPROV_BASE  0x0300u   // OR with the target short address (0..63)
-// True if `v` is a syntactically valid MBREG_COMMISSION write command.  Used by
-// the FC06/FC10 handlers to choose ILLEGAL_VALUE vs DEVICE_BUSY on a failed arm.
-#define MBREG_COMM_VALID(v) \
-    ((v) <= 2u || (((v) & 0xFF00u) == MBREG_COMM_REPROV_BASE && ((v) & 0x00FFu) < 64u))
 
 // System reset.  Write the magic value 0xA5A5 to force an immediate software
 // reset of the gateway (RSTCTRL software reset) once the Modbus ACK for this
@@ -175,13 +145,7 @@ uint8_t  userrow_get_slave_addr(void);
 bool     userrow_set_slave_addr(uint8_t addr);    // false on out-of-range
 uint8_t  userrow_get_baud_index(void);
 bool     userrow_set_baud_index(uint8_t idx);     // false on out-of-range
-uint16_t userrow_get_rescan_interval(void);
-bool     userrow_set_rescan_interval(uint16_t v);
 
-// Copy count FC04 input registers starting at addr into buf (big-endian, 2 bytes each).
-// The register_map_t layout mirrors the FC04 address space, so this is a direct memcpy.
-// Caller must validate addr and count before calling.
-void     regs_read_input_bulk(uint16_t addr, uint8_t count, uint8_t *buf);
 
 // Read one FC03 holding register at addr into *val.
 // Returns false for any address not in the holding register map.
@@ -192,27 +156,10 @@ bool     regs_read_holding(uint16_t addr, uint16_t *val);
 // Does NOT enqueue DALI commands - dispatch_action_reg in modbus.c does that.
 bool     regs_write_holding(uint16_t addr, uint16_t val);
 
-// Store one field from a DALI query response into the appropriate register block.
-// Called from ISR context via dali_result_received; must be short.
-void     regs_apply_result(uint8_t ballast_idx, reg_target_t target, uint8_t value);
 
-// Apply a DALI status byte: updates block0.status and sets the dirty bit.
-// The FADE_RUNNING bit is observable directly via the status byte (bit 4) — there
-// is no separate fading bitmap to maintain.
-void     regs_apply_status(uint8_t ballast_idx, uint8_t dali_status);
 
-// Set or clear the present bit for ballast_idx in the present bitmask.
-void     regs_set_present(uint8_t ballast_idx, bool present);
 
-// Reset all register fields for ballast_idx to absent/default and clear its present bit.
-void     regs_clear_ballast(uint8_t ballast_idx);
 
-// Atomically snapshot and clear dirty[word_idx] (covers ballasts word_idx*16 to word_idx*16+15).
-// Called by modbus FC04 handler to detect changed ballasts since the last read.
-uint16_t regs_read_clear_dirty(uint8_t word_idx);
 
-// Recompute group membership for ballast_idx from a QUERY_GROUP response byte.
-// high_groups=false → groups 0-7; high_groups=true → groups 8-15.
-void     regs_update_group_mask(uint8_t ballast_idx, uint8_t bits, bool high_groups);
 
 #endif

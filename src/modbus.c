@@ -256,9 +256,10 @@ static void send_error(mb_err_t err) {
 // uint32_t prevents wrap (e.g. addr=0xFFFF, count=1 -> 0) from sneaking
 // through the upper-bound check.
 static bool fc04_range_allowed(uint16_t addr, uint8_t count) {
-    uint32_t end = (uint32_t)addr + count;  // exclusive
-    // Single contiguous FC04 ladder: present[4] | dirty[4].
-    if (addr >= FC04_PRESENT_BASE && end <= (uint32_t)FC04_INPUT_END + 1u) return true;
+    (void)addr; (void)count;
+    // TASK 05: the contiguous FC04 ladder (present[4] | dirty[4] at 0x0100-0x0107)
+    // is GONE with the gateway's cache. The only FC04 blocks left are the
+    // version, diag and sysinfo special cases, each handled before this check.
     return false;
 }
 
@@ -340,50 +341,6 @@ static void process_fc04(void) {
     }
 
     buf[2] = (uint8_t)(count * 2u);
-    regs_read_input_bulk(addr, (uint8_t)count, buf + 3);
-
-    // present[] (0x0100-0x0103) are uint16_t held in AVR little-endian memory, so
-    // the bulk memcpy above shipped each word low-byte-first — but Modbus
-    // registers are big-endian.  That byte-swap made the master read every
-    // presence bit shifted by 8 (a ballast at short address 0 reported at 8, 1 at
-    // 9, …).  Re-emit each present word high-byte-first, the same big-endian
-    // fix-up dirty[] already gets below.  (block0 and group_mask are byte-pair
-    // structs, already in wire order — only these uint16_t bitmask words swap.)
-    // Fence the LVL1 completion handler (regs_set_present) so the 16-bit reads
-    // cannot tear.
-    if (addr <= FC04_PRESENT_BASE + 3u && addr + count > FC04_PRESENT_BASE) {
-        uint16_t p_start = (addr < FC04_PRESENT_BASE) ? FC04_PRESENT_BASE : addr;
-        uint16_t p_end   = (uint16_t)((addr + count - 1u > FC04_PRESENT_BASE + 3u)
-                                      ? FC04_PRESENT_BASE + 3u : (addr + count - 1u));
-        uint8_t old_tcb = TCB0.INTCTRL;
-        TCB0.INTCTRL = 0;
-        for (uint16_t a = p_start; a <= p_end; a++) {
-            uint16_t v   = g_regs.present[a - FC04_PRESENT_BASE];
-            uint16_t off = (uint16_t)((a - addr) * 2u);
-            buf[3 + off]      = (uint8_t)(v >> 8);
-            buf[3 + off + 1u] = (uint8_t)v;
-        }
-        TCB0.INTCTRL = old_tcb;
-    }
-
-    // If the read range covers any dirty-flag words, atomically read-and-clear
-    // each one and OVERWRITE the corresponding bytes in buf with the captured
-    // value.  Without this overwrite, an ISR setting a new dirty bit between
-    // the bulk-read above and the clear below would: (1) be sent to the
-    // master as 0 in the bulk-read snapshot, then (2) be wiped by the clear
-    // before the next FC04 - silently losing the update.  The atomic
-    // read-and-clear inside regs_read_clear_dirty captures the up-to-the-
-    // moment state, which we then ship to the master.
-    if (addr + count > FC04_DIRTY_BASE && addr <= FC04_DIRTY_END) {
-        uint16_t d_start = (addr < FC04_DIRTY_BASE) ? FC04_DIRTY_BASE : addr;
-        uint16_t d_end   = (addr + count - 1u > FC04_DIRTY_END) ? FC04_DIRTY_END : (addr + count - 1u);
-        for (uint16_t a = d_start; a <= d_end; a++) {
-            uint16_t fresh   = regs_read_clear_dirty((uint8_t)(a - FC04_DIRTY_BASE));
-            uint16_t buf_off = (uint16_t)(a - addr) * 2u;
-            buf[3 + buf_off]      = (uint8_t)(fresh >> 8);
-            buf[3 + buf_off + 1u] = (uint8_t)fresh;
-        }
-    }
 
     start_tx(3 + buf[2]);
 }
@@ -445,26 +402,11 @@ static void process_fc03(void) {
 
 // Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
 //
-// Raw DALI commands go through the command queue (submit window 0x1000), not
-// through here.  This handles the surviving action registers: MBREG_SCAN_TRIGGER
-// (sets SYNC_READ_SETTINGS | SYNC_READ_LEVEL on all ballasts) and
-// MBREG_SYSTEM_RESET.  Per-ballast level writes (0x0000-0x003F) and group
-// register writes (0x0110-0x014F) are handled directly by regs_write_holding
-// via the SYNC_WRITE_LEVEL / group_write paths and do not reach this function.
+// DALI commands go through the command queue (submit window 0x1000), not through
+// here. After the task-05 strip the ONLY action register left is
+// MBREG_SYSTEM_RESET — scan-trigger, rescan-interval and commissioning all went
+// with the gateway's state.
 static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
-    if (mb_reg == MBREG_SCAN_TRIGGER) {
-        // Set BOTH SYNC_READ_SETTINGS and SYNC_READ_LEVEL on all 64 ballasts.
-        // The work selector services them one at a time via issue_dali_command.
-        // Both are needed: SYNC_READ_SETTINGS re-fetches group membership,
-        // SYNC_READ_LEVEL re-fetches the live arc level/status.  A master-driven
-        // rescan should refresh everything, so the gateway's cached brightness
-        // tracks reality (mirrors the boot scan in main.c).
-        if (val == 0x0001) {
-            for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
-                sync_flags_set(i, SYNC_READ_SETTINGS | SYNC_READ_LEVEL);
-        }
-        return 0;
-    }
     if (mb_reg == MBREG_SYSTEM_RESET) {
         // regs_write_holding already validated the magic value.  Latch the
         // reset; fire_pending_reset() reboots once the ACK has left the wire.
@@ -500,14 +442,10 @@ static void process_fc06(void) {
         //   - 0x1014 commissioning write with an invalid value (illegal value)
         //   - 0x1014 commissioning write while running (busy)
         //   - everything else is genuine ILLEGAL_ADDRESS.
-        if (addr == MBREG_COMMISSION) {
-            if (!MBREG_COMM_VALID(val)) send_error(MB_ERR_ILLEGAL_VALUE);
-            else                        send_error(MB_ERR_DEVICE_BUSY);
-        } else if (addr >= 0x0110u && addr <= 0x014Fu && dali_sync_group_busy()) {
-            send_error(MB_ERR_DEVICE_BUSY);
-        } else {
-            send_error(MB_ERR_ILLEGAL_ADDRESS);
-        }
+        /* TASK 05: the commissioning register and the group-mask registers are
+         * gone, and with them the only two writes that could fail for a reason
+         * other than "no such register". A rejected write is now unambiguous. */
+        send_error(MB_ERR_ILLEGAL_ADDRESS);
         return;
     }
     note_runtime_config_write(addr);
@@ -564,14 +502,7 @@ static void process_fc10(void) {
         payload_ptr += 2;
         if (!regs_write_holding(r, reg_value)) {
             // Same BUSY-vs-ILLEGAL distinction as FC06.
-            if (r == MBREG_COMMISSION) {
-                if (!MBREG_COMM_VALID(reg_value)) send_error(MB_ERR_ILLEGAL_VALUE);
-                else                             send_error(MB_ERR_DEVICE_BUSY);
-            } else if (r >= 0x0110u && r <= 0x014Fu && dali_sync_group_busy()) {
-                send_error(MB_ERR_DEVICE_BUSY);
-            } else {
-                send_error(MB_ERR_ILLEGAL_ADDRESS);
-            }
+            send_error(MB_ERR_ILLEGAL_ADDRESS);   /* see process_fc06 */
             return;
         }
         note_runtime_config_write(r);

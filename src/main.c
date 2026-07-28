@@ -114,20 +114,9 @@ int main(void) {
 
     sei();
 
-    // Initial bus scan: arm BOTH SYNC_READ_SETTINGS and SYNC_READ_LEVEL on every
-    // ballast.  The work selector services them one at a time via the unified
-    // DALI issuance path (which sets the present bit on first OK response).
-    //
-    // Both flags are required because they read disjoint state and regs_init()
-    // zeroed everything: SYNC_READ_SETTINGS fetches the 7 config fields but NOT
-    // the live arc level, while SYNC_READ_LEVEL fetches QUERY_STATUS +
-    // QUERY_ACTUAL_LEVEL.  Without the level read, a ballast that is physically
-    // ON would sit at the boot-zeroed brightness=0 (reported as OFF to the
-    // master) until a command or the slow periodic re-poll cursor happened to
-    // touch it — the "ON but shows 0 after a gateway reboot" bug.  Arming both
-    // makes a freshly-booted gateway converge to true state on its own.
-    for (uint8_t i = 0; i < DALI_MAX_DEVICES; i++)
-        sync_flags_set(i, SYNC_READ_SETTINGS | SYNC_READ_LEVEL);
+    // No boot scan. TASK 05: discovering the bus is the controller's job — it
+    // interrogates every short address through the command queue and holds the
+    // only cache. The gateway starts with nothing to know and nothing to lose.
 
     for (;;) {
         modbus_process();

@@ -60,17 +60,19 @@ get_config:
 # line; defaults match the firmware's "fresh chip" defaults.
 #   make configure                                # slave 1, 9600 baud, 64 s rescan
 #   make configure SLAVE_ADDR=5 BAUD_INDEX=1      # slave 5, 19200, default rescan
-#   make configure RESCAN_INTERVAL=120            # change just the rescan
 #
 # Encoding (matches the read formulas in registers.c):
 #   byte 0 (slave):     SLAVE_ADDR=1 -> 0xFF (the post-erase default), else SLAVE_ADDR-2
 #   byte 1 (baud):      BAUD_INDEX directly (0=9600, 1=19200, 2=38400)
-#   bytes 2-3 (rescan): RESCAN_INTERVAL big-endian (high byte first)
+#   bytes 2-3 (rescan): RETIRED in task 05 — written as 0xFFFF (unused).
 # Bytes 4-31 are written 0xFF so the page is in a known state regardless of
 # what was there before.
 SLAVE_ADDR      ?= 2
 BAUD_INDEX      ?= 1
-RESCAN_INTERVAL ?= 64
+# Rescan interval retired in task 05 (the gateway does no polling of its own —
+# the controller owns the background sweep via dali_sweep_interval_ms). The
+# USERROW bytes are left written as 0xFFFF so the layout is unchanged.
+RESCAN_INTERVAL ?= 65535
 
 USERROW_SLAVE_BYTE := $(if $(filter 1,$(SLAVE_ADDR)),0xFF,$(shell printf '0x%02X' $$(($(SLAVE_ADDR) - 2))))
 USERROW_BAUD_BYTE  := $(shell printf '0x%02X' $(BAUD_INDEX))

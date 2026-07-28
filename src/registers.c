@@ -19,7 +19,6 @@
 #define USERROW_OFFSET_RESCAN_HI   2u
 #define USERROW_OFFSET_RESCAN_LO   3u
 
-#define DEFAULT_RESCAN_INTERVAL    64u
 
 // SPM-CCP unlock + PAGEERASEWRITE.  The store to NVMCTRL.CTRLA must happen
 // within 4 cycles of the CCP write, so cli/out/sts are kept adjacent in one

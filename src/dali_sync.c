@@ -25,19 +25,19 @@
 #include "mbq_slots.h"
 #include "tick.h"
 
-volatile bool dali_cmd_active;
+volatile bool dali_cmd_executing;
 
 // The executing slot and its unpacked opaque command [addr, data, flags, dtr0].
 static uint8_t s_raw_slot;
 static mbq_cmd_t s_raw_cmd;
 
-// Where we are in the executing command. Meaningless unless dali_cmd_active.
+// Where we are in the executing command. Meaningless unless dali_cmd_executing.
 // Together
 // with s_raw_cmd this is the WHOLE issuance state — see dali_sync.h.
 static volatile dali_step_t s_step;
 
 void dali_sync_init(void) {
-    dali_cmd_active = false;
+    dali_cmd_executing = false;
     mbq_init();
 }
 
@@ -62,7 +62,7 @@ static void dispatch_step(void) {
 }
 
 void dali_sync_dispatch_current(void) {
-    if (!dali_cmd_active) {
+    if (!dali_cmd_executing) {
         // The caller reaches here only with the channel claimed, so returning
         // quietly parks the DALI channel busy with nothing in flight — a stall
         // that clears only via the bus escape timeout.
@@ -93,13 +93,13 @@ bool start_next_dali_work(void) {
     TCB0.INTCTRL = 0;   // fence the LVL1 completion handler across the selection
 
     uint8_t slot = MBQ_NONE;
-    if (dali_line_idle && !dali_cmd_active) slot = mbq_next_pending();
+    if (dali_line_idle && !dali_cmd_executing) slot = mbq_next_pending();
 
     if (slot != MBQ_NONE) {
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             // Re-check under global-atomic: state may have moved during the
             // selection (LVL0 idle timer / PIT / edge callbacks).
-            if (dali_line_idle && !dali_cmd_active) {
+            if (dali_line_idle && !dali_cmd_executing) {
                 // If the queue cannot hand us the command, do NOT launch: a
                 // committed launch with no command would put the previous frame
                 // back on the bus. Record it — nothing above can act on it — and
@@ -112,7 +112,7 @@ bool start_next_dali_work(void) {
                 // A command without QF_DTR0 has no preload step to run.
                 s_step = (dali_frame_of(&s_raw_cmd).flags & QF_DTR0)
                              ? DALI_STEP_DTR0 : DALI_STEP_FRAME;
-                dali_cmd_active   = true;
+                dali_cmd_executing   = true;
                 dali_line_idle   = false;
                 dali_cancel_edge_detect();
                 launch = true;
@@ -125,7 +125,7 @@ no_launch: ;
     if (launch) {
         // Committed to a send. If another master is driving the bus, wait for
         // it to clear; the wait-for-idle -> idle-state-enter path re-enters and
-        // dispatches via dali_sync_dispatch_current (dali_cmd_active is true).
+        // dispatches via dali_sync_dispatch_current (dali_cmd_executing is true).
         if (dali_is_bus_active()) dali_wait_for_idle_state_enter();
         else                      dali_sync_dispatch_current();
     }
@@ -137,7 +137,7 @@ no_launch: ;
 void dali_sync_completion(dali_response_type_t type, uint8_t value) {
     bool more = false;
 
-    if (dali_cmd_active) {
+    if (dali_cmd_executing) {
         // DTR0 preload just finished (no backward frame, so OK/NAK both mean
         // "done"). Advance to the frame within the SAME slot lifecycle; a real
         // bus error falls through to terminal handling below.
@@ -165,9 +165,9 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         }
     }
 
-    if (!more) dali_cmd_active = false;
+    if (!more) dali_cmd_executing = false;
 
-    // Always go through the wait-for-idle gap. When dali_cmd_active stays true,
+    // Always go through the wait-for-idle gap. When dali_cmd_executing stays true,
     // dali_idle_state_enter dispatches the next step via
     // dali_sync_dispatch_current; when false, it arms idle.
     dali_wait_for_idle_state_enter();
@@ -182,9 +182,9 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 // Deliberately does NOT re-enter the wait-for-idle path — the caller is already
 // in it and drives the transition itself.
 void dali_sync_abort_busfault(void) {
-    if (dali_cmd_active)
+    if (dali_cmd_executing)
         tm_fault(TM_SITE_MBQ_COMPLETE,
                  mbq_complete(s_raw_slot, MBQ_S_FAILED, DALI_RESP_BUSFAULT));
-    dali_cmd_active = false;
+    dali_cmd_executing = false;
 }
 

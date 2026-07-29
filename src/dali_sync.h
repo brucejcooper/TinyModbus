@@ -63,21 +63,32 @@ static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
 #define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
 #define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse, stuck bus)
 
-// LAYER 1 (this file, issuance): a queue slot is CLAIMED and its command is
-// mid-execution. Held across the whole multi-frame sequence (DTR0 preload +
-// frame + a send-twice repeat) so nothing can interleave within one slot's
-// lifecycle, and it is what makes s_step meaningful.
+// LAYER 1 (this file, issuance): exactly one queue slot is in MBQ_S_EXECUTING
+// and this gateway is running its command. Held across the whole multi-frame
+// sequence (DTR0 preload + frame + a send-twice repeat) so nothing interleaves
+// within one slot's lifecycle, and it is what makes s_step meaningful.
+//
+// The name mirrors the queue's own lifecycle word deliberately: this flag rises
+// with mbq_begin() marking a slot MBQ_S_EXECUTING and falls when that slot goes
+// terminal, so the two never disagree.
+//
+// It does NOT mean "a command is waiting in the queue" — that is a different
+// question with a different answer, asked by mbq_next_pending() != MBQ_NONE.
+// Up to seven other commands can sit MBQ_S_PENDING while this is true, and it
+// is equally true when the executing one is the last in the queue. MBQ_S_PENDING
+// is specifically the state BEFORE this flag rises ("accepted, waiting to
+// execute"), so calling this anything with "pending" in it would name the wrong
+// half of the lifecycle.
 //
 // This is slot ownership, not a wire condition — see the state table over
 // dali_line_idle in dali.h for how the two layers combine, including the
-// false/false case that stops them being inverses. Named dali_busy until this
-// pass, which paired with dali_idle to suggest one flag written twice.
-extern volatile bool dali_cmd_active;
+// false/false case that stops them being inverses.
+extern volatile bool dali_cmd_executing;
 
 // The "operation in flight" struct is gone. It held three fields, of which:
-//   op    duplicated dali_cmd_active exactly — both were set together and cleared
+//   op    duplicated dali_cmd_executing exactly — both were set together and cleared
 //         together at every site, so keeping them in agreement across an ISR
-//         boundary was a standing hazard with no benefit. dali_cmd_active is the one
+//         boundary was a standing hazard with no benefit. dali_cmd_executing is the one
 //         that survives; the enum had a single meaningful value (OP_RAW) once
 //         the background work selector went in task 05.
 //   addr  was written 0xFF at launch and never read by anything.
@@ -117,7 +128,7 @@ typedef enum __attribute__((packed)) {
 bool dali_sync_repeat_send(void);
 
 // Completion handler — called from dali_result_received (dali_state_idle.c)
-// when dali_cmd_active is true. Runs in ISR context.
+// when dali_cmd_executing is true. Runs in ISR context.
 void dali_sync_completion(dali_response_type_t type, uint8_t value);
 
 // Dispatch the next step of the in-flight op, called when the bus goes idle.

@@ -30,9 +30,9 @@ static void on_idle_bus(void) {
 // This is the path that produces the line_idle=false / cmd_active=false state
 // described in dali.h: the command is released while the wire is still not ours.
 //
-// Without clearing dali_cmd_active here, dali_idle_state_enter takes its
+// Without clearing dali_cmd_executing here, dali_idle_state_enter takes its
 // "busy" branch and re-enters wait_for_idle on the still-shorted bus —
-// indefinite ~83 ms/cycle loop, slave never sleeps.  Clear dali_cmd_active so
+// indefinite ~83 ms/cycle loop, slave never sleeps.  Clear dali_cmd_executing so
 // dali_idle_state_enter takes the idle-arm branch instead, and complete the
 // in-flight slot with a bus-fault code (see dali_sync_abort_busfault) so the
 // master is not left waiting on a command that can never finish.

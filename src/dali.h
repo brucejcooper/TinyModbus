@@ -72,29 +72,32 @@ typedef enum {
 // its idle state — TX released, receiver armed, rising-edge monitor watching for
 // another master starting a frame. It describes the WIRE and our posture on it.
 //
-// Not the inverse of dali_cmd_active (dali_sync.h), despite how "idle" and
-// "busy" read. That pair named two different layers, which is why they looked
-// like one flag written twice. The full state space:
+// Not the inverse of dali_cmd_executing (dali_sync.h), despite how the original
+// "idle"/"busy" pair read. They name two different layers, which is why they
+// looked like one flag written twice. The full state space:
 //
-//   line_idle  cmd_active
-//   ---------  ----------
-//      true      false     parked, owing nothing. The ONLY state in which new
-//                          work may launch — main() gates on exactly this.
-//      false     true      a command is mid-execution: transmitting, holding
-//                          the response window, or in an inter-frame gap.
-//      false     false     REAL, and the reason these are not inverses. The
-//                          wire is not ours to use, but we owe nothing: another
-//                          master started a frame while we were parked
-//                          (external_message_started clears line_idle and drops
-//                          into wait-for-idle), or a stuck bus timed out and
-//                          dali_sync_abort_busfault() released the command
-//                          while recovery continues.
-//      true      true      IMPOSSIBLE by construction, and load-bearing:
-//                          dali_idle_state_enter() only sets line_idle in the
-//                          branch where cmd_active is false, and the launch path
-//                          clears line_idle in the same ATOMIC block that sets
-//                          cmd_active. If it ever held, two writers would drive
-//                          the wire at once.
+//   line_idle  cmd_executing
+//   ---------  -------------
+//     true        false      Parked, owing nothing. The ONLY state in which
+//                            new work may launch — main() gates on this.
+//     false       true       A command is mid-execution: transmitting,
+//                            holding the response window, or in an
+//                            inter-frame gap of a multi-step sequence.
+//     false       false      REAL, and the reason these are not inverses.
+//                            The wire is not ours to use, but we owe
+//                            nothing: another master started a frame while
+//                            we were parked (external_message_started
+//                            clears line_idle and drops into wait-for-idle),
+//                            or a stuck bus timed out and
+//                            dali_sync_abort_busfault() released the
+//                            command while recovery continues.
+//     true        true       IMPOSSIBLE by construction, and load-bearing:
+//                            dali_idle_state_enter() sets line_idle only in
+//                            the branch where cmd_executing is false, and
+//                            the launch path clears line_idle in the same
+//                            ATOMIC block that sets cmd_executing. If it
+//                            ever held, two writers would drive the wire at
+//                            once.
 extern volatile bool dali_line_idle;
 
 // Initialise TX/RX pins and TCB0 edge-capture, then enter wait-for-idle to let

@@ -12,7 +12,7 @@ volatile bool dali_line_idle = false;
 
 // Leave the parked state: we are about to drive the wire (or yield it to another
 // master), so drop dali_line_idle and disarm the rising-edge monitor. Says
-// nothing about command ownership — that is dali_cmd_active's job.
+// nothing about command ownership — that is dali_cmd_executing's job.
 static void cleanup(void) {
     dali_line_idle = false;
     dali_cancel_edge_detect();
@@ -44,7 +44,7 @@ static void external_message_started(void) {
 //      logical step or releases the channel.
 
 void dali_result_received(dali_response_type_t type, uint8_t value) {
-    if (dali_cmd_active) {
+    if (dali_cmd_executing) {
         if (dali_sync_repeat_send()) return;
         dali_sync_completion(type, value);
         return;
@@ -55,7 +55,7 @@ void dali_result_received(dali_response_type_t type, uint8_t value) {
 // ---- dali_idle_state_enter ---------------------------------------------
 //
 // Two branches:
-//   1. A command is still claimed (dali_cmd_active): we just finished the
+//   1. A command is still claimed (dali_cmd_executing): we just finished the
 //      inter-frame gap of a multi-step sequence. Dispatch its next step via
 //      dali_sync_dispatch_current — and do NOT set dali_line_idle, because the
 //      wire is still ours. This branch is why the two flags are not inverses.
@@ -66,7 +66,7 @@ void dali_idle_state_enter(void) {
     // Belt-and-braces: ensure the DALI TX line is released before entering idle.
     DALI_PORT.OUTCLR = DALI_TX_bm;
 
-    if (dali_cmd_active) {
+    if (dali_cmd_executing) {
         cleanup();
         if (dali_is_bus_active()) {
             dali_wait_for_idle_state_enter();

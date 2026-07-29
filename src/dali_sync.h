@@ -77,10 +77,6 @@ extern volatile bool dali_busy;
 //   step  is genuinely live and now stands alone inside dali_sync.c (nothing
 //         outside that file ever touched it).
 
-// Seconds since boot, incremented by the RTC PIT. A pure diagnostic now (FC04
-// sysinfo) — nothing schedules off it since the rescan cursor was removed.
-extern volatile uint32_t g_uptime_s;
-
 // Reset issuance state. Call once at boot.
 void dali_sync_init(void);
 

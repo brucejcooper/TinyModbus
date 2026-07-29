@@ -10,6 +10,7 @@
 #include "modbus.h"
 #include "registers.h"
 #include "errors.h"
+#include "sysinfo.h"
 #include "mbq_slots.h"
 #include "dali.h"
 #include "dali_sync.h"
@@ -321,12 +322,12 @@ static void process_fc04(void) {
     if (addr == FC04_SYSINFO_BLOCK && count == 0x04u) {
         buf[2] = 8u;
         uint8_t *p = buf + 3;
-        uint32_t up;
-        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { up = g_uptime_s; }
+        uint32_t up = sysinfo_uptime_s();   // fenced inside
         p[0] = (uint8_t)(up >> 24); p[1] = (uint8_t)(up >> 16);
         p[2] = (uint8_t)(up >> 8);  p[3] = (uint8_t)up;
-        p[4] = (uint8_t)(g_boot_count >> 8); p[5] = (uint8_t)g_boot_count;
-        p[6] = 0;                            p[7] = g_reset_reason;
+        uint16_t bc = sysinfo_boot_count();
+        p[4] = (uint8_t)(bc >> 8);           p[5] = (uint8_t)bc;
+        p[6] = 0;                            p[7] = sysinfo_reset_reason();
         start_tx(11u);
         return;
     }

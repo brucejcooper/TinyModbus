@@ -43,12 +43,6 @@ void dali_init(void) {
     EVSYS.ASYNCCH1    = EVSYS_ASYNCCH1_PORTB_PIN1_gc;
     EVSYS.ASYNCUSER0  = EVSYS_ASYNCUSER0_ASYNCCH1_gc;
 
-    // RTC PIT for periodic bus rescan (1 kHz internal osc, fires every ~1 s)
-    RTC.CLKSEL = RTC_CLKSEL_INT1K_gc;
-    while (RTC.PITSTATUS & RTC_CTRLABUSY_bm) {}
-    RTC.PITCTRLA   = RTC_PERIOD_CYC1024_gc | RTC_PITEN_bm;
-    RTC.PITINTCTRL = RTC_PI_bm;
-
     // Start in wait-for-idle to let the bus settle after reset
     dali_wait_for_idle_state_enter();
 }

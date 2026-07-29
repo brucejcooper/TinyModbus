@@ -7,6 +7,7 @@
 #include <util/delay.h>
 
 #include "registers.h"
+#include "sysinfo.h"
 #include "tick.h"
 #include "dali.h"
 #include "dali_sync.h"
@@ -35,35 +36,10 @@ FUSES = {
     .BOOTEND = FUSE_BOOTEND_DEFAULT,
 };
 
-// ---- Reboot diagnostics (no EEPROM — exposed via the FC04 sysinfo block) ----
-// g_boot_count / s_boot_magic live in .noinit SRAM: the C runtime does NOT clear
-// .noinit, so they survive a WARM reset (watchdog, software RSTCTRL.SWRR, the
-// external RESET pin) but are undefined after a true power-on / brownout where
-// SRAM content is lost.  The magic guard detects that (and PORF) and restarts
-// the count, so g_boot_count means "reboots since the last cold power-on" with
-// ZERO flash/EEPROM wear — safe even under a watchdog crash-loop.  g_reset_reason
-// is the RSTCTRL.RSTFR flag byte latched (and cleared) at boot.
-#define BOOT_MAGIC 0xB007u
-volatile uint16_t g_boot_count __attribute__((section(".noinit")));
-static   uint16_t s_boot_magic __attribute__((section(".noinit")));
-volatile uint8_t  g_reset_reason;
-
 int main(void) {
-    // Latch + clear the reset cause and maintain the warm-reboot counter FIRST,
-    // before anything touches RSTFR or the WDT re-arms.  RSTFR flags are
-    // cumulative until cleared (write-1-to-clear), so capture then clear to keep
-    // each boot's reason distinct.
-    {
-        uint8_t rr = RSTCTRL.RSTFR;
-        RSTCTRL.RSTFR  = rr;            // write-1-to-clear
-        g_reset_reason = rr;
-        // Cold boot (power-on/brownout) or corrupted .noinit magic => restart count.
-        if (s_boot_magic != BOOT_MAGIC || (rr & RSTCTRL_PORF_bm)) {
-            g_boot_count = 0;
-            s_boot_magic = BOOT_MAGIC;
-        }
-        g_boot_count++;
-    }
+    // Reset cause + warm-reboot counter FIRST, before anything touches RSTFR
+    // or the WDT re-arms.
+    sysinfo_boot_latch();
 
     // Drive DE low immediately - prevents floating pin from enabling RS-485 TX
     // during the startup window before modbus_init() configures the pin.
@@ -99,6 +75,7 @@ int main(void) {
     // Initialise subsystems
     regs_init();
     dali_sync_init();                     // queue slots + issuance state
+    sysinfo_init();                       // 1 Hz uptime tick (RTC PIT)
     tick_init();                          // starts TCA0 - ticks begin here
     modbus_init(userrow_get_slave_addr());
     dali_init();

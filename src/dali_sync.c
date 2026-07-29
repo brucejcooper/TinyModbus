@@ -25,8 +25,7 @@
 #include "mbq_slots.h"
 #include "tick.h"
 
-volatile bool     dali_busy;
-volatile uint32_t g_uptime_s;
+volatile bool dali_busy;
 
 // The executing slot and its unpacked opaque command [addr, data, flags, dtr0].
 static uint8_t s_raw_slot;
@@ -188,13 +187,3 @@ void dali_sync_abort_busfault(void) {
     dali_busy = false;
 }
 
-// ---- 1 Hz tick --------------------------------------------------------
-//
-// The RTC PIT used to also drive a round-robin rescan cursor that set
-// SYNC_READ_LEVEL on one ballast per interval. That is the controller's job
-// now, so all this does is keep the uptime counter for the sysinfo block.
-
-ISR(RTC_PIT_vect) {
-    g_uptime_s++;
-    RTC.PITINTFLAGS = RTC_PI_bm;
-}

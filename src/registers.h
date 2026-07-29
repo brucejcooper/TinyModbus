@@ -78,10 +78,10 @@
 // A master spots a reboot when uptime_s drops or boot_count changes.
 #define FC04_SYSINFO_BLOCK  0x0310u
 
-// Reboot diagnostics, sourced without EEPROM (defined in main.c).  See the
-// FC04_SYSINFO_BLOCK layout above; g_uptime_s lives in dali_sync.{c,h}.
-extern volatile uint16_t g_boot_count;
-extern volatile uint8_t  g_reset_reason;
+// The uptime / boot-count / reset-reason values behind this block live in
+// sysinfo.{c,h} — they are properties of the chip having booted, not of the
+// register map. This header used to declare two of them and point at
+// dali_sync.{c,h} for the third.
 
 // ---- Command queue (see the map above; protocol in mbq_slots.h) -----------
 

@@ -25,49 +25,44 @@
 #include "mbq_slots.h"
 #include "tick.h"
 
-volatile bool              dali_busy;
-volatile dali_current_op_t current_op;
-volatile cmd_entry_t       s_active;
-volatile uint32_t          g_uptime_s;
+volatile bool        dali_busy;
+volatile dali_step_t s_active;
+volatile uint32_t    g_uptime_s;
 
 // The executing slot and its unpacked opaque command [addr, data, flags, dtr0].
 static uint8_t s_raw_slot;
 static mbq_cmd_t s_raw_cmd;
 
+// Which half of a QF_DTR0 pair is in flight: 0 = the DTR0 preload, 1 = the frame.
+// Meaningless unless dali_busy; file-static because nothing outside this module
+// has ever read it.
+static volatile uint8_t s_dtr0_step;
+
 void dali_sync_init(void) {
-    dali_busy    = false;
-    current_op.op = OP_NONE;
+    dali_busy = false;
     mbq_init();
 }
 
-void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
-                        dali_kind_t kind, uint8_t repeat) {
+void issue_dali_command(uint8_t addr_byte, uint8_t data_byte, dali_kind_t kind) {
     // No cache invalidation any more — there is no cache to invalidate. The
     // controller decides what to re-read after a command.
-    cmd_type_t t;
-    switch (kind) {
-        case DALI_KIND_DAPC:  t = CMD_DIRECT_ARC; break;
-        case DALI_KIND_CMD:   t = CMD_SEND;       break;
-        case DALI_KIND_TWICE: t = CMD_SEND_TWICE; break;
-        case DALI_KIND_QUERY: t = CMD_QUERY;      break;
-        default:              t = CMD_SEND;       break;
-    }
-    s_active.type      = t;
-    s_active.dali_addr = addr_byte;
-    s_active.dali_cmd  = data_byte;
-    s_active.repeat    = repeat;
+    s_active.kind   = kind;
+    s_active.addr   = addr_byte;
+    s_active.data   = data_byte;
+    // Derived, not passed: a SET-class command is two sends by definition, so a
+    // separate repeat argument could only ever agree with the kind or be wrong.
+    s_active.repeat = (kind == DALI_KIND_TWICE) ? 2u : 1u;
 
-    dali_transmitting_state_enter((const cmd_entry_t *)&s_active);
+    dali_transmitting_state_enter((const dali_step_t *)&s_active);
 }
 
 // ---- Dispatch ---------------------------------------------------------
 
 void dali_sync_dispatch_current(void) {
-    if (current_op.op != OP_RAW) {
-        // The caller reaches here only with dali_busy held, so returning quietly
-        // parks the DALI channel busy with nothing in flight — a stall that clears
-        // only via the bus escape timeout. OP_RAW is the sole op since the task-05
-        // strip, so this means the op state was corrupted.
+    if (!dali_busy) {
+        // The caller reaches here only with the channel claimed, so returning
+        // quietly parks the DALI channel busy with nothing in flight — a stall
+        // that clears only via the bus escape timeout.
         tm_fault(TM_SITE_DALI_ISSUE, TM_ERR_BAD_SLOT);
         return;
     }
@@ -78,17 +73,17 @@ void dali_sync_dispatch_current(void) {
     // dali_busy stays held across the pair (one slot's lifecycle).
     dali_frame_t f = dali_frame_of(&s_raw_cmd);
 
-    if ((f.flags & QF_DTR0) && current_op.step == 0u) {
-        issue_dali_command(DALI_ADDR_SET_DTR0, f.dtr0, DALI_KIND_CMD, 1u);
+    if ((f.flags & QF_DTR0) && s_dtr0_step == 0u) {
+        issue_dali_command(DALI_ADDR_SET_DTR0, f.dtr0, DALI_KIND_CMD);
         return;
     }
     // Terminal frame. KIND from the flags byte:
     //   QF_TWICE  -> send twice (SET-class), no answer
     //   QF_ANSWER -> KIND_QUERY, open the backward-frame window
     //   else      -> KIND_CMD, completes as soon as the frame is out
-    if (f.flags & QF_TWICE)       issue_dali_command(f.addr, f.data, DALI_KIND_TWICE, 2u);
-    else if (f.flags & QF_ANSWER) issue_dali_command(f.addr, f.data, DALI_KIND_QUERY, 1u);
-    else                          issue_dali_command(f.addr, f.data, DALI_KIND_CMD,   1u);
+    if (f.flags & QF_TWICE)       issue_dali_command(f.addr, f.data, DALI_KIND_TWICE);
+    else if (f.flags & QF_ANSWER) issue_dali_command(f.addr, f.data, DALI_KIND_QUERY);
+    else                          issue_dali_command(f.addr, f.data, DALI_KIND_CMD);
 }
 
 // ---- Work selection ---------------------------------------------------
@@ -114,12 +109,10 @@ bool start_next_dali_work(void) {
                     tm_fault(TM_SITE_MBQ_BEGIN, TM_ERR_BAD_SLOT);
                     goto no_launch;
                 }
-                s_raw_slot      = slot;
-                current_op.op   = OP_RAW;
-                current_op.addr = 0xFFu;
-                current_op.step = 0;
-                dali_busy = true;
-                dali_idle = false;
+                s_raw_slot  = slot;
+                s_dtr0_step = 0;
+                dali_busy   = true;
+                dali_idle   = false;
                 dali_cancel_edge_detect();
                 launch = true;
             }
@@ -143,15 +136,15 @@ no_launch: ;
 void dali_sync_completion(dali_response_type_t type, uint8_t value) {
     bool more = false;
 
-    if (current_op.op == OP_RAW) {
+    if (dali_busy) {
         dali_frame_t f = dali_frame_of(&s_raw_cmd);
 
         // DTR0 preload just finished (no backward frame, so OK/NAK both mean
         // "done"). Advance to the frame within the SAME slot lifecycle; a real
         // bus error falls through to terminal handling below.
-        if ((f.flags & QF_DTR0) && current_op.step == 0u
+        if ((f.flags & QF_DTR0) && s_dtr0_step == 0u
             && (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK)) {
-            current_op.step = 1u;
+            s_dtr0_step = 1u;
             more = true;
         } else {
             // Terminal. Map the DALI outcome to the slot's (status, response8):
@@ -173,10 +166,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         }
     }
 
-    if (!more) {
-        dali_busy = false;
-        current_op.op = OP_NONE;
-    }
+    if (!more) dali_busy = false;
 
     // Always go through the wait-for-idle gap. When dali_busy stays true,
     // dali_idle_state_enter dispatches the next step via
@@ -193,11 +183,10 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 // Deliberately does NOT re-enter the wait-for-idle path — the caller is already
 // in it and drives the transition itself.
 void dali_sync_abort_busfault(void) {
-    if (current_op.op == OP_RAW)
+    if (dali_busy)
         tm_fault(TM_SITE_MBQ_COMPLETE,
                  mbq_complete(s_raw_slot, MBQ_S_FAILED, DALI_RESP_BUSFAULT));
-    dali_busy     = false;
-    current_op.op = OP_NONE;
+    dali_busy = false;
 }
 
 // ---- 1 Hz tick --------------------------------------------------------

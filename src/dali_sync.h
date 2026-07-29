@@ -68,19 +68,15 @@ static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
 // atomic sequence (DTR0 preload + frame) so nothing can interleave.
 extern volatile bool dali_busy;
 
-// The operation in flight. Only one kind remains now that the background work
-// selector is gone: a command from the queue.
-typedef enum __attribute__((packed)) {
-    OP_NONE = 0,
-    OP_RAW,          // a slot from the generic command queue (mbq_slots.c)
-} dali_op_t;
-
-typedef struct {
-    dali_op_t op;
-    uint8_t   addr;   // unused for OP_RAW — the command carries its own address
-    uint8_t   step;   // 0 = DTR0 preload, 1 = the frame (QF_DTR0 pairs)
-} dali_current_op_t;
-extern volatile dali_current_op_t current_op;
+// The "operation in flight" struct is gone. It held three fields, of which:
+//   op    duplicated dali_busy exactly — both were set together and cleared
+//         together at every site, so keeping them in agreement across an ISR
+//         boundary was a standing hazard with no benefit. dali_busy is the one
+//         that survives; the enum had a single meaningful value (OP_RAW) once
+//         the background work selector went in task 05.
+//   addr  was written 0xFF at launch and never read by anything.
+//   step  is genuinely live and now stands alone inside dali_sync.c (nothing
+//         outside that file ever touched it).
 
 // Seconds since boot, incremented by the RTC PIT. A pure diagnostic now (FC04
 // sysinfo) — nothing schedules off it since the rescan cursor was removed.
@@ -93,19 +89,14 @@ void dali_sync_init(void);
 // a command was launched. Called from the main loop.
 bool start_next_dali_work(void);
 
-// How a forward frame is transmitted. repeat selects how many hardware sends
-// comprise one logical command (1 one-shot, 2 for SET-class / send-twice).
-typedef enum __attribute__((packed)) {
-    DALI_KIND_DAPC = 0,        // CMD_DIRECT_ARC; bit0 of addr clear
-    DALI_KIND_CMD,             // CMD_SEND; no response
-    DALI_KIND_TWICE,           // CMD_SEND_TWICE; no response, but 22 TE wait
-    DALI_KIND_QUERY,           // CMD_QUERY; backward frame expected
-} dali_kind_t;
-void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
-                        dali_kind_t kind, uint8_t repeat);
+// dali_kind_t moved to types.h, next to the step struct that carries it.
+// The send count is implied by the kind (TWICE = 2, everything else = 1) and is
+// no longer passed separately — a caller could previously pass a repeat that
+// contradicted the kind.
+void issue_dali_command(uint8_t addr_byte, uint8_t data_byte, dali_kind_t kind);
 
-// In-flight command stash, consumed by the bit-level state machine.
-extern volatile cmd_entry_t s_active;
+// The step currently on the wire, consumed by the bit-level state machine.
+extern volatile dali_step_t s_active;
 
 // Completion handler — called from dali_result_received (dali_state_idle.c)
 // when dali_busy is true. Runs in ISR context.

@@ -10,15 +10,14 @@
 static volatile uint16_t shift_reg;
 static volatile uint8_t  bits_left;
 
-// Last stop bit has been sent.  Read s_active.type (populated by
-// issue_dali_command) to decide:
-//   CMD_QUERY: arm the backward frame window (response or 22 TE timeout).
-//   CMD_SEND_TWICE: hold the 22 TE inter-send gap via the response window.
-//   CMD_SEND / CMD_DIRECT_ARC: no response expected; complete immediately
-//   so the caller can advance state before the 22 TE idle gap.
+// Last stop bit has been sent.  The step's kind decides what happens next:
+//   DALI_KIND_QUERY: arm the backward frame window (response or 22 TE timeout).
+//   DALI_KIND_TWICE: hold the 22 TE inter-send gap via that same window.
+//   DALI_KIND_CMD:   no response expected; complete immediately so the caller
+//                    can advance state before the 22 TE idle gap.
 static void finished_transmission(void) {
-    cmd_type_t t = s_active.type;
-    if (t == CMD_QUERY || t == CMD_SEND_TWICE)
+    dali_kind_t k = s_active.kind;
+    if (k == DALI_KIND_QUERY || k == DALI_KIND_TWICE)
         dali_wait_for_response_state_enter();
     else
         dali_result_received(DALI_RESPONSE_NAK, 0);
@@ -59,11 +58,11 @@ static void half_bit_toggle(void) {
     dali_timer = 1;
 }
 
-void dali_transmitting_state_enter(const cmd_entry_t *cmd) {
-    // Build the 16-bit DALI forward frame from the entry.  s_active.type
-    // is already set by issue_dali_command; finished_transmission reads
-    // it after the last stop bit clears.
-    shift_reg = ((uint16_t)cmd->dali_addr << 8) | cmd->dali_cmd;
+void dali_transmitting_state_enter(const dali_step_t *step) {
+    // Build the 16-bit DALI forward frame from the step.  Only the two frame
+    // bytes are needed here; finished_transmission reads the kind from s_active
+    // after the last stop bit clears.
+    shift_reg = ((uint16_t)step->addr << 8) | step->data;
     bits_left = 17;  // 16 data bits + 1 extra for the stop-bit transition
     dali_timer_cb = send_one;
     dali_timer    = 1;

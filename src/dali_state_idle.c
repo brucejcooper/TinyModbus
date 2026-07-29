@@ -32,7 +32,7 @@ static void external_message_started(void) {
 //
 // Two intercepts before dispatch:
 //
-//   1. s_active.repeat > 1: this is a SEND_TWICE (raw twice, group bit,
+//   1. s_active.repeat > 1: this is a DALI_KIND_TWICE (raw twice, group bit,
 //      SET commands within multi-step writes).  Decrement the repeat
 //      counter and re-fire dali_transmitting_state_enter immediately —
 //      no inter-frame gap, matching the legacy queue mechanism.  This
@@ -47,7 +47,7 @@ void dali_result_received(dali_response_type_t type, uint8_t value) {
     if (dali_busy) {
         if (s_active.repeat > 1u) {
             s_active.repeat--;
-            dali_transmitting_state_enter((const cmd_entry_t *)&s_active);
+            dali_transmitting_state_enter((const dali_step_t *)&s_active);
             return;
         }
         dali_sync_completion(type, value);

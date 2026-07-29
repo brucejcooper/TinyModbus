@@ -12,79 +12,29 @@
 #define DALI_BAUD             1200
 #define DALI_BIT_USECS        (1000000.0 / DALI_BAUD)
 #define DALI_HALF_BIT_USECS   (DALI_BIT_USECS / 2.0)
-#define DALI_MAX_DEVICES      64
 
-// ---- Address encoding --------------------------------------------------
-
-#define DALI_SHORT_ADDR(n)  ((uint8_t)(((n) & 0x3Fu) << 1u))
-#define DALI_GROUP_ADDR(n)  ((uint8_t)(0x80u | (((n) & 0x0Fu) << 1u)))
-#define DALI_BROADCAST      0xFEu
-#define DALI_CMD_FLAG       0x01u   // set bit 0 for command (vs DAPC)
-
-// ---- DALI commands (low byte of 16-bit frame) --------------------------
-
-#define DALI_CMD_OFF                  0x00u
-#define DALI_CMD_UP                   0x01u
-#define DALI_CMD_DOWN                 0x02u
-#define DALI_CMD_STEP_UP              0x03u
-#define DALI_CMD_STEP_DOWN            0x04u
-#define DALI_CMD_RECALL_MAX           0x05u
-#define DALI_CMD_RECALL_MIN           0x06u
-#define DALI_CMD_GOTO_LAST_ACTIVE     0x0Au
-#define DALI_CMD_QUERY_STATUS         0x90u
-#define DALI_CMD_QUERY_ACTUAL_LEVEL   0xA0u
-#define DALI_CMD_QUERY_MAX_LEVEL      0xA1u   // IEC 62386-102: 0xA1 = QUERY MAX LEVEL
-#define DALI_CMD_QUERY_MIN_LEVEL      0xA2u   //                0xA2 = QUERY MIN LEVEL
-#define DALI_CMD_QUERY_POWER_ON_LEVEL 0xA3u
-#define DALI_CMD_QUERY_FAIL_LEVEL     0xA4u
-// QUERY_FADE_TIME_FADE_RATE returns one byte: high nibble = fade time
-// (0..15), low nibble = fade rate (0..15).  Both fields refresh from this
-// single query.  (DALI opcode 0xA6 is QUERY_MANUFACTURER_SPECIFIC_MODE
-// per IEC 62386-102; we don't issue it from internal scans because the
-// response is manufacturer-defined.)
-#define DALI_CMD_QUERY_FADE_TIME_FADE_RATE  0xA5u
-#define DALI_CMD_QUERY_GROUP_0_7      0xC0u
-#define DALI_CMD_QUERY_GROUP_8_15     0xC1u
-
-// Configuration commands - require SEND_TWICE; DTR0 loaded with new value first
-#define DALI_CMD_SET_MAX_LEVEL        0x2Au
-#define DALI_CMD_SET_MIN_LEVEL        0x2Bu
-#define DALI_CMD_SET_SYS_FAIL_LEVEL   0x2Cu
-#define DALI_CMD_SET_POWER_ON_LEVEL   0x2Du
-#define DALI_CMD_SET_FADE_TIME        0x2Eu
-#define DALI_CMD_SET_FADE_RATE        0x2Fu
-
-// DTR0 set: addr byte = opcode 0xA3, cmd byte = value to load.  Used by the
-// DTR0-preload queue records (the QF_DTR0 flag emits 0xA3<dtr0> before the
-// frame).  DTR1/DTR2 setters (0xC3 / 0xC5) are reachable from the master by
-// submitting them as ordinary command-queue records.
+// ---- What the gateway knows about DALI: almost nothing ---------------------
+//
+// Everything that used to live here — the address-encoding macros, the ~30
+// command opcodes (OFF/UP/DOWN/RECALL/QUERY */SET *), the commissioning
+// specials (INITIALISE, RANDOMISE, COMPARE, WITHDRAW, SEARCHADDRH/M/L,
+// PROGRAM/VERIFY SHORT ADDRESS, TERMINATE) and their data-byte conventions —
+// was deleted in this pass. Not one of them had a reference left.
+//
+// That is the intended end state of task 05, not an oversight. The gateway is a
+// dumb pipe: the controller composes complete 16-bit forward frames and submits
+// them as opaque queue commands, and this firmware shifts the bytes onto the
+// wire without interpreting them. Keeping an opcode table here implied a
+// vocabulary the gateway does not have, and the commissioning block documented
+// itself as "driven by the OP_COMMISSION state machine in dali_sync.c" — a state
+// machine that no longer exists. Anything needed again belongs on the controller
+// side, which is where the frames are built.
+//
+// DTR0 is the single exception, and only because the QF_DTR0 flag makes the
+// preload a GATEWAY-side two-step sequence (0xA3<value>, then the frame) inside
+// one slot lifecycle. DTR1/DTR2 (0xC3/0xC5) need no constant here — the master
+// submits them as ordinary command records.
 #define DALI_ADDR_SET_DTR0  0xA3u
-
-// ---- Commissioning special-command opcodes (IEC 62386-102) -------------
-// All take the addr-byte slot of the 16-bit forward frame (replace the
-// per-ballast addressing entirely).  Driven by the OP_COMMISSION state
-// machine in dali_sync.c.  INITIALISE / RANDOMISE require SEND-TWICE; the
-// rest are single forward frames with no response (COMPARE / VERIFY /
-// QUERY produce a backward frame).
-#define DALI_ADDR_TERMINATE              0xA1u  // cancel commissioning early
-#define DALI_ADDR_INITIALISE             0xA5u  // data: 0x00=all, 0xFF=no-short, else short addr.  TWICE.
-#define DALI_ADDR_RANDOMISE              0xA7u  // each gear picks a fresh 24-bit random.  TWICE.
-#define DALI_ADDR_COMPARE                0xA9u  // backward 0xFF if any gear's random <= search
-#define DALI_ADDR_WITHDRAW               0xABu  // pull last-matched gear out of comparison set
-#define DALI_ADDR_SEARCHADDRH            0xB1u  // load search-addr high byte
-#define DALI_ADDR_SEARCHADDRM            0xB3u  // load search-addr mid byte
-#define DALI_ADDR_SEARCHADDRL            0xB5u  // load search-addr low byte
-#define DALI_ADDR_PROGRAM_SHORT_ADDRESS  0xB7u  // data = (short<<1)|1, or 0xFF to clear
-#define DALI_ADDR_VERIFY_SHORT_ADDRESS   0xB9u  // data = (short<<1)|1.  Backward 0xFF if match.
-#define DALI_ADDR_QUERY_SHORT_ADDRESS    0xBBu  // backward = (short<<1)|1, or 0xFF if none
-
-// INITIALISE data-byte conventions
-#define DALI_INIT_DATA_ALL          0x00u   // include every gear in the comparison set
-#define DALI_INIT_DATA_NO_SHORT     0xFFu   // include only gears without a short address
-
-// PROGRAM/VERIFY short-address encoding.  Bit 0 set marks the byte as a
-// short-address command target (matches the broader DALI_CMD_FLAG convention).
-#define DALI_PROG_SHORT(s)          ((uint8_t)(((s) << 1) | 0x01u))
 
 // ---- Hardware pins -----------------------------------------------------
 
@@ -130,7 +80,7 @@ void dali_idle_state_enter(void);
 
 // Begin transmitting cmd as a DALI forward frame (Manchester-encoded, 1200 baud).
 // Returns immediately; the timer ISR drives the rest of the transmission.
-void dali_transmitting_state_enter(const cmd_entry_t *cmd);
+void dali_transmitting_state_enter(const dali_step_t *step);
 
 // Enforce the mandatory 22 TE (~9 ms) inter-frame gap before the next TX.
 // Handles bus-shorted (another master active) by waiting for it to release first.
@@ -151,7 +101,7 @@ void dali_state_receiving_enter(void);
 
 // Single authority for post-command state transitions - called from ISR context.
 // Updates the target register (if any), fires the optional callback, decrements
-// repeat count for CMD_SEND_TWICE, pops the queue, and enters the next state.
+// repeat count for DALI_KIND_TWICE, pops the queue, and enters the next state.
 void dali_result_received(dali_response_type_t type, uint8_t value);
 
 #endif

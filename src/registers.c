@@ -5,7 +5,6 @@
 #include "dali_sync.h"
 #include "mbq_slots.h"
 
-
 // ---- USERROW layout -------------------------------------------------------
 // byte 0:    slave address (encoded as addr - 2; 0xFF -> address 1)
 // byte 1:    baud index (0=9600, 1=19200, 2=38400; 0xFF -> 9600)
@@ -18,7 +17,6 @@
 #define USERROW_OFFSET_BAUD_INDEX  1u
 #define USERROW_OFFSET_RESCAN_HI   2u
 #define USERROW_OFFSET_RESCAN_LO   3u
-
 
 // SPM-CCP unlock + PAGEERASEWRITE.  The store to NVMCTRL.CTRLA must happen
 // within 4 cycles of the CCP write, so cli/out/sts are kept adjacent in one
@@ -85,19 +83,11 @@ tm_err_t userrow_set_baud_index(uint8_t idx) {
     return userrow_write_byte(USERROW_OFFSET_BAUD_INDEX, idx) ? TM_OK : TM_ERR_HW_FAULT;
 }
 
-
-
 void regs_init(void) {
     // Nothing to initialise: the gateway holds no register map any more. Kept as
     // a call site so the boot sequence reads the same and a future addition has
     // an obvious home.
 }
-
-// ---- bitmask helpers ---------------------------------------------------
-
-
-// ---- FC04 bulk read ----------------------------------------------------
-
 
 // ---- FC03 holding read -------------------------------------------------
 
@@ -165,11 +155,3 @@ tm_err_t regs_write_holding(uint16_t addr, uint16_t val) {
             return TM_ERR_NO_SUCH_REG;
     }
 }
-
-// ---- result application ------------------------------------------------
-
-
-
-
-
-

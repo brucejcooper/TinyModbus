@@ -7,17 +7,37 @@
 // entirely in the caller (the DALI issuance adapter in dali_sync.c). See
 // controller/docs/modbus-command-queue.md for the protocol.
 //
-// Threading: mbq_submit / mbq_read_status / mbq_next_pending / mbq_begin run in
-// main (Modbus + work-arbiter) context; mbq_complete runs in the LVL1 DALI
-// completion (ISR) context. The single load-bearing ordering is that a terminal
-// slot's response8 is written BEFORE its status, and a status read is atomic
-// against the completion writer — so a fenced reader never sees status=complete/
-// failed with a stale response8 (the v2 analog of v1's ring-before-completed_id).
-// Because each slot is one self-describing 16-bit register, cross-slot tears are
-// benign (slots reconcile independently), so only the in-register order + a fenced
-// read matter. Compound/main-context accesses use ATOMIC_BLOCK (a brief global
-// cli, which also blocks the DALI completion ISR); single-byte status reads are
-// naturally atomic on the AVR.
+// Threading: mbq_submit / mbq_read_status / mbq_next_pending / mbq_begin all run
+// in main (Modbus + work-arbiter) context. The ONLY concurrent writer is
+// mbq_complete, in the LVL1 DALI completion ISR, and it touches only the one
+// EXECUTING slot.
+//
+// THERE ARE NO INTERRUPT FENCES IN THIS FILE, deliberately. The write ORDER is
+// what carries the invariant:
+//
+//   mbq_complete writes response8, THEN status.
+//   mbq_read_status reads status,  THEN response8.
+//
+// So if a reader observes a terminal status, the ISR had already written status —
+// which happens after response8 — and the response8 it goes on to read is
+// therefore fresh. The other interleaving gives a stale non-terminal status with
+// a fresh response8, which is harmless: response8 is defined only when the status
+// is terminal. Each byte is a single AVR store/load, so neither can tear, and
+// `volatile` stops the compiler reordering the pair.
+//
+// Cross-slot tears are benign too — every slot is self-describing and reconciles
+// independently — so a multi-slot read needs no snapshot either.
+//
+// mbq_submit needs none for a different reason: mbq_complete can only move the
+// executing slot EXECUTING -> terminal, which can never make a slot that read as
+// free become active. It cannot invalidate an all-or-nothing "none active" check.
+//
+// This is not a micro-optimisation. A global cli here blocks the DALI bit-timing
+// callbacks and the USART RX ISR, and an over-long ATOMIC_BLOCK on a hot path is
+// precisely what caused the 2026-06-05 RX starvation bug (see CLAUDE.md): a scan
+// held interrupts off for hundreds of µs and overran the 2-byte RX FIFO. Do not
+// add a fence here without a concrete race the write order does not already
+// cover.
 //
 // State is an array of mbq_slot_t — one struct per queue entry. It was four
 // parallel byte arrays, to avoid a multiply on every access from a 7-byte
@@ -30,7 +50,6 @@
 #pragma GCC optimize("Os")
 
 #include "mbq_slots.h"
-#include <util/atomic.h>
 
 static volatile mbq_slot_t s_slot[MBQ_SLOTS];
 static volatile uint8_t    s_seq_ctr;   // monotonic accept-sequence counter
@@ -51,48 +70,49 @@ static inline bool slot_active(uint8_t st) {
 
 tm_err_t mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots) {
     if (n_slots == 0u || (uint16_t)first_slot + n_slots > MBQ_SLOTS) return TM_ERR_BAD_RANGE;
-    tm_err_t err = TM_ERR_BUSY;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        // All-or-nothing: refuse the whole write if ANY targeted slot is active
-        // (pending/executing) — a stale-cache write must not clobber in-flight work.
-        bool any_active = false;
-        for (uint8_t i = 0; i < n_slots; i++) {
-            if (slot_active(s_slot[first_slot + i].st.status)) { any_active = true; break; }
-        }
-        if (!any_active) {
-            // Arm each targeted slot to PENDING with the opaque command and a fresh
-            // accept sequence, stamped in ascending slot order so execution order ==
-            // the master's intended submit order for a multi-slot write.
-            for (uint8_t i = 0; i < n_slots; i++) {
-                uint8_t s = (uint8_t)(first_slot + i);
-                const uint8_t *r = regs + (uint16_t)i * MBQ_CMD_BYTES;  // 2 regs = 4 bytes
-                for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) s_slot[s].cmd.b[b] = r[b];
-                s_slot[s].st.response8 = 0;
-                s_slot[s].seq          = s_seq_ctr++;
-                s_slot[s].st.status    = MBQ_S_PENDING;
-            }
-            err = TM_OK;
-        }
+    // All-or-nothing: refuse the whole write if ANY targeted slot is active
+    // (pending/executing) — a stale-cache write must not clobber in-flight work.
+    // Unfenced: see the file header. The completion ISR can only retire the
+    // executing slot, never make a free one active, so it cannot turn this
+    // decision stale in the unsafe direction. The reverse — a slot retiring just
+    // after we saw it active — costs one spurious DEVICE_BUSY that the master
+    // retries, and a fence would not prevent that either, only narrow the window.
+    for (uint8_t i = 0; i < n_slots; i++) {
+        if (slot_active(s_slot[first_slot + i].st.status)) return TM_ERR_BUSY;
     }
-    return err;
+    // Arm each targeted slot to PENDING with the opaque command and a fresh
+    // accept sequence, stamped in ascending slot order so execution order ==
+    // the master's intended submit order for a multi-slot write.
+    for (uint8_t i = 0; i < n_slots; i++) {
+        uint8_t s = (uint8_t)(first_slot + i);
+        const uint8_t *r = regs + (uint16_t)i * MBQ_CMD_BYTES;  // 2 regs = 4 bytes
+        for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) s_slot[s].cmd.b[b] = r[b];
+        s_slot[s].st.response8 = 0;
+        s_slot[s].seq          = s_seq_ctr++;
+        s_slot[s].st.status    = MBQ_S_PENDING;
+    }
+    return TM_OK;
 }
 
 tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
-    // One 16-bit register per slot: [status:8 | response8:8]. Fenced so a single
-    // slot's status+response8 are read atomically against the completion writer.
+    // One 16-bit register per slot: [status:8 | response8:8].
+    //
+    // Unfenced, and the read order below is load-bearing: status FIRST, then
+    // response8. That is what makes a terminal status imply a fresh response8
+    // against mbq_complete's response8-then-status write. Swapping these two
+    // lines would reintroduce exactly the stale-value race the ordering exists to
+    // prevent. See the file header.
     tm_err_t err = TM_OK;
-    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-        for (uint8_t i = 0; i < count; i++) {
-            uint8_t s = (uint8_t)(sidx + i);
-            uint8_t st = 0, r8 = 0;
-            // Out-of-range entries are reported AND zeroed — the caller may still
-            // put this buffer on the wire, and stale bytes would read as real
-            // slot state.
-            if (s < MBQ_SLOTS) { st = s_slot[s].st.status; r8 = s_slot[s].st.response8; }
-            else               { err = TM_ERR_BAD_RANGE; }
-            out[(uint16_t)i * 2u]      = st;   // hi byte = status
-            out[(uint16_t)i * 2u + 1u] = r8;   // lo byte = response8
-        }
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t s = (uint8_t)(sidx + i);
+        uint8_t st = 0, r8 = 0;
+        // Out-of-range entries are reported AND zeroed — the caller may still
+        // put this buffer on the wire, and stale bytes would read as real
+        // slot state.
+        if (s < MBQ_SLOTS) { st = s_slot[s].st.status; r8 = s_slot[s].st.response8; }
+        else               { err = TM_ERR_BAD_RANGE; }
+        out[(uint16_t)i * 2u]      = st;   // hi byte = status
+        out[(uint16_t)i * 2u + 1u] = r8;   // lo byte = response8
     }
     return err;
 }

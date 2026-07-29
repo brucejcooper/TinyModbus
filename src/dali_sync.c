@@ -114,9 +114,18 @@ bool start_next_dali_work(void) {
 
     uint8_t slot = mbq_next_pending();
     if (slot != MBQ_NONE) {
+        // THE ONLY INTERRUPT FENCE LEFT IN THE QUEUE PATH, and it guards
+        // dali_bus_busy, not the slots. mbq_slots.c needs none — its write
+        // ordering carries the invariant (see that file's header) — but this is a
+        // genuine test-and-set: between reading "bus free" and committing the
+        // launch, an LVL0 callback (idle timer, PIT, or the rising-edge monitor
+        // firing because someone else took the line) can set dali_bus_busy. Losing
+        // that race means transmitting on top of another sender.
+        //
+        // Kept deliberately short for the reason mbq_slots.c has none at all: a
+        // long cli here starves the USART RX FIFO. TCB0.INTCTRL above fences LVL1
+        // separately, so this block only has to exclude LVL0.
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            // Re-check as a test-and-set: the line may have been taken during
-            // the selection by an LVL0 idle-timer / PIT / edge callback.
             if (!dali_bus_busy && !dali_sync_owns_channel()) {
                 // If the queue cannot hand us the command, do NOT launch: a
                 // committed launch with no command would put the previous frame

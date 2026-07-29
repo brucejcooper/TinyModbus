@@ -378,11 +378,13 @@ static bool read_holding_block(uint16_t addr, uint16_t count) {
 static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t *regs) {
     if (wr_addr < MBREG_SLOT_CMD_BASE || wr_addr > MBREG_SLOT_CMD_END)  return MB_ERR_ILLEGAL_ADDRESS;
     uint16_t off = (uint16_t)(wr_addr - MBREG_SLOT_CMD_BASE);
-    if (off & 1u)                                              return MB_ERR_ILLEGAL_ADDRESS;  // slot boundary
-    if ((wr_count & 1u) || wr_count == 0u)                     return MB_ERR_ILLEGAL_VALUE;
+    if (off % MBQ_CMD_REGS)                                    return MB_ERR_ILLEGAL_ADDRESS;  // slot boundary
+    if ((wr_count % MBQ_CMD_REGS) || wr_count == 0u)           return MB_ERR_ILLEGAL_VALUE;
     if ((uint32_t)wr_addr + wr_count > (uint32_t)MBREG_SLOT_CMD_END + 1u) return MB_ERR_ILLEGAL_ADDRESS;
-    uint8_t first_slot = (uint8_t)(off / 2u);
-    uint8_t n_slots    = (uint8_t)(wr_count / 2u);
+    // Registers per slot, not bytes — mixing those two units is what once made a
+    // submit declare twice its length and arm the following slot.
+    uint8_t first_slot = (uint8_t)(off / MBQ_CMD_REGS);
+    uint8_t n_slots    = (uint8_t)(wr_count / MBQ_CMD_REGS);
     if (!mbq_submit(first_slot, regs, n_slots))               return MB_ERR_DEVICE_BUSY;
     return 0;
 }

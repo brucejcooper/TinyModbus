@@ -5049,6 +5049,16 @@
 		)
 		(uuid "28f49eee-fccb-49c6-ac57-f73ab8318540")
 	)
+	(label "PG"
+		(at 107.95 31.75 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "2e58fcb9-fd89-4632-9443-3980acce15d7")
+	)
 	(label "RX_DALI"
 		(at 22.86 36.83 180)
 		(effects
@@ -5218,6 +5228,16 @@
 			(justify right bottom)
 		)
 		(uuid "f9d60ce1-5d47-43d4-95c2-7bad99ddfdac")
+	)
+	(label "SW"
+		(at 118.11 46.99 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "fcd1c00d-ca23-4e17-bf90-0899da7a28f3")
 	)
 	(symbol
 		(lib_id "power:PWR_FLAG")
@@ -5409,7 +5429,7 @@
 				)
 			)
 		)
-		(property "Footprint" "Capacitor_SMD:C_0805_2012Metric"
+		(property "Footprint" "Capacitor_SMD:C_0402_1005Metric"
 			(at 38.1 20.6248 0)
 			(hide yes)
 			(show_name no)

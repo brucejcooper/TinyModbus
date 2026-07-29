@@ -28,7 +28,10 @@
 // declare twice its length and arm the following slot with adjacent memory.
 typedef struct { uint8_t b[MBQ_CMD_BYTES]; } mbq_cmd_t;
 
-// A slot's status register, as it appears on the wire: [status:8 | response8:8].
+// A slot's status register exactly as it appears on the wire:
+// [status:8 | response8:8]. This is the ONE definition of that pair — mbq_slot_t
+// embeds it rather than repeating the fields, so the in-memory layout and the
+// wire layout cannot drift apart.
 typedef struct {
     uint8_t status;      // MBQ_S_*
     uint8_t response8;   // value on COMPLETE, code on FAILED, else 0
@@ -47,11 +50,10 @@ typedef struct {
 // AVR — the reason this was previously four parallel arrays. The static assert
 // keeps that property from being lost by a future field.
 typedef struct {
-    mbq_cmd_t cmd;         // opaque payload; the queue never interprets it
-    uint8_t   status;      // MBQ_S_* lifecycle
-    uint8_t   response8;   // value on COMPLETE, code on FAILED
-    uint8_t   seq;         // accept sequence, valid while PENDING
-    uint8_t   _pad;        // keep sizeof == 8 (power-of-two stride)
+    mbq_cmd_t         cmd;   // opaque payload; the queue never interprets it
+    mbq_slot_status_t st;    // exactly what a status read returns
+    uint8_t           seq;   // accept sequence, valid while PENDING
+    uint8_t           _pad;  // keep sizeof == 8 (power-of-two stride)
 } mbq_slot_t;
 _Static_assert(sizeof(mbq_slot_t) == 8u,
                "mbq_slot_t must stay a power-of-two stride for cheap AVR indexing");

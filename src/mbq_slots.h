@@ -15,6 +15,7 @@
 //     = [status:8 | response8:8].
 
 #include <stdint.h>
+#include "errors.h"
 #include <stdbool.h>
 
 #define MBQ_SLOTS      8u   // number of self-describing slots
@@ -79,24 +80,45 @@ void mbq_init(void);
 // targeted slot is active (pending/executing) nothing changes and this returns
 // false (the caller raises SLAVE_DEVICE_BUSY 0x06). Otherwise each targeted slot
 // is armed to PENDING with the opaque command and a fresh accept sequence stamped
-// in ascending slot order. Fenced. Returns false on an out-of-range range too.
-bool mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots);
+// in ascending slot order. Fenced.
+//   TM_OK           armed
+//   TM_ERR_BAD_RANGE  n_slots == 0, or the window runs past the last slot
+//   TM_ERR_BUSY       a targeted slot is active — nothing was changed
+// The two failures are distinct on purpose: BUSY is a retry-later, BAD_RANGE is a
+// malformed request. Collapsing both to "false" made a malformed submit report
+// DEVICE_BUSY, inviting the master to retry a request that could never succeed.
+tm_err_t mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots);
 
 // Serve `count` status registers starting at slot index `sidx` into `out`
-// (count * 2 big-endian bytes, [status:8 | response8:8] per slot). Reads past the
-// last slot yield zero. Fenced so each slot's status+response8 pair is atomic
-// against the completion writer.
-void mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
+// (count * 2 big-endian bytes, [status:8 | response8:8] per slot). Fenced so each
+// slot's status+response8 pair is atomic against the completion writer.
+//   TM_OK             all `count` slots served
+//   TM_ERR_BAD_RANGE  the window overran the slot array
+// On BAD_RANGE the out-of-range entries are still written as zero, so `out` is
+// never left holding whatever the caller's buffer had before — a partially built
+// response must not carry stale bytes onto the wire.
+tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
 
 // Arbiter hook: the lowest accept-sequence PENDING slot (0..MBQ_SLOTS-1), or
 // MBQ_NONE if none is pending. Wrap-aware over the small live window.
 uint8_t mbq_next_pending(void);
 
-// Arbiter hook: copy `slot`'s opaque command (MBQ_CMD_BYTES) into `out4` and mark
+// Arbiter hook: copy `slot`'s opaque command (MBQ_CMD_BYTES) into `out` and mark
 // the slot EXECUTING. The caller (payload adapter) interprets the bytes.
-void mbq_begin(uint8_t slot, mbq_cmd_t *out);
+//   TM_OK            *out holds the command
+//   TM_ERR_BAD_SLOT  slot >= MBQ_SLOTS; *out is ZEROED, never left untouched
+// The zeroing matters: this used to return silently without writing *out, so a
+// caller that ignored the failure would re-fire whatever command the buffer still
+// held — a repeat of the previous DALI frame, which for a non-idempotent UP/DOWN
+// step is exactly the double-apply the protocol works to prevent.
+tm_err_t mbq_begin(uint8_t slot, mbq_cmd_t *out);
 
 // Completion hook (called from the payload adapter's completion path): set the
 // slot terminal. `status` is MBQ_S_COMPLETE or MBQ_S_FAILED; `response8` is the
 // value or code. Writes response8 before status (the load-bearing ordering).
-void mbq_complete(uint8_t slot, uint8_t status, uint8_t response8);
+//   TM_OK            slot is terminal
+//   TM_ERR_BAD_SLOT  slot >= MBQ_SLOTS — the slot stays EXECUTING FOREVER
+// That failure is unrecoverable from here (this runs in the DALI completion ISR)
+// and strands a queue slot until reboot, so callers should hand it to tm_fault()
+// rather than drop it. Dropping it is how a stuck slot becomes a mystery.
+tm_err_t mbq_complete(uint8_t slot, uint8_t status, uint8_t response8);

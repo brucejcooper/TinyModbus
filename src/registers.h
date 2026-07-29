@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "errors.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 //                            MODBUS REGISTER MAP
@@ -57,7 +58,14 @@
 
 // RX diagnostics.  reg0 rx_overflow, reg1 frame_error, reg2 crc_error,
 // reg3 frames_ok, reg4 last_fail_len, reg5..12 the last CRC-failed frame
-// (2 bytes/reg, big-endian), reg13..15 spare.  Zeroed on reset.
+// (2 bytes/reg, big-endian), reg13 internal fault count (saturating at 0xFFFF),
+// reg14 [tm_err_t | tm_fault_site_t] of the FIRST internal fault, reg15 spare.
+// Zeroed on reset.
+//
+// reg13/reg14 are the errors that could not be returned to a caller — a bad slot
+// index in the DALI completion ISR, a refused command launch (see errors.h).
+// reg13 != 0 means an internal invariant broke; reg14 says which one.  A healthy
+// gateway reads 0 here for its whole uptime.
 #define FC04_DIAG_BLOCK     0x0300u
 
 // System info.  No persistent storage is used (no EEPROM wear): uptime is a RAM
@@ -110,20 +118,32 @@ void     regs_init(void);
 //         bytes 2-3 = unused (were the rescan interval, retired in task 05;
 //                     left written so the layout is unchanged).
 // Reserved Modbus addresses (0, 248-255) are clamped to 1 on read.
+// Setters return TM_ERR_BAD_VALUE for an out-of-range argument and
+// TM_ERR_HW_FAULT if the NVM write itself did not take — two outcomes a bool
+// could not tell apart, and the master needs to: one is "your request was wrong",
+// the other is "this gateway's flash is failing".
 uint8_t  userrow_get_slave_addr(void);
-bool     userrow_set_slave_addr(uint8_t addr);    // false on out-of-range
+tm_err_t userrow_set_slave_addr(uint8_t addr);
 uint8_t  userrow_get_baud_index(void);
-bool     userrow_set_baud_index(uint8_t idx);     // false on out-of-range
+tm_err_t userrow_set_baud_index(uint8_t idx);
 
 
 // Read one FC03 holding register at addr into *val.
-// Returns false for any address not in the holding register map.
-bool     regs_read_holding(uint16_t addr, uint16_t *val);
+//   TM_OK              *val holds the register
+//   TM_ERR_NO_SUCH_REG address is not in the holding map
+tm_err_t regs_read_holding(uint16_t addr, uint16_t *val);
 
-// Write one FC06/FC10 holding register; validates value range for config registers.
-// Returns false if addr is unknown or val is out of range.
-// Does NOT enqueue DALI commands - dispatch_action_reg in modbus.c does that.
-bool     regs_write_holding(uint16_t addr, uint16_t val);
+// Write one FC06/FC10 holding register; validates the value for config registers.
+// Does NOT enqueue DALI commands — dispatch_action_reg in modbus.c does that.
+//   TM_OK              written (or already equal — a no-change write is success)
+//   TM_ERR_NO_SUCH_REG address is not in the holding map
+//   TM_ERR_BAD_VALUE   address is valid but the value is out of range
+//   TM_ERR_HW_FAULT    the USERROW/NVM write did not take
+// These were one `false` return. The master was told ILLEGAL_ADDRESS — "no such
+// register" — for an out-of-range baud index, a bad slave address, a wrong reset
+// magic and a failed NVM write alike, which is both wrong and undiagnosable from
+// the far end of an RS-485 bus.
+tm_err_t regs_write_holding(uint16_t addr, uint16_t val);
 
 
 #endif

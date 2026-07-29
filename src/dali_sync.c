@@ -19,6 +19,7 @@
 #include <util/atomic.h>
 
 #include "dali_sync.h"
+#include "errors.h"
 #include "dali.h"
 #include "registers.h"
 #include "mbq_slots.h"
@@ -62,7 +63,14 @@ void issue_dali_command(uint8_t addr_byte, uint8_t data_byte,
 // ---- Dispatch ---------------------------------------------------------
 
 void dali_sync_dispatch_current(void) {
-    if (current_op.op != OP_RAW) return;
+    if (current_op.op != OP_RAW) {
+        // The caller reaches here only with dali_busy held, so returning quietly
+        // parks the DALI channel busy with nothing in flight — a stall that clears
+        // only via the bus escape timeout. OP_RAW is the sole op since the task-05
+        // strip, so this means the op state was corrupted.
+        tm_fault(TM_SITE_DALI_ISSUE, TM_ERR_BAD_SLOT);
+        return;
+    }
 
     // Unpack the executing slot's opaque command and issue it. A QF_DTR0
     // command is a two-step atomic sequence — step 0 preloads DTR0, step 1
@@ -98,7 +106,14 @@ bool start_next_dali_work(void) {
             // Re-check under global-atomic: state may have moved during the
             // selection (LVL0 idle timer / PIT / edge callbacks).
             if (dali_idle && !dali_busy) {
-                mbq_begin(slot, &s_raw_cmd);
+                // If the queue cannot hand us the command, do NOT launch: a
+                // committed launch with no command would put the previous frame
+                // back on the bus. Record it — nothing above can act on it — and
+                // leave the channel idle for the next selection.
+                if (mbq_begin(slot, &s_raw_cmd) != TM_OK) {
+                    tm_fault(TM_SITE_MBQ_BEGIN, TM_ERR_BAD_SLOT);
+                    goto no_launch;
+                }
                 s_raw_slot      = slot;
                 current_op.op   = OP_RAW;
                 current_op.addr = 0xFFu;
@@ -108,6 +123,7 @@ bool start_next_dali_work(void) {
                 dali_cancel_edge_detect();
                 launch = true;
             }
+no_launch: ;
         }
     }
     TCB0.INTCTRL = old_tcb;
@@ -150,7 +166,10 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             else if (type == DALI_RESPONSE_NAK)       { st = MBQ_S_FAILED;   r8 = DALI_RESP_NAK; }
             else if (type == DALI_RESPONSE_MALFORMED) { st = MBQ_S_FAILED;   r8 = DALI_RESP_COLLISION; }
             else                                      { st = MBQ_S_FAILED;   r8 = DALI_RESP_BUSFAULT; }
-            mbq_complete(s_raw_slot, st, r8);
+            // ISR context: no caller to return to, and a dropped completion
+            // strands the slot EXECUTING until reboot. Record it so a stuck slot
+            // is diagnosable over Modbus instead of a mystery.
+            tm_fault(TM_SITE_MBQ_COMPLETE, mbq_complete(s_raw_slot, st, r8));
         }
     }
 
@@ -175,7 +194,8 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 // in it and drives the transition itself.
 void dali_sync_abort_busfault(void) {
     if (current_op.op == OP_RAW)
-        mbq_complete(s_raw_slot, MBQ_S_FAILED, DALI_RESP_BUSFAULT);
+        tm_fault(TM_SITE_MBQ_COMPLETE,
+                 mbq_complete(s_raw_slot, MBQ_S_FAILED, DALI_RESP_BUSFAULT));
     dali_busy     = false;
     current_op.op = OP_NONE;
 }

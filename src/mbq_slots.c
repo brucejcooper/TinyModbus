@@ -49,9 +49,9 @@ static inline bool slot_active(uint8_t st) {
     return st == MBQ_S_PENDING || st == MBQ_S_EXECUTING;
 }
 
-bool mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots) {
-    if (n_slots == 0u || (uint16_t)first_slot + n_slots > MBQ_SLOTS) return false;
-    bool ok = false;
+tm_err_t mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots) {
+    if (n_slots == 0u || (uint16_t)first_slot + n_slots > MBQ_SLOTS) return TM_ERR_BAD_RANGE;
+    tm_err_t err = TM_ERR_BUSY;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         // All-or-nothing: refuse the whole write if ANY targeted slot is active
         // (pending/executing) — a stale-cache write must not clobber in-flight work.
@@ -71,24 +71,30 @@ bool mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots) {
                 s_slot[s].seq          = s_seq_ctr++;
                 s_slot[s].st.status    = MBQ_S_PENDING;
             }
-            ok = true;
+            err = TM_OK;
         }
     }
-    return ok;
+    return err;
 }
 
-void mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
+tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
     // One 16-bit register per slot: [status:8 | response8:8]. Fenced so a single
     // slot's status+response8 are read atomically against the completion writer.
+    tm_err_t err = TM_OK;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
         for (uint8_t i = 0; i < count; i++) {
             uint8_t s = (uint8_t)(sidx + i);
             uint8_t st = 0, r8 = 0;
+            // Out-of-range entries are reported AND zeroed — the caller may still
+            // put this buffer on the wire, and stale bytes would read as real
+            // slot state.
             if (s < MBQ_SLOTS) { st = s_slot[s].st.status; r8 = s_slot[s].st.response8; }
+            else               { err = TM_ERR_BAD_RANGE; }
             out[(uint16_t)i * 2u]      = st;   // hi byte = status
             out[(uint16_t)i * 2u + 1u] = r8;   // lo byte = response8
         }
     }
+    return err;
 }
 
 uint8_t mbq_next_pending(void) {
@@ -105,17 +111,24 @@ uint8_t mbq_next_pending(void) {
     return best;
 }
 
-void mbq_begin(uint8_t slot, mbq_cmd_t *out) {
-    if (slot >= MBQ_SLOTS) return;
+tm_err_t mbq_begin(uint8_t slot, mbq_cmd_t *out) {
+    if (slot >= MBQ_SLOTS) {
+        // Zero the output rather than leaving it untouched: a caller that ignores
+        // this error would otherwise re-fire the command still sitting in *out.
+        for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) out->b[b] = 0;
+        return TM_ERR_BAD_SLOT;
+    }
     for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) out->b[b] = s_slot[slot].cmd.b[b];
     s_slot[slot].st.status = MBQ_S_EXECUTING;   // single-byte store, atomic
+    return TM_OK;
 }
 
-void mbq_complete(uint8_t slot, uint8_t status, uint8_t response8) {
-    if (slot >= MBQ_SLOTS) return;
+tm_err_t mbq_complete(uint8_t slot, uint8_t status, uint8_t response8) {
+    if (slot >= MBQ_SLOTS) return TM_ERR_BAD_SLOT;
     // ORDERING (load-bearing): publish the value BEFORE publishing that it is ready.
     // A fenced reader (mbq_read_status) therefore never sees a terminal status with
     // a stale response8.
     s_slot[slot].st.response8 = response8;
     s_slot[slot].st.status    = status;   // MBQ_S_COMPLETE or MBQ_S_FAILED
+    return TM_OK;
 }

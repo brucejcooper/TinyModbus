@@ -9,6 +9,7 @@
 
 #include "modbus.h"
 #include "registers.h"
+#include "errors.h"
 #include "mbq_slots.h"
 #include "dali.h"
 #include "dali_sync.h"
@@ -99,6 +100,24 @@ typedef enum {
     MB_ERR_TARGET_FAILED       = 0x0B,
     MB_ERR_DALI_PULSE_INVALID  = 0x30,
 } mb_err_t;
+
+// THE translation point: internal cause -> Modbus wire exception. Every other
+// module speaks tm_err_t and knows nothing about these byte values; this is the
+// only place the two vocabularies meet. Keep it total — a new tm_err_t must get
+// a case here, and the default deliberately reports DEVICE_FAILURE rather than
+// guessing, so an unmapped cause is visible as a fault instead of a plausible lie.
+static mb_err_t tm_err_to_modbus(tm_err_t e) {
+    switch (e) {
+        case TM_OK:              return 0;
+        case TM_ERR_NO_SUCH_REG: return MB_ERR_ILLEGAL_ADDRESS;
+        case TM_ERR_BAD_VALUE:   return MB_ERR_ILLEGAL_VALUE;
+        case TM_ERR_BAD_RANGE:   return MB_ERR_ILLEGAL_ADDRESS;
+        case TM_ERR_BUSY:        return MB_ERR_DEVICE_BUSY;
+        case TM_ERR_BAD_SLOT:    return MB_ERR_ILLEGAL_ADDRESS;
+        case TM_ERR_HW_FAULT:    return MB_ERR_DEVICE_FAILURE;
+    }
+    return MB_ERR_DEVICE_FAILURE;
+}
 
 // ---- RS-485 hardware ------------------------------------------------
 
@@ -250,17 +269,6 @@ static void send_error(mb_err_t err) {
 // ILLEGAL_ADDRESS.  present + dirty are packed into the contiguous 0x0100-0x0107
 // ladder so a master can read both in one 8-register FC04 request.
 //
-// addr and count come off the wire as 16-bit values; promoting the sum to
-// uint32_t prevents wrap (e.g. addr=0xFFFF, count=1 -> 0) from sneaking
-// through the upper-bound check.
-static bool fc04_range_allowed(uint16_t addr, uint8_t count) {
-    (void)addr; (void)count;
-    // TASK 05: the contiguous FC04 ladder (present[4] | dirty[4] at 0x0100-0x0107)
-    // is GONE with the gateway's cache. The only FC04 blocks left are the
-    // version, diag and sysinfo special cases, each handled before this check.
-    return false;
-}
-
 // Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
 // at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.
 static void process_fc04(void) {
@@ -295,7 +303,14 @@ static void process_fc04(void) {
         p[6] = (uint8_t)(diag_frames_ok   >> 8); p[7] = (uint8_t)diag_frames_ok;
         p[8] = 0;                                p[9] = diag_last_fail_len;
         for (uint8_t i = 0; i < 16u; i++) p[10 + i] = diag_last_fail[i];
-        // p[26..31] left zero (spare)
+        // reg13: internal fault count (saturating). reg14: the FIRST fault's
+        // identity, [err | site]. These are the errors that had no caller to
+        // return to (see errors.h rule 2) — without them a stranded queue slot or
+        // a refused command launch is invisible from the master's side.
+        uint16_t fc = tm_fault_count();
+        p[26] = (uint8_t)(fc >> 8);          p[27] = (uint8_t)fc;
+        p[28] = (uint8_t)tm_fault_last_err(); p[29] = (uint8_t)tm_fault_last_site();
+        // p[30..31] left zero (spare)
         start_tx(35u);
         return;
     }
@@ -324,23 +339,22 @@ static void process_fc04(void) {
         && (uint32_t)addr + count <= (uint32_t)MBREG_SLOT_STATUS_BASE + MBQ_SLOTS
         && count >= 1u) {
         buf[2] = (uint8_t)(count * 2u);
-        mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE), (uint8_t)count, buf + 3);
+        // The range test above bounds this read, but consume the result rather
+        // than trusting that: a response built from an overrun must not go out.
+        tm_err_t se = mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE),
+                                      (uint8_t)count, buf + 3);
+        if (se != TM_OK) { send_error(tm_err_to_modbus(se)); return; }
         start_tx(3 + buf[2]);
         return;
     }
 
-    if (count == 0 || count > MAX_REG_RD) {
-        send_error(MB_ERR_ILLEGAL_VALUE);
-        return;
-    }
-    if (!fc04_range_allowed(addr, (uint8_t)count)) {
-        send_error(MB_ERR_ILLEGAL_ADDRESS);
-        return;
-    }
-
-    buf[2] = (uint8_t)(count * 2u);
-
-    start_tx(3 + buf[2]);
+    // Every live FC04 block is a special case handled above. What used to follow
+    // was a generic tail that set buf[2] = count*2 and transmitted WITHOUT filling
+    // the payload — harmless only because fc04_range_allowed() returns false
+    // unconditionally, and a stale-buffer leak the moment anyone allow-listed a
+    // range. The allow-list hook is gone with it; a new block adds its own case
+    // above, next to the code that fills the buffer it promises.
+    send_error(MB_ERR_ILLEGAL_ADDRESS);
 }
 
 // ---- FC03 - read holding registers --------------------------------------
@@ -356,16 +370,17 @@ static void process_fc04(void) {
 // upper bound wraps to 0x0001 and the loop would never run while buf[2] already
 // promised 4 bytes.  Iterating by index keeps the count exact; a wrapped
 // reg_addr that maps nowhere fails regs_read_holding and trips ILLEGAL_ADDRESS.
-static bool read_holding_block(uint16_t addr, uint16_t count) {
+static mb_err_t read_holding_block(uint16_t addr, uint16_t count) {
     buf[2] = (uint8_t)(count * 2u);
     uint8_t *rp = buf + 3;
     for (uint16_t i = 0; i < count; i++) {
         uint16_t v = 0;
-        if (!regs_read_holding((uint16_t)(addr + i), &v)) return false;
+        tm_err_t e = regs_read_holding((uint16_t)(addr + i), &v);
+        if (e != TM_OK) return tm_err_to_modbus(e);
         *rp++ = (uint8_t)(v >> 8);
         *rp++ = (uint8_t)v;
     }
-    return true;
+    return 0;
 }
 
 // Validate + execute a write to the v2 slot command block (0x1000-0x100F),
@@ -385,8 +400,9 @@ static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t
     // submit declare twice its length and arm the following slot.
     uint8_t first_slot = (uint8_t)(off / MBQ_CMD_REGS);
     uint8_t n_slots    = (uint8_t)(wr_count / MBQ_CMD_REGS);
-    if (!mbq_submit(first_slot, regs, n_slots))               return MB_ERR_DEVICE_BUSY;
-    return 0;
+    // BUSY (retry later) and BAD_RANGE (never valid) are now distinguishable, so
+    // the master is no longer invited to retry a malformed submit forever.
+    return tm_err_to_modbus(mbq_submit(first_slot, regs, n_slots));
 }
 
 static void process_fc03(void) {
@@ -394,7 +410,8 @@ static void process_fc03(void) {
     uint16_t count = ((uint16_t)buf[4] << 8) | buf[5];
 
     if (count == 0 || count > MAX_REG_RD) { send_error(MB_ERR_ILLEGAL_VALUE); return; }
-    if (!read_holding_block(addr, count)) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
+    mb_err_t e = read_holding_block(addr, count);
+    if (e) { send_error(e); return; }
     start_tx(3 + buf[2]);
 }
 
@@ -406,9 +423,11 @@ static void process_fc03(void) {
 // here. After the task-05 strip the ONLY action register left is
 // MBREG_SYSTEM_RESET — scan-trigger, rescan-interval and commissioning all went
 // with the gateway's state.
-static mb_err_t dispatch_action_reg(uint16_t mb_reg, uint16_t val) {
+static mb_err_t dispatch_action_reg(uint16_t mb_reg) {
     if (mb_reg == MBREG_SYSTEM_RESET) {
-        // regs_write_holding already validated the magic value.  Latch the
+        // regs_write_holding validated the magic and returned TM_ERR_BAD_VALUE if
+        // it was wrong, so reaching here means the value was correct — which is
+        // why this takes no value parameter.  Latch the
         // reset; fire_pending_reset() reboots once the ACK has left the wire.
         pending_reset = true;
         return 0;
@@ -436,20 +455,13 @@ static void process_fc06(void) {
     uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t val  = ((uint16_t)buf[4] << 8) | buf[5];
 
-    if (!regs_write_holding(addr, val)) {
-        // Three failure shapes share the regs_write_holding "false" return:
-        //   - group-register write rejected because group channel is busy
-        //   - 0x1014 commissioning write with an invalid value (illegal value)
-        //   - 0x1014 commissioning write while running (busy)
-        //   - everything else is genuine ILLEGAL_ADDRESS.
-        /* TASK 05: the commissioning register and the group-mask registers are
-         * gone, and with them the only two writes that could fail for a reason
-         * other than "no such register". A rejected write is now unambiguous. */
-        send_error(MB_ERR_ILLEGAL_ADDRESS);
-        return;
-    }
+    // regs_write_holding now names its cause, so an out-of-range baud index gets
+    // ILLEGAL_VALUE and a failed NVM write gets DEVICE_FAILURE, instead of both
+    // being reported as "no such register".
+    tm_err_t we = regs_write_holding(addr, val);
+    if (we != TM_OK) { send_error(tm_err_to_modbus(we)); return; }
     note_runtime_config_write(addr);
-    mb_err_t err = dispatch_action_reg(addr, val);
+    mb_err_t err = dispatch_action_reg(addr);
     if (err) { send_error(err); return; }
     // Echo the request back (standard FC06 response)
     start_tx(6);
@@ -470,7 +482,12 @@ static void process_fc10(void) {
     // one all-or-nothing submit of count/2 command records.  Handled here,
     // before the per-register loop, because it is a block operation (the record
     // count and all-or-nothing free-slot check need the whole write at once).
-    if (addr == MBREG_SLOT_CMD_BASE) {
+    // Any address inside the command block routes to the submit window, not just
+    // the base: submit_window validates slot alignment itself, and FC23 already
+    // accepted a mid-block write. Requiring the exact base here meant an FC10
+    // submit to slot 1+ fell through to the per-register loop and came back
+    // ILLEGAL_ADDRESS — a gratuitous difference between two paths into one queue.
+    if (addr >= MBREG_SLOT_CMD_BASE && addr <= MBREG_SLOT_CMD_END) {
         mb_err_t e = submit_window(addr, count, buf + 7);
         if (e) { send_error(e); return; }
         start_tx(6);   // standard FC10 echo (addr, fc, start, count)
@@ -500,13 +517,10 @@ static void process_fc10(void) {
         uint16_t reg_value = ((uint16_t)payload_ptr[0] << 8) | payload_ptr[1];
         uint16_t r         = addr + i;
         payload_ptr += 2;
-        if (!regs_write_holding(r, reg_value)) {
-            // Same BUSY-vs-ILLEGAL distinction as FC06.
-            send_error(MB_ERR_ILLEGAL_ADDRESS);   /* see process_fc06 */
-            return;
-        }
+        tm_err_t we = regs_write_holding(r, reg_value);
+        if (we != TM_OK) { send_error(tm_err_to_modbus(we)); return; }
         note_runtime_config_write(r);
-        mb_err_t err = dispatch_action_reg(r, reg_value);
+        mb_err_t err = dispatch_action_reg(r);
         if (err) { send_error(err); return; }
     }
     // Standard FC10 response: slave addr, FC, start addr (2), count (2)
@@ -529,7 +543,11 @@ static void process_fc23(void) {
     uint8_t  wr_bytes = buf[10];
 
     if (rd_count == 0 || rd_count > MAX_REG_RD)   { send_error(MB_ERR_ILLEGAL_VALUE); return; }
-    if (wr_bytes != (uint8_t)(wr_count * 2u))     { send_error(MB_ERR_ILLEGAL_VALUE); return; }
+    // Compare in 16-bit: (uint8_t)(wr_count * 2) truncates, so wr_count = 128 with
+    // wr_bytes = 0 used to pass this check. submit_window's range test caught it
+    // downstream, but a length check that a crafted length can walk through should
+    // not be relying on a later check to save it.
+    if ((uint16_t)wr_bytes != (uint16_t)(wr_count * 2u)) { send_error(MB_ERR_ILLEGAL_VALUE); return; }
 
     // --- WRITE FIRST ---
     // The only writable FC23 target is the queue submit window.  wr_count == 0
@@ -545,7 +563,8 @@ static void process_fc23(void) {
     // --- THEN READ (holding space, incl. the 0x1010 status block) ---
     // The write (if any) already executed; a bad read range is a malformed
     // request (the controller always pairs its submit with a valid status read).
-    if (!read_holding_block(rd_addr, rd_count)) { send_error(MB_ERR_ILLEGAL_ADDRESS); return; }
+    mb_err_t rd_err = read_holding_block(rd_addr, rd_count);
+    if (rd_err) { send_error(rd_err); return; }
     start_tx(3 + buf[2]);
 }
 

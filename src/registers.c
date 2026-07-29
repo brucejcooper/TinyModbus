@@ -60,28 +60,6 @@ static bool userrow_write_byte(uint8_t offset, uint8_t value) {
     return true;
 }
 
-// Update two adjacent bytes of USERROW in a single page-erase-write cycle.
-// Used for the 16-bit rescan interval so a config write costs one 3.4 ms
-// stall, not two.
-static bool userrow_write_word(uint8_t offset_hi, uint8_t hi, uint8_t lo) {
-    if ((uint16_t)offset_hi + 1u >= sizeof(USERROW)) return false;
-
-    volatile uint8_t *userrow_bytes = (volatile uint8_t *)&USERROW;
-    while (NVMCTRL.STATUS & NVMCTRL_FBUSY_bm) {}
-    if (userrow_bytes[offset_hi] == hi && userrow_bytes[offset_hi + 1u] == lo)
-        return true;
-
-    for (uint8_t i = 0; i < sizeof(USERROW); i++) {
-        uint8_t b;
-        if      (i == offset_hi)        b = hi;
-        else if (i == offset_hi + 1u)   b = lo;
-        else                            b = userrow_bytes[i];
-        userrow_bytes[i] = b;
-    }
-    userrow_commit();
-    return true;
-}
-
 uint8_t userrow_get_slave_addr(void) {
     // 0xFF (post-erase) -> 1 (default).  0xF6..0xFD would map to reserved IDs
     // 248..255; 0xFE would wrap to 0 (broadcast); both clamped to 1.
@@ -89,12 +67,12 @@ uint8_t userrow_get_slave_addr(void) {
     return (v >= 0xF6 && v != 0xFF) ? 1 : (uint8_t)(v + 2);
 }
 
-bool userrow_set_slave_addr(uint8_t addr) {
-    if (addr < 1 || addr > 247) return false;
+tm_err_t userrow_set_slave_addr(uint8_t addr) {
+    if (addr < 1 || addr > 247) return TM_ERR_BAD_VALUE;
     // addr == 1 stores 0xFF so the default (post-erase) chip continues to
     // come up at address 1.  All other addresses store (addr - 2).
     uint8_t v = (addr == 1) ? 0xFF : (uint8_t)(addr - 2);
-    return userrow_write_byte(USERROW_OFFSET_SLAVE_ADDR, v);
+    return userrow_write_byte(USERROW_OFFSET_SLAVE_ADDR, v) ? TM_OK : TM_ERR_HW_FAULT;
 }
 
 uint8_t userrow_get_baud_index(void) {
@@ -102,9 +80,9 @@ uint8_t userrow_get_baud_index(void) {
     return (v <= 2) ? v : 0;
 }
 
-bool userrow_set_baud_index(uint8_t idx) {
-    if (idx > 2) return false;
-    return userrow_write_byte(USERROW_OFFSET_BAUD_INDEX, idx);
+tm_err_t userrow_set_baud_index(uint8_t idx) {
+    if (idx > 2) return TM_ERR_BAD_VALUE;
+    return userrow_write_byte(USERROW_OFFSET_BAUD_INDEX, idx) ? TM_OK : TM_ERR_HW_FAULT;
 }
 
 
@@ -123,7 +101,7 @@ void regs_init(void) {
 
 // ---- FC03 holding read -------------------------------------------------
 
-bool regs_read_holding(uint16_t addr, uint16_t *val) {
+tm_err_t regs_read_holding(uint16_t addr, uint16_t *val) {
     // 0x0000-0x00FF and 0x0110-0x014F are GONE (task 05): the arc/status bank,
     // the presence/dirty bitmaps and the group masks were the gateway's cache of
     // the bus, and the gateway no longer caches anything. They fall through to
@@ -144,22 +122,25 @@ bool regs_read_holding(uint16_t addr, uint16_t *val) {
     // to ILLEGAL DATA ADDRESS (retired v1 QRES[6/7]).
     if (addr >= MBREG_SLOT_STATUS_BASE && addr <= MBREG_SLOT_STATUS_END) {
         uint8_t out[2];
-        mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE), 1u, out);
+        // The address is bounds-checked above, so this cannot overrun; hand the
+        // status back anyway rather than assuming.
+        tm_err_t e = mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE), 1u, out);
+        if (e != TM_OK) return e;
         *val = ((uint16_t)out[0] << 8) | out[1];
-        return true;
+        return TM_OK;
     }
 
     switch (addr) {
         // Action registers read as 0 (write-only by convention).
-        case MBREG_SLAVE_ADDR:      *val = userrow_get_slave_addr();      return true;
-        case MBREG_BAUD_INDEX:      *val = userrow_get_baud_index();      return true;
-        default:     return false;
+        case MBREG_SLAVE_ADDR:      *val = userrow_get_slave_addr();      return TM_OK;
+        case MBREG_BAUD_INDEX:      *val = userrow_get_baud_index();      return TM_OK;
+        default:                                              return TM_ERR_NO_SUCH_REG;
     }
 }
 
 // ---- FC06/FC10 holding write -------------------------------------------
 
-bool regs_write_holding(uint16_t addr, uint16_t val) {
+tm_err_t regs_write_holding(uint16_t addr, uint16_t val) {
     // 0x0110-0x014F group masks: GONE. The controller diffs membership against
     // its own cache and emits ADD/REMOVE FROM GROUP itself, so the gateway no
     // longer needs the mask, the diff, or the fan-out state machine — and a
@@ -167,17 +148,21 @@ bool regs_write_holding(uint16_t addr, uint16_t val) {
     // original group-toggle failure possible.
 
     switch (addr) {
+        // The setters distinguish BAD_VALUE from HW_FAULT themselves, so this
+        // forwards rather than re-deriving the ranges in a second place.
+        // A 16-bit val above 255 would truncate into range, so check width here.
         case MBREG_SLAVE_ADDR:
+            if (val > 0xFFu) return TM_ERR_BAD_VALUE;
             return userrow_set_slave_addr((uint8_t)val);
         case MBREG_BAUD_INDEX:
+            if (val > 0xFFu) return TM_ERR_BAD_VALUE;
             return userrow_set_baud_index((uint8_t)val);
         case MBREG_SYSTEM_RESET:
             // Validate the magic here; dispatch_action_reg latches the deferred
-            // reset so the FC06/FC10 ACK can still go out before we reboot.  A
-            // wrong value falls through to ILLEGAL_ADDRESS.
-            return (val == MBREG_SYSTEM_RESET_MAGIC);
+            // reset so the FC06/FC10 ACK can still go out before we reboot.
+            return (val == MBREG_SYSTEM_RESET_MAGIC) ? TM_OK : TM_ERR_BAD_VALUE;
         default:
-            return false;
+            return TM_ERR_NO_SUCH_REG;
     }
 }
 

@@ -97,6 +97,14 @@ tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
     return err;
 }
 
+bool mbq_has_work(void) {
+    for (uint8_t i = 0; i < MBQ_SLOTS; i++) {
+        uint8_t st = s_slot[i].st.status;
+        if (st == MBQ_S_PENDING || st == MBQ_S_EXECUTING) return true;
+    }
+    return false;
+}
+
 uint8_t mbq_next_pending(void) {
     // Lowest accept-sequence PENDING slot; wrap-aware (modular) compare over the
     // ≤8 live window. Only main mutates PENDING slots, so no fence needed (single-

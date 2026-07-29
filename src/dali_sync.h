@@ -63,14 +63,21 @@ static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
 #define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
 #define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse, stuck bus)
 
-// The channel's state (dali_chan / DALI_CHAN_*) is declared in dali.h — it spans
-// both layers, so it lives in the lower one that this header already includes.
+// True while this gateway is running a queued command — i.e. one slot is
+// MBQ_S_EXECUTING and we hold the wire for it, across the whole multi-frame
+// sequence including the quiet inter-frame gaps.
+//
+// Derived from the slot handle we need anyway, not a separate flag, so it cannot
+// disagree with the queue. The bit-level machine asks this to decide "dispatch
+// the next step" versus "park" — the one fact about us that "is the bus busy"
+// cannot answer, since the bus is quiet between frames of a send-twice.
+bool dali_sync_owns_channel(void);
 
 // The "operation in flight" struct is gone. It held three fields, of which:
 //   op    duplicated the busy flag exactly — both were set together and cleared
 //         together at every site, so keeping them in agreement across an ISR
 //         boundary was a standing hazard with no benefit. That flag has since
-//         become DALI_CHAN_EXECUTING (dali.h); the enum here had a single
+//         become dali_sync_owns_channel(); the enum here had a single
 //         meaningful value (OP_RAW) once the background work selector went in
 //         task 05.
 //   addr  was written 0xFF at launch and never read by anything.
@@ -110,7 +117,7 @@ typedef enum __attribute__((packed)) {
 bool dali_sync_repeat_send(void);
 
 // Completion handler — called from dali_result_received (dali_state_idle.c)
-// while the channel is DALI_CHAN_EXECUTING. Runs in ISR context.
+// while we own the channel. Runs in ISR context.
 void dali_sync_completion(dali_response_type_t type, uint8_t value);
 
 // Dispatch the next step of the in-flight op, called when the bus goes idle.

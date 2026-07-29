@@ -99,6 +99,12 @@ tm_err_t mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots);
 // response must not carry stale bytes onto the wire.
 tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
 
+// True if any slot is PENDING or EXECUTING — i.e. the queue has work that still
+// needs CPU. Terminal slots do not count: an uncollected COMPLETE/FAILED result
+// just waits for the master to read it and needs nothing from us. This is the
+// queue half of the main loop's sleep decision.
+bool mbq_has_work(void);
+
 // Arbiter hook: the lowest accept-sequence PENDING slot (0..MBQ_SLOTS-1), or
 // MBQ_NONE if none is pending. Wrap-aware over the small live window.
 uint8_t mbq_next_pending(void);

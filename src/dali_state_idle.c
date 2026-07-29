@@ -6,6 +6,8 @@
 #include "dali.h"
 #include "dali_sync.h"
 
+volatile bool dali_bus_busy = true;
+
 // ---- Internal helpers ---------------------------------------------------
 
 // Rising edge while parked: SOMETHING asserted the bus and it was not us. Yield
@@ -23,7 +25,7 @@
 // "we are executing" are different questions: here the bus is very much busy and
 // we own nothing.
 static void external_message_started(void) {
-    dali_chan = DALI_CHAN_YIELDED;
+    dali_bus_busy = true;
     dali_cancel_edge_detect();
     dali_wait_for_idle_state_enter();
 }
@@ -47,7 +49,7 @@ static void external_message_started(void) {
 //      logical step or releases the channel.
 
 void dali_result_received(dali_response_type_t type, uint8_t value) {
-    if (dali_chan == DALI_CHAN_EXECUTING) {
+    if (dali_sync_owns_channel()) {
         if (dali_sync_repeat_send()) return;
         dali_sync_completion(type, value);
         return;
@@ -58,21 +60,20 @@ void dali_result_received(dali_response_type_t type, uint8_t value) {
 // ---- dali_idle_state_enter ---------------------------------------------
 //
 // Two branches:
-//   1. Still EXECUTING: we just finished the
+//   1. The queue still owns a command: we just finished the
 //      inter-frame gap of a multi-step sequence. Dispatch its next step via
 //      dali_sync_dispatch_current — and do NOT go PARKED, because the
 //      wire is still ours.
-//   2. Otherwise: arm the bus monitor and go PARKED, so main() may kick
+//   2. Otherwise: arm the bus monitor and park, so main() may kick
 //      start_next_dali_work.
 
 void dali_idle_state_enter(void) {
     // Belt-and-braces: ensure the DALI TX line is released before entering idle.
     DALI_PORT.OUTCLR = DALI_TX_bm;
 
-    if (dali_chan == DALI_CHAN_EXECUTING) {
-        // Stay EXECUTING: the wire is still ours mid-sequence, so only the
-        // rising-edge monitor needs disarming. (The old cleanup() also cleared
-        // the idle flag here, which was already false by the invariant.)
+    if (dali_sync_owns_channel()) {
+        // The queue still owns this command — we are between frames of a
+        // multi-step sequence, not finished. Do not park; the wire stays ours.
         dali_cancel_edge_detect();
         if (dali_is_bus_active()) {
             dali_wait_for_idle_state_enter();
@@ -82,7 +83,7 @@ void dali_idle_state_enter(void) {
         return;
     }
 
-    dali_chan = DALI_CHAN_PARKED;
+    dali_bus_busy = false;
     dali_state_receiving_prepare();
     dali_call_on_rising_once(external_message_started);
 }

@@ -68,50 +68,35 @@ typedef enum {
 
 // ---- Public interface --------------------------------------------------
 
-// THE DALI CHANNEL'S STATE — one variable, three states, and a fourth that can
-// no longer be written down.
+// IS SOMETHING GOING ON ON THE DALI BUS? That is the whole question this
+// answers, and the only thing outside the bit-level machine needs to know about
+// the wire. True while we are transmitting, while a response window is open,
+// while the mandatory 22 TE quiet period is counting down, and while another
+// master or a fault holds the line. False only when parked: TX released,
+// receiver armed, monitor watching, nothing outstanding.
 //
-// This replaces the pair dali_idle + dali_busy (briefly dali_line_idle +
-// dali_cmd_executing). Two bools describe four combinations, but only three of
-// them are legal, and the illegal one — parked AND executing — would mean two
-// writers driving the wire at once. That invariant used to be a paragraph of
-// comment held up by the discipline of two writes staying in step; now the type
-// simply cannot express it.
+// IT STAYS TRUE THROUGH THE POST-COMMAND SETTLE, and that is the point. DALI
+// requires a quiet gap before the next frame, so the bus is not free the instant
+// a transaction ends. This flag — not the queue's state — is what stops the next
+// command starting too early.
 //
-// It also removes a consistency hazard of the same shape as the op/busy pair
-// deleted earlier: a single-byte store is atomic on this core, so no reader can
-// ever catch the channel half-transitioned between the two flags.
+// Deliberately decoupled from when the MASTER learns the outcome. The slot goes
+// terminal in dali_sync_completion the moment the transaction ends (right after
+// the last stop bit for an answerless frame, or when the response window
+// closes), so a master can collect its result and submit the next command while
+// this is still true for our settle. Publishing the result and freeing the wire
+// are two different events and must not be tied together — tying them would add
+// the whole 22 TE to every round trip the master sees.
 //
-// NOTE what none of these states is: "the wire is electrically asserted right
-// now". That is dali_is_bus_active(), which reads the RX pin, and it is why
-// "busy" was the wrong word — the bus is busy whenever ANOTHER master is
-// sending, while this gateway owns nothing at all.
-typedef enum __attribute__((packed)) {
-    // Parked on an idle wire: TX released, receiver armed, rising-edge monitor
-    // watching for another master. The ONLY state from which new work may
-    // launch — main() gates on exactly this.
-    DALI_CHAN_PARKED = 0,
-
-    // Exactly one queue slot is MBQ_S_EXECUTING and we are running its command.
-    // Held across the whole multi-frame sequence (DTR0 preload + frame +
-    // send-twice repeat) so nothing interleaves within one slot's lifecycle,
-    // including across the inter-frame gaps where the wire is briefly quiet.
-    // Rises with mbq_begin(), falls when that slot goes terminal.
-    DALI_CHAN_EXECUTING,
-
-    // The wire is not ours to use, but we owe nothing. This is the state that
-    // proved the old "idle"/"busy" pair were not inverses.
-    //
-    // Reached on EVERY command completion (dali_sync_completion releases the
-    // slot here, and wait-for-idle re-parks us), so it is the most travelled
-    // transition in the file — not an exceptional one. Also reached when
-    // something else asserts the bus while we are parked
-    // (external_message_started: a late backward frame, noise, a short, or a
-    // second master), and when a stuck bus times out and
-    // dali_sync_abort_busfault() releases the command mid-recovery.
-    DALI_CHAN_YIELDED,
-} dali_chan_t;
-extern volatile dali_chan_t dali_chan;
+// It says nothing about whether a command is in flight; the queue owns that, as
+// MBQ_S_EXECUTING, via dali_sync_owns_channel(). Between the frames of a
+// send-twice the bus IS busy and a command IS in flight; while another master
+// sends, the bus is busy and no command is. Both facts are needed and neither
+// implies the other.
+//
+// LOAD-BEARING for sleep: false means no TCA0 deadline is outstanding. TCA0 has
+// no RUNSTDBY bit and so STOPS in standby — see the sleep gate in main().
+extern volatile bool dali_bus_busy;
 
 // Initialise TX/RX pins and TCB0 edge-capture, then enter wait-for-idle to let
 // the bus settle after reset. (The RTC PIT it used to start belongs to

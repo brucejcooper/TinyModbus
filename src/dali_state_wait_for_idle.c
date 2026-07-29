@@ -27,8 +27,8 @@ static void on_idle_bus(void) {
 // Safety escape: bus held high for 200 TE without clearing.
 // Force TX low (release any stuck open-drain drive) and recover.
 //
-// This is the path that produces DALI_CHAN_YIELDED from EXECUTING: the command
-// is released while the wire is still not ours.
+// This is the path that releases a command without the wire being ours again:
+// the slot is failed and the handle cleared while recovery continues.
 //
 // Without releasing the command here, dali_idle_state_enter takes its
 // "busy" branch and re-enters wait_for_idle on the still-shorted bus —

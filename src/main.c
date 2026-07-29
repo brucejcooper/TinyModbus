@@ -11,6 +11,7 @@
 #include "tick.h"
 #include "dali.h"
 #include "dali_sync.h"
+#include "mbq_slots.h"
 #include "modbus.h"
 
 // Fuse configuration.  Emits a `.fuse` section in the ELF; the Makefile's
@@ -98,15 +99,23 @@ int main(void) {
 
     for (;;) {
         modbus_process();
-        // Launch new work only when we are parked on an idle wire AND own no
-        // command — the one combination of the two layers that permits it.
-        if (dali_chan == DALI_CHAN_PARKED)
-            start_next_dali_work();
+        // Executing -> wait; pending -> start it; neither -> nothing. All three
+        // decisions live in start_next_dali_work, which reads them off the queue
+        // and the line rather than a summary kept in step with them.
+        start_next_dali_work();
         wdt_reset();
 
         // Sleep left ENABLED — confirmed (again) NOT the cause of the deafness:
         // with sleep disabled and scanning disabled the gateway is still dead.
-        if (dali_chan == DALI_CHAN_PARKED && modbus_idle)
+        // Sleep when the queue has nothing needing CPU and Modbus is quiet.
+        //
+        // dali_bus_busy is NOT redundant with the queue check, and dropping it
+        // would be a latency bug: TCA0 has no RUNSTDBY bit, so it STOPS in
+        // standby. The moment a command completes its slot goes terminal — the
+        // queue has no work — while the state machine is still counting out the
+        // 22 TE settle on TCA0. Sleeping there strands that countdown until the
+        // 1 Hz PIT happens to wake us.
+        if (!dali_bus_busy && !mbq_has_work() && modbus_idle)
             sleep_cpu();
     }
 }

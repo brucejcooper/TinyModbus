@@ -25,22 +25,26 @@
 #include "mbq_slots.h"
 #include "tick.h"
 
-volatile dali_chan_t dali_chan;
 
-// The executing slot and its unpacked opaque command [addr, data, flags, dtr0].
-static uint8_t s_raw_slot;
+// The slot we are running and its unpacked command [addr, data, flags, dtr0].
+// MBQ_NONE means we own nothing — so this handle, which we need anyway to call
+// mbq_complete, IS the "is a command in flight" flag. No separate bool can
+// disagree with it, and the queue's own MBQ_S_EXECUTING remains the truth.
+static uint8_t s_raw_slot = MBQ_NONE;
 static mbq_cmd_t s_raw_cmd;
 
-// Where we are in the executing command. Meaningless unless DALI_CHAN_EXECUTING.
+// Where we are in the executing command. Meaningless unless we own the channel.
 // Together
 // with s_raw_cmd this is the WHOLE issuance state — see dali_sync.h.
 static volatile dali_step_t s_step;
 
 void dali_sync_init(void) {
-    // dali_init() follows and enters wait-for-idle, so start there rather than
-    // claiming to be parked before the bus has been observed.
-    dali_chan = DALI_CHAN_YIELDED;
+    s_raw_slot = MBQ_NONE;
     mbq_init();
+}
+
+bool dali_sync_owns_channel(void) {
+    return s_raw_slot != MBQ_NONE;
 }
 
 // ---- Dispatch ---------------------------------------------------------
@@ -64,7 +68,7 @@ static void dispatch_step(void) {
 }
 
 void dali_sync_dispatch_current(void) {
-    if (dali_chan != DALI_CHAN_EXECUTING) {
+    if (!dali_sync_owns_channel()) {
         // The caller reaches here only with the channel claimed, so returning
         // quietly parks the DALI channel busy with nothing in flight — a stall
         // that clears only via the bus escape timeout.
@@ -90,34 +94,40 @@ bool dali_sync_repeat_send(void) {
 // ---- Work selection ---------------------------------------------------
 
 bool start_next_dali_work(void) {
+    // The whole main-loop decision, in the order the questions actually matter:
+    //
+    //   1. A command is executing -> nothing to do but let it finish.
+    //   2. Otherwise, a command is pending -> start it, if the wire is ours.
+    //   3. Neither -> nothing to do.
+    //
+    // All three answers come from the queue and the line, with no gateway-side
+    // summary of either to fall out of step with them.
+    if (dali_sync_owns_channel()) return false;
+    if (dali_bus_busy)            return false;   // bus not free yet (incl. settle)
+
     bool launch = false;
     uint8_t old_tcb = TCB0.INTCTRL;
     TCB0.INTCTRL = 0;   // fence the LVL1 completion handler across the selection
 
-    uint8_t slot = MBQ_NONE;
-    if (dali_chan == DALI_CHAN_PARKED) slot = mbq_next_pending();
-
+    uint8_t slot = mbq_next_pending();
     if (slot != MBQ_NONE) {
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-            // Re-check under global-atomic: state may have moved during the
-            // selection (LVL0 idle timer / PIT / edge callbacks).
-            // Still ATOMIC: not to keep two flags in step (one byte cannot
-            // tear) but because this is a test-and-set against the LVL0 idle
-            // timer / PIT / edge callbacks.
-            if (dali_chan == DALI_CHAN_PARKED) {
+            // Re-check as a test-and-set: the line may have been taken during
+            // the selection by an LVL0 idle-timer / PIT / edge callback.
+            if (!dali_bus_busy && !dali_sync_owns_channel()) {
                 // If the queue cannot hand us the command, do NOT launch: a
                 // committed launch with no command would put the previous frame
                 // back on the bus. Record it — nothing above can act on it — and
-                // leave the channel idle for the next selection.
+                // leave the line parked for the next selection.
                 if (mbq_begin(slot, &s_raw_cmd) != TM_OK) {
                     tm_fault(TM_SITE_MBQ_BEGIN, TM_ERR_BAD_SLOT);
                     goto no_launch;
                 }
-                s_raw_slot  = slot;
+                s_raw_slot = slot;          // we now own the channel
                 // A command without QF_DTR0 has no preload step to run.
                 s_step = (dali_frame_of(&s_raw_cmd).flags & QF_DTR0)
                              ? DALI_STEP_DTR0 : DALI_STEP_FRAME;
-                dali_chan = DALI_CHAN_EXECUTING;
+                dali_bus_busy = true;
                 dali_cancel_edge_detect();
                 launch = true;
             }
@@ -127,9 +137,9 @@ no_launch: ;
     TCB0.INTCTRL = old_tcb;
 
     if (launch) {
-        // Committed to a send. If another master is driving the bus, wait for
-        // it to clear; the wait-for-idle -> idle-state-enter path re-enters and
-        // dispatches via dali_sync_dispatch_current (still EXECUTING).
+        // Committed to a send. If something else is driving the bus, wait for it
+        // to clear; the wait-for-idle -> idle-state-enter path re-enters and
+        // dispatches via dali_sync_dispatch_current.
         if (dali_is_bus_active()) dali_wait_for_idle_state_enter();
         else                      dali_sync_dispatch_current();
     }
@@ -141,7 +151,7 @@ no_launch: ;
 void dali_sync_completion(dali_response_type_t type, uint8_t value) {
     bool more = false;
 
-    if (dali_chan == DALI_CHAN_EXECUTING) {
+    if (dali_sync_owns_channel()) {
         // DTR0 preload just finished (no backward frame, so OK/NAK both mean
         // "done"). Advance to the frame within the SAME slot lifecycle; a real
         // bus error falls through to terminal handling below.
@@ -169,7 +179,7 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
         }
     }
 
-    if (!more) dali_chan = DALI_CHAN_YIELDED;   // wait-for-idle re-parks us
+    if (!more) s_raw_slot = MBQ_NONE;   // released; wait-for-idle re-parks us
 
     // Always go through the wait-for-idle gap. When we stay EXECUTING,
     // dali_idle_state_enter dispatches the next step via
@@ -186,9 +196,9 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 // Deliberately does NOT re-enter the wait-for-idle path — the caller is already
 // in it and drives the transition itself.
 void dali_sync_abort_busfault(void) {
-    if (dali_chan == DALI_CHAN_EXECUTING)
+    if (dali_sync_owns_channel())
         tm_fault(TM_SITE_MBQ_COMPLETE,
                  mbq_complete(s_raw_slot, MBQ_S_FAILED, DALI_RESP_BUSFAULT));
-    dali_chan = DALI_CHAN_YIELDED;
+    s_raw_slot = MBQ_NONE;
 }
 

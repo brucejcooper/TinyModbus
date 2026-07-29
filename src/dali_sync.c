@@ -25,38 +25,41 @@
 #include "mbq_slots.h"
 #include "tick.h"
 
-volatile bool        dali_busy;
-volatile dali_step_t s_active;
-volatile uint32_t    g_uptime_s;
+volatile bool     dali_busy;
+volatile uint32_t g_uptime_s;
 
 // The executing slot and its unpacked opaque command [addr, data, flags, dtr0].
 static uint8_t s_raw_slot;
 static mbq_cmd_t s_raw_cmd;
 
-// Which half of a QF_DTR0 pair is in flight: 0 = the DTR0 preload, 1 = the frame.
-// Meaningless unless dali_busy; file-static because nothing outside this module
-// has ever read it.
-static volatile uint8_t s_dtr0_step;
+// Where we are in the executing command. Meaningless unless dali_busy. Together
+// with s_raw_cmd this is the WHOLE issuance state — see dali_sync.h.
+static volatile dali_step_t s_step;
 
 void dali_sync_init(void) {
     dali_busy = false;
     mbq_init();
 }
 
-void issue_dali_command(uint8_t addr_byte, uint8_t data_byte, dali_kind_t kind) {
-    // No cache invalidation any more — there is no cache to invalidate. The
-    // controller decides what to re-read after a command.
-    s_active.kind   = kind;
-    s_active.addr   = addr_byte;
-    s_active.data   = data_byte;
-    // Derived, not passed: a SET-class command is two sends by definition, so a
-    // separate repeat argument could only ever agree with the kind or be wrong.
-    s_active.repeat = (kind == DALI_KIND_TWICE) ? 2u : 1u;
-
-    dali_transmitting_state_enter((const dali_step_t *)&s_active);
-}
-
 // ---- Dispatch ---------------------------------------------------------
+
+// Put the current step on the wire. Both bytes and the window decision are
+// DERIVED here from the command plus s_step — this is the only place that
+// knows how a queued command maps onto sends.
+static void dispatch_step(void) {
+    dali_frame_t f = dali_frame_of(&s_raw_cmd);
+
+    if (s_step == DALI_STEP_DTR0) {
+        // The preload never awaits an answer, whatever the frame after it does.
+        dali_transmitting_state_enter(DALI_ADDR_SET_DTR0, f.dtr0, false);
+        return;
+    }
+    // A frame step holds the window open to receive a backward frame
+    // (QF_ANSWER) or to provide the 22 TE inter-send gap (QF_TWICE — both of
+    // its sends use it).
+    dali_transmitting_state_enter(f.addr, f.data,
+                                  (f.flags & (QF_ANSWER | QF_TWICE)) != 0u);
+}
 
 void dali_sync_dispatch_current(void) {
     if (!dali_busy) {
@@ -66,24 +69,20 @@ void dali_sync_dispatch_current(void) {
         tm_fault(TM_SITE_DALI_ISSUE, TM_ERR_BAD_SLOT);
         return;
     }
+    dispatch_step();
+}
 
-    // Unpack the executing slot's opaque command and issue it. A QF_DTR0
-    // command is a two-step atomic sequence — step 0 preloads DTR0, step 1
-    // sends the frame — back-to-back with nothing interleaved, because
-    // dali_busy stays held across the pair (one slot's lifecycle).
+// The second send of a QF_TWICE command, re-fired from the completion path
+// (ISR) before the slot is allowed to go terminal. Returns true if another send
+// was issued. Replaces a mutable repeat counter: "which send is this" IS the
+// step, so there is nothing to decrement and nothing that can disagree with the
+// command's own flags.
+bool dali_sync_repeat_send(void) {
     dali_frame_t f = dali_frame_of(&s_raw_cmd);
-
-    if ((f.flags & QF_DTR0) && s_dtr0_step == 0u) {
-        issue_dali_command(DALI_ADDR_SET_DTR0, f.dtr0, DALI_KIND_CMD);
-        return;
-    }
-    // Terminal frame. KIND from the flags byte:
-    //   QF_TWICE  -> send twice (SET-class), no answer
-    //   QF_ANSWER -> KIND_QUERY, open the backward-frame window
-    //   else      -> KIND_CMD, completes as soon as the frame is out
-    if (f.flags & QF_TWICE)       issue_dali_command(f.addr, f.data, DALI_KIND_TWICE);
-    else if (f.flags & QF_ANSWER) issue_dali_command(f.addr, f.data, DALI_KIND_QUERY);
-    else                          issue_dali_command(f.addr, f.data, DALI_KIND_CMD);
+    if (s_step != DALI_STEP_FRAME || !(f.flags & QF_TWICE)) return false;
+    s_step = DALI_STEP_FRAME_2;
+    dispatch_step();
+    return true;
 }
 
 // ---- Work selection ---------------------------------------------------
@@ -110,7 +109,9 @@ bool start_next_dali_work(void) {
                     goto no_launch;
                 }
                 s_raw_slot  = slot;
-                s_dtr0_step = 0;
+                // A command without QF_DTR0 has no preload step to run.
+                s_step = (dali_frame_of(&s_raw_cmd).flags & QF_DTR0)
+                             ? DALI_STEP_DTR0 : DALI_STEP_FRAME;
                 dali_busy   = true;
                 dali_idle   = false;
                 dali_cancel_edge_detect();
@@ -137,14 +138,12 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
     bool more = false;
 
     if (dali_busy) {
-        dali_frame_t f = dali_frame_of(&s_raw_cmd);
-
         // DTR0 preload just finished (no backward frame, so OK/NAK both mean
         // "done"). Advance to the frame within the SAME slot lifecycle; a real
         // bus error falls through to terminal handling below.
-        if ((f.flags & QF_DTR0) && s_dtr0_step == 0u
+        if (s_step == DALI_STEP_DTR0
             && (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK)) {
-            s_dtr0_step = 1u;
+            s_step = DALI_STEP_FRAME;
             more = true;
         } else {
             // Terminal. Map the DALI outcome to the slot's (status, response8):

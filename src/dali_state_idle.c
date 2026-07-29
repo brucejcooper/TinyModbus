@@ -32,24 +32,18 @@ static void external_message_started(void) {
 //
 // Two intercepts before dispatch:
 //
-//   1. s_active.repeat > 1: this is a DALI_KIND_TWICE (raw twice, group bit,
-//      SET commands within multi-step writes).  Decrement the repeat
-//      counter and re-fire dali_transmitting_state_enter immediately —
-//      no inter-frame gap, matching the legacy queue mechanism.  This
-//      keeps the bit-level state machine semantics identical to the
-//      pre-refactor code (the 22 TE inter-send window is provided by
-//      wait_for_response between the two sends).
+//   1. dali_sync_repeat_send(): a send-twice command's second send. The
+//      issuance layer decides — it owns the command and the step — and
+//      re-fires immediately with no inter-frame gap here, because the 22 TE
+//      inter-send window is provided by wait_for_response between the two
+//      sends. This file no longer keeps a repeat counter of its own.
 //
 //   2. otherwise: dispatch to dali_sync_completion which advances the
 //      logical step or releases the channel.
 
 void dali_result_received(dali_response_type_t type, uint8_t value) {
     if (dali_busy) {
-        if (s_active.repeat > 1u) {
-            s_active.repeat--;
-            dali_transmitting_state_enter((const dali_step_t *)&s_active);
-            return;
-        }
+        if (dali_sync_repeat_send()) return;
         dali_sync_completion(type, value);
         return;
     }

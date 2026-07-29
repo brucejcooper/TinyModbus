@@ -26,7 +26,6 @@
 #include <avr/io.h>
 
 #include "dali.h"
-#include "types.h"
 #include "mbq_slots.h"
 
 // ---- DALI payload mapping (the ONLY DALI-specific part of the queue) -------
@@ -89,14 +88,30 @@ void dali_sync_init(void);
 // a command was launched. Called from the main loop.
 bool start_next_dali_work(void);
 
-// dali_kind_t moved to types.h, next to the step struct that carries it.
-// The send count is implied by the kind (TWICE = 2, everything else = 1) and is
-// no longer passed separately — a caller could previously pass a repeat that
-// contradicted the kind.
-void issue_dali_command(uint8_t addr_byte, uint8_t data_byte, dali_kind_t kind);
+// WHERE THE ISSUANCE STATE LIVES: the executing slot's 4-byte command, plus
+// this. Nothing else.
+//
+// There used to be a parallel copy — a struct holding {kind, addr, data,
+// repeat} — populated from the command on every send. Every field of it was
+// derivable from the command and the step:
+//   addr/data  DTR0 preload sends (0xA3, dtr0); any frame step sends the
+//              command's own addr/data bytes.
+//   kind       QF_TWICE / QF_ANSWER / neither, and a preload is never a query
+//              regardless of what the frame after it is.
+//   repeat     a send-twice is two sends by definition; the countdown is just
+//              "which of the two is this", i.e. the step.
+// Keeping that copy meant the same facts existed twice and could disagree.
+// The command is the single source of truth; this says where we are in it.
+typedef enum __attribute__((packed)) {
+    DALI_STEP_DTR0 = 0,   // 0xA3<dtr0> preload — only for a QF_DTR0 command
+    DALI_STEP_FRAME,      // the command frame itself (first send)
+    DALI_STEP_FRAME_2,    // its second send — only for a QF_TWICE command
+} dali_step_t;
 
-// The step currently on the wire, consumed by the bit-level state machine.
-extern volatile dali_step_t s_active;
+// Re-fire the second send of a QF_TWICE command. Called from
+// dali_result_received (ISR) BEFORE the slot is allowed to go terminal; returns
+// true if another send went out, false if this command is done sending.
+bool dali_sync_repeat_send(void);
 
 // Completion handler — called from dali_result_received (dali_state_idle.c)
 // when dali_busy is true. Runs in ISR context.

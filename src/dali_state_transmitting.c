@@ -5,22 +5,21 @@
 #include "dali.h"
 #include "dali_sync.h"
 #include "tick.h"
-#include "types.h"
 
 static volatile uint16_t shift_reg;
 static volatile uint8_t  bits_left;
 
-// Last stop bit has been sent.  The step's kind decides what happens next:
-//   DALI_KIND_QUERY: arm the backward frame window (response or 22 TE timeout).
-//   DALI_KIND_TWICE: hold the 22 TE inter-send gap via that same window.
-//   DALI_KIND_CMD:   no response expected; complete immediately so the caller
-//                    can advance state before the 22 TE idle gap.
+// Whether the send in flight keeps the response window open after its last stop
+// bit. Set by dali_transmitting_state_enter; a property of the ONE send on the
+// wire, so it lives here rather than being re-derived from the command.
+static volatile bool s_hold_window;
+
+// Last stop bit has been sent. Either arm the backward-frame window (a query
+// awaiting an answer, or a send-twice using it as the 22 TE inter-send gap), or
+// complete immediately so the caller can advance state before the 22 TE idle gap.
 static void finished_transmission(void) {
-    dali_kind_t k = s_active.kind;
-    if (k == DALI_KIND_QUERY || k == DALI_KIND_TWICE)
-        dali_wait_for_response_state_enter();
-    else
-        dali_result_received(DALI_RESPONSE_NAK, 0);
+    if (s_hold_window) dali_wait_for_response_state_enter();
+    else               dali_result_received(DALI_RESPONSE_NAK, 0);
 }
 
 static void half_bit_toggle(void);
@@ -58,11 +57,9 @@ static void half_bit_toggle(void) {
     dali_timer = 1;
 }
 
-void dali_transmitting_state_enter(const dali_step_t *step) {
-    // Build the 16-bit DALI forward frame from the step.  Only the two frame
-    // bytes are needed here; finished_transmission reads the kind from s_active
-    // after the last stop bit clears.
-    shift_reg = ((uint16_t)step->addr << 8) | step->data;
+void dali_transmitting_state_enter(uint8_t addr, uint8_t data, bool hold_window) {
+    s_hold_window = hold_window;
+    shift_reg = ((uint16_t)addr << 8) | data;
     bits_left = 17;  // 16 data bits + 1 extra for the stop-bit transition
     dali_timer_cb = send_one;
     dali_timer    = 1;

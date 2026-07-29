@@ -4,8 +4,21 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <avr/io.h>
-#include "types.h"
 #include "tick.h"
+
+// How the bit-level receiver classified a transaction. Lives here, in the
+// bit-level layer that PRODUCES it (dali_result_received below takes it), not in
+// the issuance layer — dali_sync.h already includes this header, so the reverse
+// would be circular. It was in a types.h junk drawer until this pass.
+typedef enum {
+    DALI_RESPONSE_OK = 0,
+    DALI_RESPONSE_NAK,
+    DALI_RESPONSE_MALFORMED,
+    DALI_RESPONSE_PULSE_TOO_SHORT,
+    DALI_RESPONSE_PULSE_IN_MIDDLE,
+    DALI_RESPONSE_PULSE_TOO_LONG,
+    DALI_RESPONSE_PENDING = 0xFF,
+} dali_response_type_t;
 
 // ---- Protocol constants ------------------------------------------------
 
@@ -80,7 +93,11 @@ void dali_idle_state_enter(void);
 
 // Begin transmitting cmd as a DALI forward frame (Manchester-encoded, 1200 baud).
 // Returns immediately; the timer ISR drives the rest of the transmission.
-void dali_transmitting_state_enter(const dali_step_t *step);
+// Shift one forward frame onto the wire. `hold_window` keeps the response
+// window open after the last stop bit (a QUERY awaiting a backward frame, or a
+// send-twice borrowing it as the 22 TE inter-send gap). The caller derives all
+// three from the queued command — this layer holds no copy of them.
+void dali_transmitting_state_enter(uint8_t addr, uint8_t data, bool hold_window);
 
 // Enforce the mandatory 22 TE (~9 ms) inter-frame gap before the next TX.
 // Handles bus-shorted (another master active) by waiting for it to release first.
@@ -99,9 +116,11 @@ void dali_state_receiving_prepare(void);
 // Assumes dali_state_receiving_prepare() was called first.
 void dali_state_receiving_enter(void);
 
-// Single authority for post-command state transitions - called from ISR context.
-// Updates the target register (if any), fires the optional callback, decrements
-// repeat count for DALI_KIND_TWICE, pops the queue, and enters the next state.
+// Single authority for post-command state transitions — called from ISR context.
+// Offers the issuance layer a chance to re-fire (the second send of a
+// send-twice), otherwise completes the command and enters the next state. The
+// register-update / callback / queue-pop duties in the previous description
+// belonged to the v1 command queue and went with it in task 05.
 void dali_result_received(dali_response_type_t type, uint8_t value);
 
 #endif

@@ -8,8 +8,16 @@
 
 // ---- Internal helpers ---------------------------------------------------
 
-// Rising edge while parked: another master has started a frame. Yield the wire,
-// wait for it to settle, then re-enter to dispatch queued commands.
+// Rising edge while parked: SOMETHING asserted the bus and it was not us. Yield
+// the wire, wait for it to settle, then re-enter to dispatch queued commands.
+//
+// Do not read this as multi-master-only code. The monitor cannot tell what
+// pulled the line, and on a single-master bus the same edge is produced by a
+// ballast answering late (a backward frame arriving after our response window
+// closed), by noise or reflections on a long run, and by the bus being held
+// asserted by a short or a sagging supply — the last of which is what the 200 TE
+// escape in dali_state_wait_for_idle.c exists to recover from. A second master
+// is one cause among several, and the least likely on this installation.
 //
 // This is the PARKED -> YIELDED transition, and the reason "the bus is busy" and
 // "we are executing" are different questions: here the bus is very much busy and

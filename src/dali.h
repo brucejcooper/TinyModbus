@@ -99,11 +99,16 @@ typedef enum __attribute__((packed)) {
     // Rises with mbq_begin(), falls when that slot goes terminal.
     DALI_CHAN_EXECUTING,
 
-    // The wire is not ours to use, but we owe nothing. Reached when another
-    // master starts a frame while we are parked (external_message_started), and
-    // when a stuck bus times out and dali_sync_abort_busfault() releases the
-    // command while recovery continues. This is the state that proved the old
-    // "idle"/"busy" pair were not inverses.
+    // The wire is not ours to use, but we owe nothing. This is the state that
+    // proved the old "idle"/"busy" pair were not inverses.
+    //
+    // Reached on EVERY command completion (dali_sync_completion releases the
+    // slot here, and wait-for-idle re-parks us), so it is the most travelled
+    // transition in the file — not an exceptional one. Also reached when
+    // something else asserts the bus while we are parked
+    // (external_message_started: a late backward frame, noise, a short, or a
+    // second master), and when a stuck bus times out and
+    // dali_sync_abort_busfault() releases the command mid-recovery.
     DALI_CHAN_YIELDED,
 } dali_chan_t;
 extern volatile dali_chan_t dali_chan;

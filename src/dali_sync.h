@@ -27,6 +27,42 @@
 
 #include "dali.h"
 #include "types.h"
+#include "mbq_slots.h"
+
+// ---- DALI payload mapping (the ONLY DALI-specific part of the queue) -------
+//
+// How the queue's opaque 32-bit command is interpreted. This mapping is the
+// contract with the controller's DALI adapter (controller/src/dali_queue.c) and
+// MUST match it byte for byte.
+//
+//   byte 0  addr   DALI address byte — short address, group, broadcast (0xFE),
+//                  or a special command opcode (e.g. 0xA3 SET DTR0, or the
+//                  commissioning specials the controller drives)
+//   byte 1  data   DALI data byte
+//   byte 2  flags  QF_* below
+//   byte 3  dtr0   value preloaded into DTR0 when QF_DTR0 is set
+typedef struct {
+    uint8_t addr;
+    uint8_t data;
+    uint8_t flags;
+    uint8_t dtr0;
+} dali_frame_t;
+
+#define QF_TWICE   0x01u   // send the forward frame twice (SET-class), no answer
+#define QF_DTR0    0x02u   // emit 0xA3<dtr0> back-to-back BEFORE the frame
+#define QF_ANSWER  0x04u   // expects a backward frame; capture the answer byte
+
+// Unpack a queue slot's opaque bytes into the DALI frame they describe.
+static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
+    return (dali_frame_t){ .addr  = c->b[0], .data = c->b[1],
+                           .flags = c->b[2], .dtr0 = c->b[3] };
+}
+
+// ---- DALI failure codes carried in a FAILED slot's response8 ---------------
+// (a COMPLETE slot's response8 is the backward-frame answer instead)
+#define DALI_RESP_NAK        0x01u  // no/short backward frame where one was expected
+#define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
+#define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse, stuck bus)
 
 // dali_busy: true while a queued command is executing. Held across a multi-frame
 // atomic sequence (DTR0 preload + frame) so nothing can interleave.

@@ -24,16 +24,6 @@
 #include "mbq_slots.h"
 #include "tick.h"
 
-// ---- Queue command record flags (mirror the controller's DQ_* bits) --------
-#define QF_TWICE   0x01u   // send the forward frame twice, no answer
-#define QF_DTR0    0x02u   // preload DTR0 (0xA3<dtr0>) back-to-back before the frame
-#define QF_ANSWER  0x04u   // expects a backward frame
-
-// ---- DALI response8 payload contract (mirrored by the controller) ---------
-#define DALI_RESP_NAK        0x01u  // no / short backward frame where one was expected
-#define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
-#define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse etc.)
-
 volatile bool              dali_busy;
 volatile dali_current_op_t current_op;
 volatile cmd_entry_t       s_active;
@@ -41,7 +31,7 @@ volatile uint32_t          g_uptime_s;
 
 // The executing slot and its unpacked opaque command [addr, data, flags, dtr0].
 static uint8_t s_raw_slot;
-static uint8_t s_raw_cmd[MBQ_CMD_BYTES];
+static mbq_cmd_t s_raw_cmd;
 
 void dali_sync_init(void) {
     dali_busy    = false;
@@ -78,21 +68,19 @@ void dali_sync_dispatch_current(void) {
     // command is a two-step atomic sequence — step 0 preloads DTR0, step 1
     // sends the frame — back-to-back with nothing interleaved, because
     // dali_busy stays held across the pair (one slot's lifecycle).
-    uint8_t flags = s_raw_cmd[2];
+    dali_frame_t f = dali_frame_of(&s_raw_cmd);
 
-    if ((flags & QF_DTR0) && current_op.step == 0u) {
-        issue_dali_command(DALI_ADDR_SET_DTR0, s_raw_cmd[3], DALI_KIND_CMD, 1u);
+    if ((f.flags & QF_DTR0) && current_op.step == 0u) {
+        issue_dali_command(DALI_ADDR_SET_DTR0, f.dtr0, DALI_KIND_CMD, 1u);
         return;
     }
     // Terminal frame. KIND from the flags byte:
     //   QF_TWICE  -> send twice (SET-class), no answer
     //   QF_ANSWER -> KIND_QUERY, open the backward-frame window
     //   else      -> KIND_CMD, completes as soon as the frame is out
-    uint8_t a = s_raw_cmd[0];
-    uint8_t d = s_raw_cmd[1];
-    if (flags & QF_TWICE)       issue_dali_command(a, d, DALI_KIND_TWICE, 2u);
-    else if (flags & QF_ANSWER) issue_dali_command(a, d, DALI_KIND_QUERY, 1u);
-    else                        issue_dali_command(a, d, DALI_KIND_CMD,   1u);
+    if (f.flags & QF_TWICE)       issue_dali_command(f.addr, f.data, DALI_KIND_TWICE, 2u);
+    else if (f.flags & QF_ANSWER) issue_dali_command(f.addr, f.data, DALI_KIND_QUERY, 1u);
+    else                          issue_dali_command(f.addr, f.data, DALI_KIND_CMD,   1u);
 }
 
 // ---- Work selection ---------------------------------------------------
@@ -110,7 +98,7 @@ bool start_next_dali_work(void) {
             // Re-check under global-atomic: state may have moved during the
             // selection (LVL0 idle timer / PIT / edge callbacks).
             if (dali_idle && !dali_busy) {
-                mbq_begin(slot, s_raw_cmd);
+                mbq_begin(slot, &s_raw_cmd);
                 s_raw_slot      = slot;
                 current_op.op   = OP_RAW;
                 current_op.addr = 0xFFu;
@@ -140,12 +128,12 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
     bool more = false;
 
     if (current_op.op == OP_RAW) {
-        uint8_t flags = s_raw_cmd[2];
+        dali_frame_t f = dali_frame_of(&s_raw_cmd);
 
         // DTR0 preload just finished (no backward frame, so OK/NAK both mean
         // "done"). Advance to the frame within the SAME slot lifecycle; a real
         // bus error falls through to terminal handling below.
-        if ((flags & QF_DTR0) && current_op.step == 0u
+        if ((f.flags & QF_DTR0) && current_op.step == 0u
             && (type == DALI_RESPONSE_OK || type == DALI_RESPONSE_NAK)) {
             current_op.step = 1u;
             more = true;

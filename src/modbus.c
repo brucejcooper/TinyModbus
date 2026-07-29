@@ -596,7 +596,14 @@ static bool frame_is_valid(void) {
             expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
             break;
         }
-        default: break;
+        default:
+            // Unknown function code. Accept it on CRC alone — we cannot know its
+            // expected length — so it reaches the dispatcher and gets a proper
+            // ILLEGAL FUNCTION reply. Dropping it silently instead made the
+            // master time out and burn its whole retry budget (~150 ms of bus)
+            // for a question we could answer immediately.
+            expected_size = rx_sz;
+            break;
     }
     return rx_sz == expected_size;
 }
@@ -723,10 +730,10 @@ void modbus_process(void) {
 
     no_response = (buf[0] == 0);
 
-    // FC01/FC05/FC0F (coils) are not supported.  Well-formed coil frames
-    // survive frame_is_valid (size check still recognises them) and reach
-    // this switch, where the default branch returns ILLEGAL_FUNCTION —
-    // the standard Modbus reply for unsupported function codes.
+    // Anything not handled below gets ILLEGAL_FUNCTION, the standard Modbus
+    // reply: coils (FC01/FC05/FC0F), which are deliberately unsupported, and any
+    // unrecognised code, which frame_is_valid lets through on CRC alone so it can
+    // be answered rather than left to time out.
     switch (buf[1]) {
         case FC_READ_INPUT:        process_fc04(); break;
         case FC_READ_HOLDING:      process_fc03(); break;

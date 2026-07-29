@@ -108,9 +108,9 @@ uint8_t mbq_next_pending(void) {
     return best;
 }
 
-void mbq_begin(uint8_t slot, uint8_t *out4) {
+void mbq_begin(uint8_t slot, mbq_cmd_t *out) {
     if (slot >= MBQ_SLOTS) return;
-    for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) out4[b] = s_cmd[slot][b];
+    for (uint8_t b = 0; b < MBQ_CMD_BYTES; b++) out->b[b] = s_cmd[slot][b];
     s_status[slot] = MBQ_S_EXECUTING;   // single-byte store, atomic
 }
 

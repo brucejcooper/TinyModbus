@@ -19,6 +19,20 @@
 
 #define MBQ_SLOTS      8u   // number of self-describing slots
 #define MBQ_CMD_BYTES  4u   // opaque command size (32-bit)
+#define MBQ_CMD_REGS   2u   // ...expressed in Modbus REGISTERS
+
+// A slot's opaque command. Deliberately a byte blob: this layer carries it and
+// does not interpret it. The wrapper exists for TYPE SAFETY, not meaning — it
+// stops a bare uint8_t* from being confused with a register pointer or a
+// wrongly-sized buffer, which is precisely the mix-up that once made a submit
+// declare twice its length and arm the following slot with adjacent memory.
+typedef struct { uint8_t b[MBQ_CMD_BYTES]; } mbq_cmd_t;
+
+// A slot's status register, as it appears on the wire: [status:8 | response8:8].
+typedef struct {
+    uint8_t status;      // MBQ_S_*
+    uint8_t response8;   // value on COMPLETE, code on FAILED, else 0
+} mbq_slot_status_t;
 
 // Lifecycle status (the hi byte of a slot's status register).
 enum {
@@ -56,7 +70,7 @@ uint8_t mbq_next_pending(void);
 
 // Arbiter hook: copy `slot`'s opaque command (MBQ_CMD_BYTES) into `out4` and mark
 // the slot EXECUTING. The caller (payload adapter) interprets the bytes.
-void mbq_begin(uint8_t slot, uint8_t *out4);
+void mbq_begin(uint8_t slot, mbq_cmd_t *out);
 
 // Completion hook (called from the payload adapter's completion path): set the
 // slot terminal. `status` is MBQ_S_COMPLETE or MBQ_S_FAILED; `response8` is the

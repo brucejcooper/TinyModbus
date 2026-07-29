@@ -97,13 +97,16 @@ bool start_next_dali_work(void) {
     // The whole main-loop decision, in the order the questions actually matter:
     //
     //   1. A command is executing -> nothing to do but let it finish.
-    //   2. Otherwise, a command is pending -> start it, if the wire is ours.
+    //   2. Otherwise, a command is pending -> start it, if the bus is free.
     //   3. Neither -> nothing to do.
     //
     // All three answers come from the queue and the line, with no gateway-side
     // summary of either to fall out of step with them.
-    if (dali_sync_owns_channel()) return false;
-    if (dali_bus_busy)            return false;   // bus not free yet (incl. settle)
+    //
+    // The two early exits below are also why this can report "work outstanding"
+    // for free: in both cases the answer is known WITHOUT scanning the slots.
+    if (dali_sync_owns_channel()) return true;   // one of ours is in flight
+    if (dali_bus_busy)            return true;   // settling, or someone else has it
 
     bool launch = false;
     uint8_t old_tcb = TCB0.INTCTRL;
@@ -143,7 +146,10 @@ no_launch: ;
         if (dali_is_bus_active()) dali_wait_for_idle_state_enter();
         else                      dali_sync_dispatch_current();
     }
-    return launch;
+    // Work existed if a slot was pending, whether or not we managed to launch it
+    // (the ATOMIC re-check can lose the bus, and mbq_begin can refuse). Either
+    // way it is still queued, so the caller must not sleep on it.
+    return slot != MBQ_NONE;
 }
 
 // ---- Completion handler (ISR context) ---------------------------------

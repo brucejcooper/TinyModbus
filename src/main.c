@@ -11,7 +11,6 @@
 #include "tick.h"
 #include "dali.h"
 #include "dali_sync.h"
-#include "mbq_slots.h"
 #include "modbus.h"
 
 // Fuse configuration.  Emits a `.fuse` section in the ELF; the Makefile's
@@ -101,21 +100,21 @@ int main(void) {
         modbus_process();
         // Executing -> wait; pending -> start it; neither -> nothing. All three
         // decisions live in start_next_dali_work, which reads them off the queue
-        // and the line rather than a summary kept in step with them.
-        start_next_dali_work();
+        // and the line rather than a summary kept in step with them, and hands
+        // back whether any DALI work is still outstanding.
+        bool dali_work = start_next_dali_work();
         wdt_reset();
 
         // Sleep left ENABLED — confirmed (again) NOT the cause of the deafness:
         // with sleep disabled and scanning disabled the gateway is still dead.
-        // Sleep when the queue has nothing needing CPU and Modbus is quiet.
         //
-        // dali_bus_busy is NOT redundant with the queue check, and dropping it
-        // would be a latency bug: TCA0 has no RUNSTDBY bit, so it STOPS in
-        // standby. The moment a command completes its slot goes terminal — the
-        // queue has no work — while the state machine is still counting out the
-        // 22 TE settle on TCA0. Sleeping there strands that countdown until the
-        // 1 Hz PIT happens to wake us.
-        if (!dali_bus_busy && !mbq_has_work() && modbus_idle)
+        // One scan, not two: dali_work already covers a command in flight, a
+        // command queued, AND a bus that is not free. That last part is
+        // load-bearing — TCA0 has no RUNSTDBY bit and STOPS in standby, and the
+        // moment a command completes its slot goes terminal (nothing queued)
+        // while the 22 TE settle is still counting on TCA0. Sleeping there would
+        // strand that countdown until the 1 Hz PIT happened to wake us.
+        if (!dali_work && modbus_idle)
             sleep_cpu();
     }
 }

@@ -87,8 +87,21 @@ bool dali_sync_owns_channel(void);
 // Reset issuance state. Call once at boot.
 void dali_sync_init(void);
 
-// If the bus is idle and a slot is pending, begin executing it. Returns true if
-// a command was launched. Called from the main loop.
+// The main loop's entire DALI service call. Starts the next queued command when
+// there is one and the bus is free, and returns whether any DALI work is
+// OUTSTANDING — a command in flight, a command queued, or a bus that is not yet
+// free. Returns false, silently, only when there is genuinely nothing to do.
+//
+// That return is the caller's sleep interlock, and it costs nothing extra: the
+// two conditions that mean "outstanding" without any queued command — we own one
+// already, or the bus is mid-settle — are the same two early exits that skip the
+// slot scan. So one pass answers both questions where the previous shape scanned
+// the slot array twice per loop iteration — once here and again in a separate
+// mbq_has_work() query, since deleted.
+//
+// Sleeping while this returns true would be wrong for two independent reasons:
+// queued work would sit unstarted, and TCA0 — which has no RUNSTDBY bit and so
+// stops in standby — may have the 22 TE settle countdown outstanding.
 bool start_next_dali_work(void);
 
 // WHERE THE ISSUANCE STATE LIVES: the executing slot's 4-byte command, plus

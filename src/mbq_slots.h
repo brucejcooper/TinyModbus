@@ -34,6 +34,28 @@ typedef struct {
     uint8_t response8;   // value on COMPLETE, code on FAILED, else 0
 } mbq_slot_status_t;
 
+// ONE QUEUE ENTRY. Everything the queue knows about a command lives here.
+//
+// `seq` is the load-bearing field and is deliberately NOT part of the command:
+// it is stamped by the GATEWAY when a slot goes idle->pending, and execution
+// order is lowest-seq-first, wrap-aware. That is why slot INDEX does not affect
+// ordering — writing slots 6, 7, 0 executes 6, 7, 0. Keeping the sequence
+// gateway-side is what removed v1's controller-managed id ledger, and with it
+// the whole class of reboot/glitch recovery-corruption bugs.
+//
+// Padded to 8 bytes so indexing is a shift rather than a multiply on the 8-bit
+// AVR — the reason this was previously four parallel arrays. The static assert
+// keeps that property from being lost by a future field.
+typedef struct {
+    mbq_cmd_t cmd;         // opaque payload; the queue never interprets it
+    uint8_t   status;      // MBQ_S_* lifecycle
+    uint8_t   response8;   // value on COMPLETE, code on FAILED
+    uint8_t   seq;         // accept sequence, valid while PENDING
+    uint8_t   _pad;        // keep sizeof == 8 (power-of-two stride)
+} mbq_slot_t;
+_Static_assert(sizeof(mbq_slot_t) == 8u,
+               "mbq_slot_t must stay a power-of-two stride for cheap AVR indexing");
+
 // Lifecycle status (the hi byte of a slot's status register).
 enum {
     MBQ_S_IDLE      = 0u,   // free; writable

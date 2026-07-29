@@ -29,15 +29,10 @@ static void on_idle_bus(void) {
 //
 // Without clearing dali_busy here, dali_idle_state_enter takes its
 // "busy" branch and re-enters wait_for_idle on the still-shorted bus —
-// indefinite ~83 ms/cycle loop, slave never sleeps.  Clear dali_busy
-// so dali_idle_state_enter takes the idle-arm branch instead, and
-// (for an in-flight commissioning run) force phase=COM_IDLE with a
-// distinct ERR_BUS_STUCK status so pick_work doesn't immediately
-// re-pick OP_COMMISSION on the next main pass and re-issue commands
-// onto the still-shorted bus.  Non-commissioning ops are left to be
-// re-picked by main; if the bus has cleared by then they retry, and
-// if it hasn't they'll re-enter wait_for_idle (one cycle of slow
-// retry rather than a tight loop).
+// indefinite ~83 ms/cycle loop, slave never sleeps.  Clear dali_busy so
+// dali_idle_state_enter takes the idle-arm branch instead, and complete the
+// in-flight slot with a bus-fault code (see dali_sync_abort_busfault) so the
+// master is not left waiting on a command that can never finish.
 static void bus_stuck_timeout(void) {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     dali_cancel_edge_detect();

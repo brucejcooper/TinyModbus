@@ -89,15 +89,16 @@ int main(void) {
 #endif
 
     // Hold off bus traffic for 1 s after reset so DALI ballasts on the same
-    // supply rail have time to power up and start responding before the
-    // initial SYNC_READ_SETTINGS sweep marks them absent.  Runs after the clock
+    // supply rail have time to power up before the controller's first queries
+    // reach them (a clean no-answer is what it counts as absence).  Runs after
+    // the clock
     // switch so _delay_ms is calibrated against F_CPU (20 MHz on the 5 V rev,
     // 10 MHz otherwise — both set by the Makefile to match the divider above).
     _delay_ms(1000);
 
     // Initialise subsystems
     regs_init();
-    dali_sync_init();                     // sync_flags[], current_op, group_write
+    dali_sync_init();                     // queue slots + issuance state
     tick_init();                          // starts TCA0 - ticks begin here
     modbus_init(userrow_get_slave_addr());
     dali_init();

@@ -232,11 +232,9 @@ static void send_error(mb_err_t err) {
 }
 
 // The generic slot command queue lives in mbq_slots.c; its DALI adapter (unpack +
-// issue + terminal mapping) is the OP_RAW arms of dali_sync.c.  Cache invalidation
-// is handled centrally in issue_dali_command for every DALI source — there is no
-// separate raw-command classification step.
-// Fade tracking is a natural consequence of SYNC_READ_LEVEL being set by the
-// unified invalidation path.
+// issue + terminal mapping) is the OP_RAW arms of dali_sync.c.  There is no cache
+// to invalidate and no fade tracking here — the controller owns both, and decides
+// for itself what to re-read after a command (see controller/src/dali_state.c).
 
 // ---- FC04 - read input registers ----------------------------------------
 

@@ -5,39 +5,6 @@
 #include <stdbool.h>
 #include "types.h"
 
-// Paired struct - stored high-byte first to match Modbus wire format.
-// block0 can be memcpy'd directly into FC04/FC03 response buffers.
-typedef struct { uint8_t status;    uint8_t brightness; } ballast_bs_t;
-
-// register_map_t backs FC03 (holding) and FC04 (input) addressing.  The
-// in-memory byte order matches the Modbus wire (big-endian per register).
-//
-// Config banks retired (task 04 / task-03 Phase D): the per-ballast config
-// fields (min/max/power-on/sys-fail/fade) that used to live at 0x0040-0x00FF
-// are GONE — the controller now owns config via raw DALI queries (reads) and
-// DTR0+SET pairs (writes), so the gateway no longer caches or serves them.
-// FC03 reads of 0x0040-0x00FF now return ILLEGAL DATA ADDRESS (see
-// regs_read_holding).  The offset-trick (struct offset == addr*2) that the old
-// contiguous banks provided is retired with them; the remaining fields are
-// addressed by name (see regs_read_input_bulk / regs_read_holding).
-//
-// COMPATIBILITY / DEPLOYMENT ORDER: a gateway running this firmware requires a
-// controller in raw-DALI-config mode (the legacy bank-read/-write path is gone;
-// FC03 0x0040-0x00FF returns exception 0x02).  Roll out CONTROLLER-FIRST: flash
-// controllers that source config over raw DALI before flashing gateways with
-// this build.  A pre-Phase-D controller pointed at this gateway will get
-// ILLEGAL DATA ADDRESS on its config full-scan.
-//
-// FC03/FC06/FC10 holding registers (read-write):
-//   0x0000-0x003F  block0[64]        status | brightness   (write low byte = DAPC level)
-//   0x0040-0x00FF  (retired)         ILLEGAL DATA ADDRESS — config moved to raw DALI
-//   0x0110-0x014F  group_mask[16][8] 64-bit per-group membership bitmask
-//
-// FC04 input registers (read-only):
-//   0x0100-0x0103  present[4]        64-bit ballast-present bitmask
-//   0x0104-0x0107  dirty[4]          set on block0 change, cleared on FC04 read
-//   0x0200         version block     16-register special case (see process_fc04)
-//   0x1010-0x1017  queue status block, 8 slots (see MBREG_SLOT_STATUS_BASE; also served under FC03)
 // TASK 05 — STATELESS PIPE: there is no register map any more.
 //
 // block0 (arc/status), present[], dirty[] and group_mask[] are DELETED. They

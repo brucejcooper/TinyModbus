@@ -98,15 +98,15 @@ int main(void) {
 
     for (;;) {
         modbus_process();
-        // Kick the sync-flag-driven work selector when the bus is idle
-        // and no sync op is currently in flight.
-        if (dali_idle && !dali_busy)
+        // Launch new work only when we are parked on an idle wire AND own no
+        // command — the one combination of the two layers that permits it.
+        if (dali_line_idle && !dali_cmd_active)
             start_next_dali_work();
         wdt_reset();
 
         // Sleep left ENABLED — confirmed (again) NOT the cause of the deafness:
         // with sleep disabled and scanning disabled the gateway is still dead.
-        if (dali_idle && modbus_idle && !dali_busy)
+        if (dali_line_idle && modbus_idle && !dali_cmd_active)
             sleep_cpu();
     }
 }

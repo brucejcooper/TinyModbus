@@ -68,11 +68,38 @@ typedef enum {
 
 // ---- Public interface --------------------------------------------------
 
-// True while the state machine is idle and able to accept new commands.
-extern volatile bool dali_idle;
+// LAYER 0 (this file, the bit-level machine): the state machine is PARKED in
+// its idle state — TX released, receiver armed, rising-edge monitor watching for
+// another master starting a frame. It describes the WIRE and our posture on it.
+//
+// Not the inverse of dali_cmd_active (dali_sync.h), despite how "idle" and
+// "busy" read. That pair named two different layers, which is why they looked
+// like one flag written twice. The full state space:
+//
+//   line_idle  cmd_active
+//   ---------  ----------
+//      true      false     parked, owing nothing. The ONLY state in which new
+//                          work may launch — main() gates on exactly this.
+//      false     true      a command is mid-execution: transmitting, holding
+//                          the response window, or in an inter-frame gap.
+//      false     false     REAL, and the reason these are not inverses. The
+//                          wire is not ours to use, but we owe nothing: another
+//                          master started a frame while we were parked
+//                          (external_message_started clears line_idle and drops
+//                          into wait-for-idle), or a stuck bus timed out and
+//                          dali_sync_abort_busfault() released the command
+//                          while recovery continues.
+//      true      true      IMPOSSIBLE by construction, and load-bearing:
+//                          dali_idle_state_enter() only sets line_idle in the
+//                          branch where cmd_active is false, and the launch path
+//                          clears line_idle in the same ATOMIC block that sets
+//                          cmd_active. If it ever held, two writers would drive
+//                          the wire at once.
+extern volatile bool dali_line_idle;
 
-// Initialise TX/RX pins, TCB0 edge-capture, RTC PIT for periodic rescan,
-// and enter wait-for-idle to let the bus settle after reset.
+// Initialise TX/RX pins and TCB0 edge-capture, then enter wait-for-idle to let
+// the bus settle after reset. (The RTC PIT it used to start belongs to
+// sysinfo.c — it drives the uptime counter, not anything DALI.)
 void    dali_init(void);
 
 // Returns non-zero when another master is driving the bus (RX pin HIGH after optocoupler inversion).

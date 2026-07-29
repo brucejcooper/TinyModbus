@@ -100,13 +100,13 @@ int main(void) {
         modbus_process();
         // Launch new work only when we are parked on an idle wire AND own no
         // command — the one combination of the two layers that permits it.
-        if (dali_line_idle && !dali_cmd_executing)
+        if (dali_chan == DALI_CHAN_PARKED)
             start_next_dali_work();
         wdt_reset();
 
         // Sleep left ENABLED — confirmed (again) NOT the cause of the deafness:
         // with sleep disabled and scanning disabled the gateway is still dead.
-        if (dali_line_idle && modbus_idle && !dali_cmd_executing)
+        if (dali_chan == DALI_CHAN_PARKED && modbus_idle)
             sleep_cpu();
     }
 }

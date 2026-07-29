@@ -6,22 +6,17 @@
 #include "dali.h"
 #include "dali_sync.h"
 
-volatile bool dali_line_idle = false;
-
 // ---- Internal helpers ---------------------------------------------------
 
-// Leave the parked state: we are about to drive the wire (or yield it to another
-// master), so drop dali_line_idle and disarm the rising-edge monitor. Says
-// nothing about command ownership — that is dali_cmd_executing's job.
-static void cleanup(void) {
-    dali_line_idle = false;
-    dali_cancel_edge_detect();
-}
-
-// Rising edge detected while idle: another master has started a frame.
-// Yield, wait for the bus to settle, then re-enter to dispatch queued commands.
+// Rising edge while parked: another master has started a frame. Yield the wire,
+// wait for it to settle, then re-enter to dispatch queued commands.
+//
+// This is the PARKED -> YIELDED transition, and the reason "the bus is busy" and
+// "we are executing" are different questions: here the bus is very much busy and
+// we own nothing.
 static void external_message_started(void) {
-    cleanup();
+    dali_chan = DALI_CHAN_YIELDED;
+    dali_cancel_edge_detect();
     dali_wait_for_idle_state_enter();
 }
 
@@ -44,7 +39,7 @@ static void external_message_started(void) {
 //      logical step or releases the channel.
 
 void dali_result_received(dali_response_type_t type, uint8_t value) {
-    if (dali_cmd_executing) {
+    if (dali_chan == DALI_CHAN_EXECUTING) {
         if (dali_sync_repeat_send()) return;
         dali_sync_completion(type, value);
         return;
@@ -55,19 +50,22 @@ void dali_result_received(dali_response_type_t type, uint8_t value) {
 // ---- dali_idle_state_enter ---------------------------------------------
 //
 // Two branches:
-//   1. A command is still claimed (dali_cmd_executing): we just finished the
+//   1. Still EXECUTING: we just finished the
 //      inter-frame gap of a multi-step sequence. Dispatch its next step via
-//      dali_sync_dispatch_current — and do NOT set dali_line_idle, because the
-//      wire is still ours. This branch is why the two flags are not inverses.
-//   2. Otherwise: arm the bus monitor and park, setting dali_line_idle so
-//      main() may kick start_next_dali_work.
+//      dali_sync_dispatch_current — and do NOT go PARKED, because the
+//      wire is still ours.
+//   2. Otherwise: arm the bus monitor and go PARKED, so main() may kick
+//      start_next_dali_work.
 
 void dali_idle_state_enter(void) {
     // Belt-and-braces: ensure the DALI TX line is released before entering idle.
     DALI_PORT.OUTCLR = DALI_TX_bm;
 
-    if (dali_cmd_executing) {
-        cleanup();
+    if (dali_chan == DALI_CHAN_EXECUTING) {
+        // Stay EXECUTING: the wire is still ours mid-sequence, so only the
+        // rising-edge monitor needs disarming. (The old cleanup() also cleared
+        // the idle flag here, which was already false by the invariant.)
+        dali_cancel_edge_detect();
         if (dali_is_bus_active()) {
             dali_wait_for_idle_state_enter();
         } else {
@@ -76,7 +74,7 @@ void dali_idle_state_enter(void) {
         return;
     }
 
-    dali_line_idle = true;
+    dali_chan = DALI_CHAN_PARKED;
     dali_state_receiving_prepare();
     dali_call_on_rising_once(external_message_started);
 }

@@ -68,37 +68,45 @@ typedef enum {
 
 // ---- Public interface --------------------------------------------------
 
-// LAYER 0 (this file, the bit-level machine): the state machine is PARKED in
-// its idle state — TX released, receiver armed, rising-edge monitor watching for
-// another master starting a frame. It describes the WIRE and our posture on it.
+// THE DALI CHANNEL'S STATE — one variable, three states, and a fourth that can
+// no longer be written down.
 //
-// Not the inverse of dali_cmd_executing (dali_sync.h), despite how the original
-// "idle"/"busy" pair read. They name two different layers, which is why they
-// looked like one flag written twice. The full state space:
+// This replaces the pair dali_idle + dali_busy (briefly dali_line_idle +
+// dali_cmd_executing). Two bools describe four combinations, but only three of
+// them are legal, and the illegal one — parked AND executing — would mean two
+// writers driving the wire at once. That invariant used to be a paragraph of
+// comment held up by the discipline of two writes staying in step; now the type
+// simply cannot express it.
 //
-//   line_idle  cmd_executing
-//   ---------  -------------
-//     true        false      Parked, owing nothing. The ONLY state in which
-//                            new work may launch — main() gates on this.
-//     false       true       A command is mid-execution: transmitting,
-//                            holding the response window, or in an
-//                            inter-frame gap of a multi-step sequence.
-//     false       false      REAL, and the reason these are not inverses.
-//                            The wire is not ours to use, but we owe
-//                            nothing: another master started a frame while
-//                            we were parked (external_message_started
-//                            clears line_idle and drops into wait-for-idle),
-//                            or a stuck bus timed out and
-//                            dali_sync_abort_busfault() released the
-//                            command while recovery continues.
-//     true        true       IMPOSSIBLE by construction, and load-bearing:
-//                            dali_idle_state_enter() sets line_idle only in
-//                            the branch where cmd_executing is false, and
-//                            the launch path clears line_idle in the same
-//                            ATOMIC block that sets cmd_executing. If it
-//                            ever held, two writers would drive the wire at
-//                            once.
-extern volatile bool dali_line_idle;
+// It also removes a consistency hazard of the same shape as the op/busy pair
+// deleted earlier: a single-byte store is atomic on this core, so no reader can
+// ever catch the channel half-transitioned between the two flags.
+//
+// NOTE what none of these states is: "the wire is electrically asserted right
+// now". That is dali_is_bus_active(), which reads the RX pin, and it is why
+// "busy" was the wrong word — the bus is busy whenever ANOTHER master is
+// sending, while this gateway owns nothing at all.
+typedef enum __attribute__((packed)) {
+    // Parked on an idle wire: TX released, receiver armed, rising-edge monitor
+    // watching for another master. The ONLY state from which new work may
+    // launch — main() gates on exactly this.
+    DALI_CHAN_PARKED = 0,
+
+    // Exactly one queue slot is MBQ_S_EXECUTING and we are running its command.
+    // Held across the whole multi-frame sequence (DTR0 preload + frame +
+    // send-twice repeat) so nothing interleaves within one slot's lifecycle,
+    // including across the inter-frame gaps where the wire is briefly quiet.
+    // Rises with mbq_begin(), falls when that slot goes terminal.
+    DALI_CHAN_EXECUTING,
+
+    // The wire is not ours to use, but we owe nothing. Reached when another
+    // master starts a frame while we are parked (external_message_started), and
+    // when a stuck bus times out and dali_sync_abort_busfault() releases the
+    // command while recovery continues. This is the state that proved the old
+    // "idle"/"busy" pair were not inverses.
+    DALI_CHAN_YIELDED,
+} dali_chan_t;
+extern volatile dali_chan_t dali_chan;
 
 // Initialise TX/RX pins and TCB0 edge-capture, then enter wait-for-idle to let
 // the bus settle after reset. (The RTC PIT it used to start belongs to

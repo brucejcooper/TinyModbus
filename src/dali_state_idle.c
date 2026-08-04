@@ -43,7 +43,7 @@ static void external_message_started(void) {
 //      issuance layer decides — it owns the command and the step — and
 //      re-fires immediately with no inter-frame gap here, because the 22 TE
 //      inter-send window is provided by wait_for_response between the two
-//      sends. This file no longer keeps a repeat counter of its own.
+//      sends. The repeat count is the issuance layer's, not this file's.
 //
 //   2. otherwise: dispatch to dali_sync_completion which advances the
 //      logical step or releases the channel.

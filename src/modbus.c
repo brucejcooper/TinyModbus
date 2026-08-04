@@ -349,7 +349,7 @@ static void process_fc04(void) {
         return;
     }
 
-    // Every live FC04 block is a special case handled above. What used to follow
+    // Every FC04 block is a special case handled above; anything else is an
     // was a generic tail that set buf[2] = count*2 and transmitted WITHOUT filling
     // the payload — harmless only because fc04_range_allowed() returns false
     // unconditionally, and a stale-buffer leak the moment anyone allow-listed a
@@ -402,7 +402,7 @@ static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t
     uint8_t first_slot = (uint8_t)(off / MBQ_CMD_REGS);
     uint8_t n_slots    = (uint8_t)(wr_count / MBQ_CMD_REGS);
     // BUSY (retry later) and BAD_RANGE (never valid) are now distinguishable, so
-    // the master is no longer invited to retry a malformed submit forever.
+    // so the master is not invited to retry a malformed submit forever.
     return tm_err_to_modbus(mbq_submit(first_slot, regs, n_slots));
 }
 
@@ -545,7 +545,7 @@ static void process_fc23(void) {
 
     if (rd_count == 0 || rd_count > MAX_REG_RD)   { send_error(MB_ERR_ILLEGAL_VALUE); return; }
     // Compare in 16-bit: (uint8_t)(wr_count * 2) truncates, so wr_count = 128 with
-    // wr_bytes = 0 used to pass this check. submit_window's range test caught it
+    // wr_bytes = 0 would otherwise pass. submit_window's range test catches it
     // downstream, but a length check that a crafted length can walk through should
     // not be relying on a later check to save it.
     if ((uint16_t)wr_bytes != (uint16_t)(wr_count * 2u)) { send_error(MB_ERR_ILLEGAL_VALUE); return; }

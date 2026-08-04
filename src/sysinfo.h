@@ -12,13 +12,6 @@
 // their own module rather than as guests of whichever subsystem happened to own
 // the timer or the reset path.
 //
-// Until this pass they were split three ways: g_uptime_s was defined in
-// dali_sync.c and declared in dali_sync.h (with the 1 Hz ISR that maintains it,
-// left there because the RTC PIT once also drove a DALI rescan cursor that no
-// longer exists), while g_boot_count and g_reset_reason were defined in main.c
-// but declared in registers.h — which carried a comment pointing readers at
-// dali_sync.{c,h} for the third one.
-//
 // No EEPROM or flash is used, so none of this wears the part out even under a
 // watchdog crash-loop: uptime is a RAM counter, boot_count lives in .noinit SRAM
 // behind a magic guard, and reset_reason is the hardware-latched RSTCTRL.RSTFR.

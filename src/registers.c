@@ -92,12 +92,12 @@ void regs_init(void) {
 // ---- FC03 holding read -------------------------------------------------
 
 tm_err_t regs_read_holding(uint16_t addr, uint16_t *val) {
-    // 0x0000-0x00FF and 0x0110-0x014F are GONE (task 05): the arc/status bank,
-    // the presence/dirty bitmaps and the group masks were the gateway's cache of
-    // the bus, and the gateway no longer caches anything. They fall through to
+    // 0x0000-0x00FF and 0x0110-0x014F are NOT IMPLEMENTED: the gateway caches
+    // nothing about the bus — no arc/status bank, no presence/dirty bitmaps, no
+    // group masks. They fall through to
     // ILLEGAL DATA ADDRESS — a client still reading them is a version mismatch
     // and should fail loudly rather than receive plausible zeros.
-    // 0x0040-0x00FF: retired config banks (min/max/power-on/sys-fail/fade).
+    // 0x0040-0x00FF: config banks (min/max/power-on/sys-fail/fade) are not served.
     // The controller owns config over raw DALI now (task-03 Phase D), so these
     // fall through to ILLEGAL DATA ADDRESS below rather than returning stale
     // zeros that a legacy bank-reading client would mistake for real values.
@@ -109,7 +109,7 @@ tm_err_t regs_read_holding(uint16_t addr, uint16_t *val) {
     // (one slot's [status|response8]) at a time from the generic queue module; each
     // slot register is independently fenced and self-describing, so a tear across
     // slots is benign (slots reconcile independently).  0x1018-0x1019 fall through
-    // to ILLEGAL DATA ADDRESS (retired v1 QRES[6/7]).
+    // to ILLEGAL DATA ADDRESS.
     if (addr >= MBREG_SLOT_STATUS_BASE && addr <= MBREG_SLOT_STATUS_END) {
         uint8_t out[2];
         // The address is bounds-checked above, so this cannot overrun; hand the
@@ -134,7 +134,7 @@ tm_err_t regs_write_holding(uint16_t addr, uint16_t val) {
     // 0x0110-0x014F group masks: GONE. The controller diffs membership against
     // its own cache and emits ADD/REMOVE FROM GROUP itself, so the gateway no
     // longer needs the mask, the diff, or the fan-out state machine — and a
-    // gateway reboot can no longer lose membership, which is what made the
+    // gateway reboot cannot lose membership, which is what would make a
     // original group-toggle failure possible.
 
     switch (addr) {

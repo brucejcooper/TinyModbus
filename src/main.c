@@ -92,7 +92,7 @@ int main(void) {
 
     sei();
 
-    // No boot scan. TASK 05: discovering the bus is the controller's job — it
+    // No boot scan: discovering the bus is the controller's job — it
     // interrogates every short address through the command queue and holds the
     // only cache. The gateway starts with nothing to know and nothing to lose.
 

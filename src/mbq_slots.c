@@ -1,4 +1,4 @@
-// mbq_slots.c — generic self-describing slot command queue (task 06, queue v2).
+// mbq_slots.c — generic self-describing slot command queue.
 //
 // A DALI-AGNOSTIC Modbus command-queue: 8 slots, each self-describing its own
 // lifecycle. The queue carries an OPAQUE 4-byte command in and reports an 8-bit

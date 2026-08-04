@@ -4,7 +4,7 @@
 /*
  * dali_sync.h — DALI issuance for the command queue.
  *
- * TASK 05 — STATELESS PIPE. This file used to be the gateway's brain: a
+ * STATELESS PIPE. This file is the DALI adapter for the generic slot queue: a
  * sync-flag work selector, a per-ballast arc/status cache, presence and dirty
  * bitmaps, group masks with ADD/REMOVE fan-out, a periodic rescan cursor, and
  * the IEC 62386-102 commissioning state machine. ALL OF IT IS GONE.
@@ -73,16 +73,9 @@ static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
 // cannot answer, since the bus is quiet between frames of a send-twice.
 bool dali_sync_owns_channel(void);
 
-// The "operation in flight" struct is gone. It held three fields, of which:
-//   op    duplicated the busy flag exactly — both were set together and cleared
-//         together at every site, so keeping them in agreement across an ISR
-//         boundary was a standing hazard with no benefit. That flag has since
-//         become dali_sync_owns_channel(); the enum here had a single
-//         meaningful value (OP_RAW) once the background work selector went in
-//         task 05.
-//   addr  was written 0xFF at launch and never read by anything.
-//   step  is genuinely live and now stands alone inside dali_sync.c (nothing
-//         outside that file ever touched it).
+// Where the issuance state lives: the executing slot's 4-byte command, plus a
+// step counter inside dali_sync.c. Whether a command is in flight is answered by
+// dali_sync_owns_channel() rather than by a flag that could disagree with it.
 
 // Reset issuance state. Call once at boot.
 void dali_sync_init(void);
@@ -107,7 +100,7 @@ bool start_next_dali_work(void);
 // WHERE THE ISSUANCE STATE LIVES: the executing slot's 4-byte command, plus
 // this. Nothing else.
 //
-// There used to be a parallel copy — a struct holding {kind, addr, data,
+// Nothing holds a parallel copy of the command. A struct of {kind, addr, data,
 // repeat} — populated from the command on every send. Every field of it was
 // derivable from the command and the step:
 //   addr/data  DTR0 preload sends (0xA3, dtr0); any frame step sends the

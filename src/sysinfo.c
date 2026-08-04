@@ -39,10 +39,8 @@ void sysinfo_boot_latch(void) {
 
 void sysinfo_init(void) {
     // RTC PIT off the 1 kHz internal oscillator: 1024 cycles ≈ 1 s.
-    // This timer exists ONLY for the uptime counter. It was set up in
-    // dali_init() and described as driving a "periodic bus rescan" — that rescan
-    // became the controller's job in task 05, leaving the PIT with no DALI
-    // purpose and a comment that no longer described anything.
+    // This timer exists ONLY for the uptime counter — nothing DALI-related is
+    // scheduled off it, so it lives here rather than in dali_init().
     RTC.CLKSEL = RTC_CLKSEL_INT1K_gc;
     while (RTC.PITSTATUS & RTC_CTRLABUSY_bm) {}
     RTC.PITCTRLA   = RTC_PERIOD_CYC1024_gc | RTC_PITEN_bm;

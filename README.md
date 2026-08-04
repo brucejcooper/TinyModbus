@@ -9,7 +9,7 @@ An ATtiny1604-based Modbus RTU to DALI gateway. It acts as a Modbus slave device
 > master submits opaque commands to an 8-slot queue; the gateway executes them
 > in accept order and reports each slot's outcome. That is the whole contract.
 >
-> This is deliberate (task 05, "no cache of a cache"): **the ballasts are the
+> This is deliberate — "no cache of a cache": **the ballasts are the
 > authority, the controller holds the one and only cache, the gateway holds
 > none.** The consequences are worth stating plainly —
 >
@@ -18,7 +18,7 @@ An ATtiny1604-based Modbus RTU to DALI gateway. It acts as a Modbus slave device
 >   the master's cache is structurally impossible, not merely mitigated.
 > - **Board replacement loses nothing.** Swap the hardware, and the controller
 >   re-establishes everything by querying the ballasts.
-> - **Anything that used to read gateway state now returns ILLEGAL DATA
+> - **Anything reading gateway state returns ILLEGAL DATA
 >   ADDRESS** — see the register map below. A client still reading those
 >   addresses is a version mismatch and should fail loudly rather than receive
 >   plausible zeros.
@@ -198,7 +198,7 @@ New or reset devices generate a 24-bit random address. A controller discovers an
 4. Issue `PROGRAM SHORT ADDRESS` to assign the next free address
 5. Issue `YES` to confirm, then loop until no devices respond
 
-Commissioning is **driven by the controller** over the command queue (task 05); this firmware only puts the frames on the wire. Out of scope for this firmware: 24-bit forward frames (DALI-2 control-device addressing), memory-bank reads, and DT1/DT8 device-type extensions.
+Commissioning is **driven by the controller** over the command queue; this firmware only puts the frames on the wire. Out of scope for this firmware: 24-bit forward frames (DALI-2 control-device addressing), memory-bank reads, and DT1/DT8 device-type extensions.
 
 ---
 
@@ -380,7 +380,7 @@ bus is idle and no command is in flight, `start_next_dali_work()` takes the
 lowest accept-sequence PENDING slot, marks it EXECUTING and dispatches it.
 
 The sync-flag table, the rotating reconciliation cursor, the periodic rescan and
-the priority chain that arbitrated between them are all **gone** (task 05). The
+the priority chain that arbitrated between them are **not present**. The
 gateway does no polling of its own, so the bus carries exactly the frames the
 controller asked for and nothing else — which is also why bus utilisation is now
 a property the controller can reason about and tune.
@@ -409,12 +409,12 @@ Slave address, baud rate, and rescan interval all live in USERROW so they surviv
 | 0x10 | Write Multiple Holding Registers | Write a contiguous holding block — including the command-queue command block (0x1000–0x100F) |
 | 0x17 | Read/Write Multiple Registers | Submit queue commands (write range) and collect status/results (read range) in one transaction — see "Raw Command Queue" |
 
-Coils (FC01 / FC05 / FC0F) were retired in subtask 5: per-ballast on/off / level changes go through the per-ballast brightness bank (0x0000-0x003F) which arms the asynchronous DALI work selector and ACKs immediately; broadcast / group / specialty DALI sends go through the **raw command queue** (command block 0x1000–0x100F via FC10/FC23).  Frames using the retired function codes get an ILLEGAL_FUNCTION exception reply.
+Coils (FC01 / FC05 / FC0F) are not supported: per-ballast on/off / level changes go through the per-ballast brightness bank (0x0000-0x003F) which arms the asynchronous DALI work selector and ACKs immediately; broadcast / group / specialty DALI sends go through the **raw command queue** (command block 0x1000–0x100F via FC10/FC23).  Frames using the retired function codes get an ILLEGAL_FUNCTION exception reply.
 
-### Register map (final, task 05)
+### Register map
 
-The map is deliberately small. **Everything that used to expose gateway state is
-gone** and returns ILLEGAL DATA ADDRESS (0x02) — a client reading those
+The map is deliberately small. **Nothing exposes gateway state**; those
+addresses return ILLEGAL DATA ADDRESS (0x02) — a client reading them
 addresses is a version mismatch and should fail loudly rather than get zeros.
 
 | Address | FC | Width | Content |
@@ -428,12 +428,12 @@ addresses is a version mismatch and should fail loudly rather than get zeros.
 | `0x1F03` | 03, 06 | 1 reg | Baud index: 0 = 9600, 1 = 19200, 2 = 38400. USERROW-persisted, applied after the ACK. |
 | `0x1F05` | 06 | 1 reg | System reset. Write `0xA5A5` to force a software reset once the ACK has left the wire. Any other value → ILLEGAL DATA ADDRESS. |
 
-**Removed in task 05 — all return ILLEGAL DATA ADDRESS:**
+**Not implemented — all return ILLEGAL DATA ADDRESS:**
 
 | Address | Was |
 |---|---|
 | `0x0000–0x003F` | per-ballast status\|brightness (the arc-level bank). The controller emits DAPC frames through the queue instead. |
-| `0x0040–0x00FF` | per-ballast config banks (retired earlier, in task 04). |
+| `0x0040–0x00FF` | per-ballast config banks. |
 | `0x0100–0x0103` | present bitmask |
 | `0x0104–0x0107` | dirty bitmask |
 | `0x0110–0x014F` | group membership masks |
@@ -441,7 +441,7 @@ addresses is a version mismatch and should fail loudly rather than get zeros.
 | `0x1F01` | RESCAN_INTERVAL |
 | `0x1F04` | COMMISSION trigger/status |
 
-Coils (FC01/FC05/FC0F) remain retired and return ILLEGAL FUNCTION.
+Coils (FC01/FC05/FC0F) are not supported and return ILLEGAL FUNCTION.
 
 #### Function codes
 
@@ -457,7 +457,7 @@ The DALI address byte inside a command record can be any valid DALI address byte
 
 ### Raw Command Queue
 
-The gateway holds an **8-slot, self-describing command queue** (queue v2, task 06). Each slot has its own command register pair and its own status register, and the **slot is the command's identity** — there is no controller-assigned id, no result ring, and no id sequence to keep in step. A master writes a command into a free slot and polls that slot's status until it reaches a terminal state. The queue itself is **DALI-agnostic**: it carries an opaque 32-bit command and returns an 8-bit response; the meaning of those bytes is the DALI adapter's contract, below. This replaced the task-04 id-tagged FIFO (submit window + result ring + `accepted_id`/`completed_id`), whose id ledger the master had to track and re-baseline across reboots — the whole class of reboot/glitch recovery-corruption bugs that fought is gone because nothing is inferred from an id sequence.
+The gateway holds an **8-slot, self-describing command queue**. Each slot has its own command register pair and its own status register, and the **slot is the command's identity** — there is no controller-assigned id, no result ring, and no id sequence to keep in step. A master writes a command into a free slot and polls that slot's status until it reaches a terminal state. The queue itself is **DALI-agnostic**: it carries an opaque 32-bit command and returns an 8-bit response; the meaning of those bytes is the DALI adapter's contract, below. This replaced the task-04 id-tagged FIFO (submit window + result ring + `accepted_id`/`completed_id`), whose id ledger the master had to track and re-baseline across reboots — the whole class of reboot/glitch recovery-corruption bugs that fought is gone because nothing is inferred from an id sequence.
 
 **Slot lifecycle** — each slot's `status` byte walks: `0 idle` → `1 pending` (a command is written and queued) → `2 executing` (on the DALI bus now) → `3 complete` / `4 failed` (terminal, holding a response). A terminal slot stays terminal until the master overwrites it with a new command (which returns it to `pending`).
 
@@ -500,9 +500,7 @@ byte3  dtr0    value preloaded into DTR0 when QF_DTR0 is set; ignored otherwise
 
 A `QF_DTR0` command's two frames land back-to-back with nothing interleaved (the slot holds the bus for the pair). After a level-changing frame the gateway marks the target ballast dirty for a priority re-query (group frames fan out to members via the group masks). A queued command **preempts the gateway's idle-time polling** — it runs within ~1–2 DALI frame times of arrival.
 
-> **Changelog / matched firmware set.** Queue v2 (task 06) is a **protocol break** from the task-04 id-tagged FIFO: the command block at 0x1000 and the status block at 0x1010 have incompatible semantics (self-describing slots vs. an id ledger + result ring). The controller (`switch_gateway_firmware`) and this gateway firmware are a **matched set** — a v1 master cannot drive a v2 gateway and vice versa, and there is no mixed-version operation. **Deploy both together.** (The earlier task-04 break — the removal of the pre-queue single-slot raw channel at 0x1000/0x1001 + FC04 0x0108 — still stands; those legacy addresses return ILLEGAL DATA ADDRESS.)
-
-### Commissioning — moved to the controller
+### Commissioning
 
 `MBREG_COMMISSION` (0x1F04) and the gateway's binary-search state machine are
 **removed**. The controller drives the whole IEC 62386-102 sequence —
@@ -589,23 +587,6 @@ make configure SLAVE_ADDR=42 BAUD_INDEX=2
 
 `BAUD_INDEX` is `0=9600 / 1=19200 / 2=38400`. `make configure` rewrites all 32 USERROW bytes — the four config bytes plus 28 bytes of `0xFF`.
 
-## Behavioural Changes (vs pre-refactor firmware)
-
-The flag-driven refactor (branch `task-1-flag-driven`) introduces several wire-protocol-visible changes. Masters built against earlier firmware revisions need the following adjustments:
-
-- **Writes ACK at the Modbus wire layer, not at DALI completion.** Per-ballast bank writes (0x0000–0x00FF), group-mask writes (0x0110–0x014F), and raw command writes (0x1000 / 0x1001) all return their normal echo-style ACK as soon as the cache is updated and the work is armed. The DALI command that pushes the change to the ballast is dispatched asynchronously by the work selector. Masters that previously took the write-ACK as "ballast confirmed" must switch to **dirty-bit polling** (FC04 0x0104–0x0107, read-clears) to detect when the change has propagated.
-- **Per-ballast cache addresses moved from FC04 (input regs) to FC03 (holding regs).** Addresses 0x0000–0x00FF (status/brightness, min/max, power-on/sys-fail, fade rate/time) and 0x0110–0x014F (group masks) are now read via FC03 and written via FC06/FC10. Reading them via FC04 returns `ILLEGAL_ADDRESS`.
-- **Coil function codes (FC01 / FC05 / FC0F) removed.** All three return `ILLEGAL_FUNCTION`. Masters that used FC05 / FC0F to drive ON/OFF should write the brightness register low byte (0 = off, ≥1 = on / proportional). FC01 (read coils) likewise has no replacement; read the brightness bank via FC03 instead.
-- **Action holding registers 0x1002–0x100A removed.** DAPC at 0x1002, GOTO_LAST_ACTIVE at 0x1003, OFF/UP/DOWN/STEP_UP/STEP_DOWN/RECALL_MAX/RECALL_MIN at 0x1004–0x100A all return `ILLEGAL_ADDRESS`. DAPC is now done via the brightness register (0x0000–0x003F); the rest are issued via the raw command channel (0x1000 / 0x1001).
-- **`RESCAN_INTERVAL` is retired (task 05).** The gateway does no polling of its own; the background sweep is the controller's, tunable there as `dali_sweep_interval_ms`. Its USERROW bytes are left unused.
-- **Async raw command pending state uses `0xFFnn` with non-zero low byte.** The 0x0108 pending encoding is `0xFF02` (after writing 0x1001 RAW_CMD_TWICE) or `0xFF01` (after writing 0x1000 RAW_CMD); the low byte does NOT decrement mid-twice-send (the firmware transitions directly from `0xFF02` to the terminal value once both sends complete). Masters that strict-equal `value == 0xFF00` for "still pending" will miss both initial arming states; match the high byte instead (`(value & 0xFF00) == 0xFF00`).
-- **DTR-setter holding registers removed (subtask 9).** `SET_DTR0` (0x100B), `SET_DTR1` (0x100C), and `SET_DTR2` (0x100D) all return `ILLEGAL_ADDRESS`. They were thin wrappers around raw DALI sends; issue the equivalent special command via the raw channel instead — write `0xA3VV` to 0x1000 to load DTR0 with `VV`, `0xC3VV` for DTR1, `0xC5VV` for DTR2 (single send, no backward frame expected; the result register at FC04 0x0108 reaches `NAK` once the send completes). Config writes (min/max, power-on/sys-fail, fade) are no longer done on the gateway at all — the controller issues them as raw DTR0+SET pairs through the command queue (the `send-DTR0-first` record flag makes each pair one atomic queue entry).
-- **FC04 input register layout cleaned up (subtask 8).** Present, dirty, and raw-command-result moved down to a contiguous block at 0x0100–0x0108: present[4] at 0x0100–0x0103, dirty[4] at 0x0104–0x0107, raw_cmd_result at 0x0108. The fading bitmap (formerly 0x0155–0x0158), group_status array (formerly 0x0100–0x010F), and scan_status (formerly 0x0150) are removed entirely — they were derivable from the per-ballast status byte / group_mask, or vestigial from the pre-flag-driven era. Masters that read presence/dirty/raw_result must update their addresses; the master-visible group_mask range at FC03 0x0110–0x014F is intentionally preserved by a 14-byte padding hole inside `register_map_t`. Fade-running detection switches from the removed bitmap to bit 4 of the per-ballast status byte at FC03 0x0000–0x003F (high byte).
-- **Raw command result high-byte encoding revamped and FC04 read-clears removed.** OK was `0x02xx`; it is now `0x00xx` (the register value is just the response byte, with `0x0000` doing double duty as "no command issued yet"). ERR was `0x03xx`; it is now `0x02xx` with the same error-subtype low byte. PENDING (`0xFFxx`) and NAK (`0x0100`) are unchanged. Reads of FC04 0x0108 no longer clear the register — the outcome of the last raw command persists until the next RAW_CMD write overwrites it. The arm gate now only checks PENDING: any other state is silently overwritten on the next RAW_CMD write (so masters that want to preserve a prior outcome must read it before re-arming).
-- **Config banks (0x0040–0x00FF) retired (task 04).** The per-ballast min/max, power-on/sys-fail, and fade banks no longer exist; FC03 reads and FC06/FC10 writes there return `ILLEGAL DATA ADDRESS`. Config is owned by the controller over raw DALI. A gateway on this firmware requires a raw-config controller — see "Config-bank retirement". Deploy controller-first.
-- **Command queue + register-map relocation (task 04) — supersedes the several raw-channel bullets above.** The legacy single-slot raw channel (0x1000/0x1001 RAW_CMD + FC04 0x0108 result) is **removed**; all raw DALI now goes through the id-tagged command queue. The register map moved to a round 0x1000 base: submit window 0x1000–0x1007 (FC10/FC23 write range), status block 0x1010–0x1019 (served under both FC03 and FC04), **FC23 (0x17)** support; and the action/config registers relocated to 0x1F00+ (scan 0x1F00, rescan 0x1F01, slave 0x1F02, baud 0x1F03, commission 0x1F04, reset 0x1F05). Every pre-queue raw/config-bank address returns ILLEGAL DATA ADDRESS. This gateway and the controller are now a **matched firmware set** — no mixed-version operation; deploy both together. See "Raw Command Queue".
-- **Command queue v2 — self-describing 8-slot lifecycle (task 06) — supersedes the task-04 id-tagged FIFO above.** The command queue is now DALI-agnostic (opaque 32-bit command in, `[status:8 | response8:8]` out) with DALI as a payload adapter on top. The register map at the same base is **incompatible** with v1: the command block is 0x1000–0x100F (8 slots × 2 regs, `0x1000 + 2*slot`, all-or-nothing reject-active write) and the status block is 0x1010–0x1017 (one `[status | response8]` register per slot; `0x1018–0x1019` now ILLEGAL). The controller-assigned id, the result ring, `accepted_id`/`completed_id`, and the boot-count resync are all gone — the slot statuses are the truth and a gateway reboot is detected as "idle means gone". This is a **fresh matched-set break** (queue v2 controller ↔ queue v2 gateway); a task-04 (v1) master cannot drive this firmware and vice versa. See "Raw Command Queue".
-
 ## Known Limitations
 
 These are residual issues that the current firmware does not address. None are runtime-fatal; each has a documented workaround or expected impact.
@@ -615,7 +596,7 @@ These are residual issues that the current firmware does not address. None are r
 - **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2–3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
 - **FC10 partial execution on register-map holes.**  The holding-register map has gaps at 0x0100–0x010F (FC04-only range), 0x1002–0x100A (action regs retired in subtask 4/5), 0x100B–0x100D (DTR setters retired in subtask 9), and 0x100E–0x100F.  A multi-register write spanning a gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the holes.
 - **FC04 0x0200 returns an ASCII version string, not a register address space.**  Reading exactly 16 input registers from address 0x0200 yields the 32-byte string `"DALI v<maj>.<min> <serial>"`.  Other lengths at this address fall through to the standard register-range check and return `ILLEGAL_ADDRESS`.
-- **`frame_is_valid` still recognises the retired coil function codes (FC01 / FC05 / FC0F) for size-check purposes, and the broadcast filter still admits FC05 / FC0F.**  This is intentional: well-formed coil frames pass frame validation, reach the FC dispatcher, and receive a graceful `ILLEGAL_FUNCTION` exception reply (or — for a broadcast-addressed FC05 / FC0F — are silently absorbed) rather than being dropped at the size check.  Candidate for future tightening: removing the FC01 / FC05 / FC0F cases from `frame_is_valid` and from the broadcast filter would drop those frames at validation time instead.  Nothing breaks if it stays as-is; the current shape gives masters that probe for coil support a clearer "function not supported" answer.
+- **`frame_is_valid` recognises the unsupported coil function codes (FC01 / FC05 / FC0F) for size-check purposes, and the broadcast filter still admits FC05 / FC0F.**  This is intentional: well-formed coil frames pass frame validation, reach the FC dispatcher, and receive a graceful `ILLEGAL_FUNCTION` exception reply (or — for a broadcast-addressed FC05 / FC0F — are silently absorbed) rather than being dropped at the size check.  Candidate for future tightening: removing the FC01 / FC05 / FC0F cases from `frame_is_valid` and from the broadcast filter would drop those frames at validation time instead.  Nothing breaks if it stays as-is; the current shape gives masters that probe for coil support a clearer "function not supported" answer.
 
 ### DALI
 

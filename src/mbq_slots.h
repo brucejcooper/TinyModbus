@@ -1,5 +1,5 @@
 #pragma once
-// mbq_slots.h — generic self-describing slot command queue (task 06, queue v2).
+// mbq_slots.h — generic self-describing slot command queue.
 //
 // A DALI-AGNOSTIC Modbus command-queue. It carries OPAQUE fixed-size commands to
 // the master and reports an 8-bit response + a lifecycle status per slot. It has
@@ -48,7 +48,7 @@ typedef struct {
 // the whole class of reboot/glitch recovery-corruption bugs.
 //
 // Padded to 8 bytes so indexing is a shift rather than a multiply on the 8-bit
-// AVR — the reason this was previously four parallel arrays. The static assert
+// AVR, which is why the struct is padded to a power of two. The static assert
 // keeps that property from being lost by a future field.
 typedef struct {
     mbq_cmd_t         cmd;   // opaque payload; the queue never interprets it
@@ -107,7 +107,7 @@ uint8_t mbq_next_pending(void);
 // the slot EXECUTING. The caller (payload adapter) interprets the bytes.
 //   TM_OK            *out holds the command
 //   TM_ERR_BAD_SLOT  slot >= MBQ_SLOTS; *out is ZEROED, never left untouched
-// The zeroing matters: this used to return silently without writing *out, so a
+// The zeroing matters: returning without writing *out would let a
 // caller that ignored the failure would re-fire whatever command the buffer still
 // held — a repeat of the previous DALI frame, which for a non-idempotent UP/DOWN
 // step is exactly the double-apply the protocol works to prevent.

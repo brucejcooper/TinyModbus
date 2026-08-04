@@ -39,8 +39,8 @@ static void on_idle_bus(void) {
 static void bus_stuck_timeout(void) {
     DALI_PORT.OUTCLR = DALI_TX_bm;
     dali_cancel_edge_detect();
-    // Fail the in-flight queue command with a bus-fault code. TASK 05: this
-    // used to abort a gateway-side commissioning run; commissioning now lives on
+    // Fail the in-flight queue command with a bus-fault code: what must not
+    // never happen is leaving a slot EXECUTING forever — the controller would
     // the controller, and what must not happen is leaving a slot EXECUTING
     // forever — the controller would wait on a command that can never finish.
     dali_sync_abort_busfault();

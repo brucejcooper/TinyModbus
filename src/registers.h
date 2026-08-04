@@ -36,12 +36,12 @@
 //  0x1F03         03, 06          1  R/W     Baud index: 0=9600 1=19200 2=38400.
 //  0x1F05         06              1  W       System reset; write 0xA5A5.
 //
-// REMOVED in task 05 (all ILLEGAL DATA ADDRESS). These were the gateway's cache
+// NOT IMPLEMENTED (all ILLEGAL DATA ADDRESS). The gateway caches nothing about
 // of the bus; it now caches nothing, which is what makes a reboot
 // consequence-free and freed ~672 B of SRAM:
 //
 //  0x0000-0x003F  per-ballast status|brightness (the arc-level bank)
-//  0x0040-0x00FF  per-ballast config banks (retired earlier, task 04)
+//  0x0040-0x00FF  per-ballast config banks
 //  0x0100-0x0103  present bitmask
 //  0x0104-0x0107  dirty bitmask
 //  0x0110-0x014F  group membership masks
@@ -80,7 +80,7 @@
 
 // The uptime / boot-count / reset-reason values behind this block live in
 // sysinfo.{c,h} — they are properties of the chip having booted, not of the
-// register map. This header used to declare two of them and point at
+// register map.
 // dali_sync.{c,h} for the third.
 
 // ---- Command queue (see the map above; protocol in mbq_slots.h) -----------
@@ -104,7 +104,7 @@
 #define MBREG_SYSTEM_RESET       0x1F05u
 #define MBREG_SYSTEM_RESET_MAGIC 0xA5A5u
 
-// No-op since task 05 — there is no register map to initialise. Kept as a call
+// No-op: there is no register map to initialise. Kept as a call
 // site so the boot sequence reads the same and a future addition has a home.
 void     regs_init(void);
 
@@ -115,8 +115,7 @@ void     regs_init(void);
 //
 // Layout: byte 0 = slave addr (encoded as addr - 2; 0xFF = address 1),
 //         byte 1 = baud index (0/1/2; 0xFF = 9600),
-//         bytes 2-3 = unused (were the rescan interval, retired in task 05;
-//                     left written so the layout is unchanged).
+//         bytes 2-3 = unused (written, but carry nothing).
 // Reserved Modbus addresses (0, 248-255) are clamped to 1 on read.
 // Setters return TM_ERR_BAD_VALUE for an out-of-range argument and
 // TM_ERR_HW_FAULT if the NVM write itself did not take — two outcomes a bool

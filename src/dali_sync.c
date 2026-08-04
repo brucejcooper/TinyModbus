@@ -1,13 +1,13 @@
 /*
  * dali_sync.c — DALI issuance for the command queue. See dali_sync.h.
  *
- * TASK 05 — STATELESS PIPE. What used to be ~1100 lines of gateway brain (work
- * selector, ballast cache, presence/dirty bitmaps, group masks, rescan cursor,
- * commissioning state machine) is now just the DALI adapter for the generic
- * slot queue. The controller owns all of that state and drives commissioning
- * itself; the gateway holds nothing a reboot could lose.
+ * STATELESS PIPE. This is only the DALI adapter for the generic slot queue: it
+ * unpacks a slot's opaque command, puts the frames on the wire, and reports the
+ * outcome back. The controller owns the bus state — ballast levels, presence,
+ * group membership, commissioning — so the gateway holds nothing a reboot could
+ * lose.
  *
- * Concurrency, unchanged from before: the queue's terminal write (mbq_complete —
+ * Concurrency: the queue's terminal write (mbq_complete —
  * response8 BEFORE status) runs in the LVL1 DALI completion handler, and
  * mbq_read_status fences each slot's read. start_next_dali_work commits its
  * launch under a brief ATOMIC re-check against the LVL0 idle-timer / PIT / edge

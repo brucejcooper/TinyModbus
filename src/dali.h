@@ -9,7 +9,7 @@
 // How the bit-level receiver classified a transaction. Lives here, in the
 // bit-level layer that PRODUCES it (dali_result_received below takes it), not in
 // the issuance layer — dali_sync.h already includes this header, so the reverse
-// would be circular. It was in a types.h junk drawer until this pass.
+// would be circular.
 typedef enum {
     DALI_RESPONSE_OK = 0,
     DALI_RESPONSE_NAK,
@@ -28,19 +28,14 @@ typedef enum {
 
 // ---- What the gateway knows about DALI: almost nothing ---------------------
 //
-// Everything that used to live here — the address-encoding macros, the ~30
-// command opcodes (OFF/UP/DOWN/RECALL/QUERY */SET *), the commissioning
-// specials (INITIALISE, RANDOMISE, COMPARE, WITHDRAW, SEARCHADDRH/M/L,
-// PROGRAM/VERIFY SHORT ADDRESS, TERMINATE) and their data-byte conventions —
-// was deleted in this pass. Not one of them had a reference left.
-//
-// That is the intended end state of task 05, not an oversight. The gateway is a
+// There is no opcode table here — no address-encoding macros, no command
+// opcodes, no commissioning specials. That is deliberate. The gateway is a
 // dumb pipe: the controller composes complete 16-bit forward frames and submits
 // them as opaque queue commands, and this firmware shifts the bytes onto the
 // wire without interpreting them. Keeping an opcode table here implied a
 // vocabulary the gateway does not have, and the commissioning block documented
 // itself as "driven by the OP_COMMISSION state machine in dali_sync.c" — a state
-// machine that no longer exists. Anything needed again belongs on the controller
+// wire without interpreting them. Anything needed belongs on the controller
 // side, which is where the frames are built.
 //
 // DTR0 is the single exception, and only because the QF_DTR0 flag makes the
@@ -99,8 +94,8 @@ typedef enum {
 extern volatile bool dali_bus_busy;
 
 // Initialise TX/RX pins and TCB0 edge-capture, then enter wait-for-idle to let
-// the bus settle after reset. (The RTC PIT it used to start belongs to
-// sysinfo.c — it drives the uptime counter, not anything DALI.)
+// the bus settle after reset. (The RTC PIT lives in sysinfo.c — it drives the
+// uptime counter, not anything DALI.)
 void    dali_init(void);
 
 // Returns non-zero when another master is driving the bus (RX pin HIGH after optocoupler inversion).
@@ -148,7 +143,7 @@ void dali_state_receiving_enter(void);
 // Offers the issuance layer a chance to re-fire (the second send of a
 // send-twice), otherwise completes the command and enters the next state. The
 // register-update / callback / queue-pop duties in the previous description
-// belonged to the v1 command queue and went with it in task 05.
+// register-update / callback / queue-pop duties are not this layer's.
 void dali_result_received(dali_response_type_t type, uint8_t value);
 
 #endif

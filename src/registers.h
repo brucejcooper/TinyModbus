@@ -10,8 +10,8 @@
 //
 // The complete, authoritative list. Any address not in this table returns
 // ILLEGAL DATA ADDRESS (0x02); any function code not listed returns ILLEGAL
-// FUNCTION (0x01). A client reading a removed address is a version mismatch and
-// should fail loudly rather than receive plausible zeros.
+// FUNCTION (0x01). A client reading an unimplemented address is a version
+// mismatch and should fail loudly rather than receive plausible zeros.
 //
 //  ADDRESS        FC              W  ACCESS  CONTENT
 //  ─────────────  ──────────────  ─  ──────  ──────────────────────────────────
@@ -35,19 +35,6 @@
 //  0x1F02         03, 06          1  R/W     Modbus slave address, 1-247.
 //  0x1F03         03, 06          1  R/W     Baud index: 0=9600 1=19200 2=38400.
 //  0x1F05         06              1  W       System reset; write 0xA5A5.
-//
-// NOT IMPLEMENTED (all ILLEGAL DATA ADDRESS). The gateway caches nothing about
-// of the bus; it now caches nothing, which is what makes a reboot
-// consequence-free and freed ~672 B of SRAM:
-//
-//  0x0000-0x003F  per-ballast status|brightness (the arc-level bank)
-//  0x0040-0x00FF  per-ballast config banks
-//  0x0100-0x0103  present bitmask
-//  0x0104-0x0107  dirty bitmask
-//  0x0110-0x014F  group membership masks
-//  0x1F00         SCAN_TRIGGER
-//  0x1F01         RESCAN_INTERVAL
-//  0x1F04         COMMISSION trigger/status
 //
 // Coils (FC01/FC05/FC0F) are not supported and return ILLEGAL FUNCTION.
 // ─────────────────────────────────────────────────────────────────────────────

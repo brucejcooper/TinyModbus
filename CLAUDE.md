@@ -8,35 +8,38 @@ The Makefile already sets `PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)` so `
 
 ## RAM budget
 
-ATtiny1604 has 1KB SRAM. Static data (BSS + data + COMMON) must stay well under 1KB to leave room for the stack (~150 bytes minimum). Key consumers:
+ATtiny1604 has 1 KB SRAM. Static data (BSS + data + COMMON) must stay well under
+that to leave room for the stack (~150 bytes minimum). Currently ~177 B, so
+there is plenty of headroom — the gateway caches nothing about the bus, which is
+what keeps it small. Key consumers:
 
-- `g_regs` (registers.c): ~672 bytes - the FC03/FC04 register map for 64 ballasts. Includes a 14 B `_reserved` padding hole at 0x0109-0x010F to anchor `group_mask` at the master-visible FC03 address 0x0110 across the FC04 trim (subtask 8).
-- `sync_flags[64]` + `current_op` + `group_write` + `commission_state` + `s_active` (dali_sync.c): the sync-flag-driven work bookkeeping that replaced the old `cmd_queue` / `bg_tasks` state.
-- `buf` (modbus.c): 40 bytes (`MAX_PKT_SZ = 16*2+8`), limits max FC03/FC04 read to 16 registers (`MAX_REG_RD`).
+- `s_slot[8]` (mbq_slots.c): 64 bytes — the command queue, 8 bytes per slot.
+- `buf` (modbus.c): 40 bytes (`MAX_PKT_SZ = 16*2+8`), which limits a single
+  FC03/FC04 read to 16 registers (`MAX_REG_RD`).
+- RX diagnostic counters + the last failed frame (modbus.c), and the sysinfo
+  values (sysinfo.c).
 
-Packed enums (`__attribute__((packed))`) on `cmd_type_t`, `reg_target_t`, `dali_op_t`, `commission_phase_t`, `dali_kind_t` force 1-byte storage instead of the default 2-byte int-sized AVR enum. The Modbus version string (FC04 at 0x0200) is built on demand directly into `buf` rather than kept in a static buffer.
+Packed enums (`__attribute__((packed))`) on `dali_kind_t`, `dali_step_t`,
+`tm_err_t` and `tm_fault_site_t` force 1-byte storage instead of the AVR's
+default 2-byte int-sized enum. The Modbus version string (FC04 `0x0200`) is
+built on demand directly into `buf` rather than kept in a static buffer.
 
 ## Diagnostics
 
 Clang (macOS) will report false-positive errors for AVR-specific attributes (`__progmem__`, `__AVR_TINY_PM_BASE_ADDRESS__`, ISR attributes, EEPROM macros). These are harmless - the code targets avr-gcc, not clang.
 
 
-## Power supply — board revision: 12 V → 5 V synchronous buck (2026-06-17)
+## Power supply — 12 V → 5 V synchronous buck
 
-**Root cause of the gateway reboots.** The current board regulates the 12 V input to
-3.3 V with an **HT7533 LDO** (100 mA, 10 µF output cap). At 12 V the LDO drops 8.7 V,
-so even ~85–100 mA of load dissipates ~0.75–0.9 W in a SOT-89 — under a sustained DALI
-scan the junction reaches **thermal shutdown**, the 3.3 V rail collapses, and the
-ATtiny's 2.6 V BOD fires. It presents as a **brownout (RSTFR `BORF`)**, which is exactly
-how the new FC04 `0x0310` sysinfo diagnostics surfaced it: **13 brownout reboots during
-one `dali_inventory.py --all` scan on bus 3**. It is *not* a transient sag and *not* a
-faulty LDO — it's linear dissipation from a 12 V input. A bigger LDO makes it worse; a
-bulk cap doesn't help a thermal trip.
+The logic rail is **5 V** from a synchronous buck. A buck is ~90 % efficient
+regardless of output, which is why an LDO is not an option here: dropping 12 V
+to logic level linearly dissipates enough to reach thermal shutdown under a
+sustained DALI scan, and the collapse fires the ATtiny's BOD (presents as
+`RSTFR BORF`). A bigger LDO makes it worse and a bulk cap does not help a
+thermal trip.
 
-**Decision.** Replace the LDO with a **synchronous buck** and move the logic rail to
-**5 V**. A buck is ~90 % efficient regardless of output, so the heat problem disappears.
-5 V also lets the ATtiny run **20 MHz** (needs V_DD ≥ 4.5 V) and gives the THVD1450
-**stronger RS-485 drive** (better noise margin — bus 3 was marginal).
+5 V also lets the ATtiny run **20 MHz** (needs V_DD ≥ 4.5 V) and gives the
+THVD1450 stronger RS-485 drive.
 
 **Regulator: MP2331H** (`MP2331HGTL-Z`, **LCSC C6992878**, SOT583-8) — 24 V/2 A, 1.2 MHz,
 **COT** control, V_FB 0.8 V, internal FETs (no catch diode). Chosen over the MP1584EN:

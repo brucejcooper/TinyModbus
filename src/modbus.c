@@ -258,17 +258,14 @@ static void send_error(mb_err_t err) {
 
 // ---- FC04 - read input registers ----------------------------------------
 
-// FC04 input registers (read-only):
-//   0x0100-0x0103  present bitmap                   (4 regs)
-//   0x0104-0x0107  dirty bitmap (read-clears)       (4 regs)
-//   0x0200         version block (special-cased; count must be 16)
-//   0x0300 diag / 0x0310 sysinfo (special-cased)
-//   0x1010-0x1019  queue status block (also served under FC03; special-cased)
+// FC04 input registers (read-only). Every one is special-cased; there is no
+// generic range:
+//   0x0200-0x020F  version block (count must be 16)
+//   0x0300-0x030F  RX diagnostics (count must be 16)
+//   0x0310-0x0313  sysinfo: uptime, boot count, reset reason (count must be 4)
+//   0x1010-0x1017  queue status block (also served under FC03)
 //
-// The per-ballast level bank (0x0000-0x003F) and group membership masks
-// (0x0110-0x014F) live in FC03/FC06/FC10 holding space; reads via FC04 return
-// ILLEGAL_ADDRESS.  present + dirty are packed into the contiguous 0x0100-0x0107
-// ladder so a master can read both in one 8-register FC04 request.
+// Anything else returns ILLEGAL_ADDRESS.
 //
 // Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
 // at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.

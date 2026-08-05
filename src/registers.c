@@ -92,18 +92,12 @@ void regs_init(void) {
 // ---- FC03 holding read -------------------------------------------------
 
 tm_err_t regs_read_holding(uint16_t addr, uint16_t *val) {
-    // 0x0000-0x00FF and 0x0110-0x014F are NOT IMPLEMENTED: the gateway caches
-    // nothing about the bus — no arc/status bank, no presence/dirty bitmaps, no
-    // group masks. They fall through to
-    // ILLEGAL DATA ADDRESS — a client still reading them is a version mismatch
-    // and should fail loudly rather than receive plausible zeros.
-    // 0x0040-0x00FF: config banks (min/max/power-on/sys-fail/fade) are not served.
-    // The controller owns config over raw DALI now (task-03 Phase D), so these
-    // fall through to ILLEGAL DATA ADDRESS below rather than returning stale
-    // zeros that a legacy bank-reading client would mistake for real values.
-    // Group membership masks 0x0110-0x014F: 16 groups × 4 registers (8 bytes
-    // each).  Indexed from the named field base — the old offset-trick anchor
-    // (struct offset 0x0220) is gone with the config banks.
+    // Holding space serves exactly three things: the slot status block, the
+    // slave address and the baud index. Anything else falls through to ILLEGAL
+    // DATA ADDRESS — the gateway caches nothing about the bus, so there is no
+    // ballast, presence or group state to read here, and a client asking for it
+    // should fail loudly rather than receive plausible zeros.
+    //
     // Slot status block at 0x1010-0x1017 (served identically under FC03 and FC04;
     // FC23's read range is holding-only, so it targets this).  Served one register
     // (one slot's [status|response8]) at a time from the generic queue module; each
@@ -131,11 +125,10 @@ tm_err_t regs_read_holding(uint16_t addr, uint16_t *val) {
 // ---- FC06/FC10 holding write -------------------------------------------
 
 tm_err_t regs_write_holding(uint16_t addr, uint16_t val) {
-    // 0x0110-0x014F group masks: GONE. The controller diffs membership against
-    // its own cache and emits ADD/REMOVE FROM GROUP itself, so the gateway no
-    // longer needs the mask, the diff, or the fan-out state machine — and a
-    // gateway reboot cannot lose membership, which is what would make a
-    // original group-toggle failure possible.
+    // Writable holding space is config only: slave address, baud index and the
+    // system-reset magic. No group masks — the controller diffs membership
+    // against its own cache and emits ADD/REMOVE FROM GROUP itself, so a gateway
+    // reboot cannot lose it.
 
     switch (addr) {
         // The setters distinguish BAD_VALUE from HW_FAULT themselves, so this

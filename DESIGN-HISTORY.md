@@ -145,3 +145,54 @@ The flag-driven refactor (branch `task-1-flag-driven`) introduces several wire-p
 ## Protocol break: queue v2 vs the id-tagged FIFO
 
 **Changelog / matched firmware set.** Queue v2 (task 06) is a **protocol break** from the task-04 id-tagged FIFO: the command block at 0x1000 and the status block at 0x1010 have incompatible semantics (self-describing slots vs. an id ledger + result ring). The controller (`switch_gateway_firmware`) and this gateway firmware are a **matched set** — a v1 master cannot drive a v2 gateway and vice versa, and there is no mixed-version operation. **Deploy both together.** (The earlier task-04 break — the removal of the pre-queue single-slot raw channel at 0x1000/0x1001 + FC04 0x0108 — still stands; those legacy addresses return ILLEGAL DATA ADDRESS.)
+
+---
+
+## The v2 slot queue (task 06), and the FC23 transport under it (task 04)
+
+Replaced by **queue v4** (task 08). `QUEUE-PROTOCOL.md` is the current
+specification; everything below is here so an old capture can still be read.
+
+**What v2 was.** Eight — later three — slots, each self-describing its own
+lifecycle. The master wrote a command into a slot it *named*, then read the
+whole status block back: one register per slot, `[status:8 | response8:8]`,
+with `status` in `0 idle / 1 pending / 2 executing / 3 complete / 4 failed`.
+Terminals were sticky and were freed by being overwritten. FC23 carried it —
+write range the command block at `0x1000–0x100F`, read range the slot status
+block at `0x1010–0x1017` — so one transaction both submitted and collected.
+A gateway reboot cleared every slot to idle, which the master read as the
+**"idle means gone"** signal.
+
+**Why it went.** FC23 forces the master to *name* the register it writes, so
+it may only submit into a slot it already knows is free — and it learns that
+from a read. Every DALI frame therefore cost a poll that carried no work, then
+a submit. Measured on the bench: **1.73 Modbus transactions per DALI command
+and 99 % RS-485 occupancy for a single saturated gateway**, which left no room
+for a second DALI bus. v4 lets the *gateway* choose the slot and retains
+results until acked, which collapses that to **1.03 transactions and 37 %**.
+
+**Retired with it** (all now `ILLEGAL DATA ADDRESS`, and FC23 itself
+`ILLEGAL FUNCTION`):
+
+| Range / code | Was |
+|---|---|
+| `0x1000–0x100F` | command block, 2 registers per slot |
+| `0x1010–0x1017` | slot status block, `[status \| response8]` per slot |
+| FC23 (`0x17`) | the read/write-multiple transport for both blocks |
+
+**Also gone: a draft FC65/FC66 pair** that briefly occupied `0x41`/`0x42`.
+It let the gateway pick the slot and returned an `accepted_slot` byte with a
+snapshot taken *before* the enqueue. It was never driven by a shipped
+controller. v4 reuses `0x41` with entirely different semantics, so a capture
+showing `0x41` must be dated before it can be decoded.
+
+**And `controller/docs/modbus-command-queue.md`**, a standalone specification
+of v2's generic slot pattern, deleted in task 08. Its subject no longer exists;
+`QUEUE-PROTOCOL.md` supersedes it and is normative for both halves.
+
+**What survived unchanged into v4:** the queue is still DALI-agnostic (an
+opaque 4-byte command in, a status + answer byte out, with DALI as a payload
+adapter on top), and the **publication ordering** rule — write the payload
+bytes before the byte that publishes them, read in the mirror order — which is
+the one invariant carried forward verbatim, because it is what lets the
+completion ISR and the Modbus reader share state with no interrupt fences.

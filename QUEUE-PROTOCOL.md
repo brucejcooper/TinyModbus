@@ -3,22 +3,6 @@
 Authoritative description of how the controller (RP2040 master) drives the
 TinyModbus gateway's DALI command queue.
 
-> ### Implementation status — READ FIRST
->
-> | | FC23 | FC65 / FC66 |
-> |---|---|---|
-> | gateway (`TinyModbus/src/modbus.c`) | shipping | **early draft only** |
-> | controller transport (`src/modbus.c`) | shipping | **early draft only** |
-> | controller client (`mbq_client.c`) | shipping | **not started** |
->
-> **No code implements this document yet.** Two things differ from the committed
-> draft: the slot status byte is packed `[state:3 | seq:5]` (today `state` is a
-> plain enum in a whole byte and `seq` is a separate internal field, never
-> transmitted), and the reply has no `accepted_slot` (the draft has one).
->
-> Nothing on a device is affected — `mbq_client` still drives the queue purely
-> over FC23, so FC65 is unreachable in the running firmware.
-
 Two transports carry the same queue:
 
 | | function code | status |
@@ -248,31 +232,53 @@ bindings, so no stale `seq` survives to be matched.
 
 ---
 
-## 3. Slot selection, and why the order matters
+## 3. Slot selection and transaction order
 
-`mbq_enqueue_any()` picks the slot:
+An FC65 transaction is **write then read**, in that order:
 
-1. first `IDLE` slot, if any;
-2. otherwise the first non-active slot — i.e. `COMPLETE` or `FAILED`;
-3. otherwise `MBQ_NONE`.
+1. place the command;
+2. build the reply from the status block **as it stands afterwards**.
 
-Preferring `IDLE` means an uncollected result is only overwritten when there is
-no alternative.
+So the reply shows the command just sent — `PENDING`, or already `EXECUTING` if
+the arbiter picked it up before the reply was built (which it will whenever the
+DALI bus was idle). The master gets its `(slot, seq)` binding from the very
+transaction that created it, exactly as FC23 does.
 
-> **The gateway snapshots the status block BEFORE performing the enqueue.**
->
-> Step 2 can reuse a slot whose terminal result the master has not yet seen. If
-> the reply were built after the enqueue, that result would be gone — the
-> command would look silently lost. Snapshotting first means the master always
-> sees the completion **in the very transaction that overwrites it**.
->
-> Consequence for the master: `accepted_slot`'s entry in the status block
-> describes the slot's state **before** this command was placed — the *previous*
-> occupant. It does **not** describe the command just sent.
+### Which slot, and the rule that makes write-then-read safe
 
-This is the single most important semantic difference from FC23, where the
-gateway writes *then* reads, so a submitted slot's status reflects the new
-command.
+`mbq_enqueue_any()` picks:
+
+1. the first `IDLE` slot; failing that
+2. the first slot holding an **already-reported** terminal; failing that
+3. nothing — no new `seq` appears in the reply, and the master resends.
+
+Step 2 is the load-bearing one. **A terminal may only be overwritten once it has
+appeared in a reply.** The gateway keeps one `reported` bit per slot, set when a
+status block containing that terminal is transmitted; it is not on the wire.
+
+Without that bit, write-then-read destroys results in the *ordinary* case, not a
+rare one. A completion landing between two enqueues would be overwritten by the
+next write and the reply — built afterwards — would never show it. At 3 slots
+under load that is the steady state, so most results would simply vanish. The
+`reported` bit costs one transaction of latency before a slot can be recycled
+and nothing else.
+
+### The one remaining lossy path
+
+If the reply that first carried a terminal is **lost in transit**, the gateway
+has marked it reported but the master never saw it, and the next enqueue may
+reuse the slot.
+
+Bounded and detectable, not silent:
+
+- `QF_TWICE` SET-class commands have **no answer** to lose.
+- `QF_ANSWER` queries do, but the master sees it precisely — a `seq` it was
+  tracking disappears having never shown a terminal. Queries are idempotent, so
+  it re-issues.
+- It needs a lost reply to begin with. Measured at 19200: zero frame or CRC
+  errors across thousands of transactions.
+
+Closing even this costs 2 bytes — see [open question 5](#7-open-questions).
 
 ---
 
@@ -282,23 +288,34 @@ Three slots, controller streaming commands C1, C2, … at a gateway whose DALI b
 takes ~33 ms per frame. `▸` marks the DALI engine's own progress between
 transactions.
 
+`R` marks a slot whose terminal has been reported and is therefore recyclable.
+
 | # | request | gateway does | status block returned | master concludes |
 |---|---|---|---|---|
-| 1 | `FC65 C1` | snapshot `[IDLE,IDLE,IDLE]`, place C1 → slot 0 as seq 1 | `IDLE, IDLE, IDLE` | no new seq yet — the snapshot predates the enqueue |
-| | | ▸ slot 0 `PENDING`→`EXECUTING` | | |
-| 2 | `FC65 C2` | snapshot `[PEND/1,IDLE,IDLE]`, place C2 → slot 1 as seq 2 | **`PEND seq1`**, `IDLE`, `IDLE` | new seq 1 in slot 0 → that is C1. Bind it |
-| 3 | `FC65 C3` | snapshot `[EXEC/1,PEND/2,IDLE]`, place C3 → slot 2 as seq 3 | `EXEC 1`, **`PEND 2`**, `IDLE` | new seq 2 in slot 1 → C2. Queue now full |
-| | | ▸ C1 finishes → slot 0 `COMPLETE`, resp8 = value | | |
-| 4 | `FC65 C4` | snapshot `[COMPLETE/1,EXEC/2,PEND/3]`, no IDLE → reuse slot 0, place C4 as seq 4 | **`COMPLETE 1(v)`**, `EXEC 2`, **`PEND 3`** | **C1's result delivered** (seq 1 matches its binding) *and* C4 enqueued — one transaction |
-| 5 | `FC65 C5` | snapshot `[PEND/4,EXEC/2,PEND/3]` — all active, nothing placed | `PEND 4`, `EXEC 2`, `PEND 3` | seq 4 is new → that was C4. No *further* new seq → C5 **not taken**, resend |
-| | | ▸ C2 finishes → slot 1 `COMPLETE` | | |
-| 6 | `FC65 C5` | snapshot `[PEND/4,COMPLETE/2,PEND/3]`, reuse slot 1 as seq 5 | `PEND 4`, **`COMPLETE 2(v)`**, `PEND 3` | C2's result delivered |
-| 7 | `FC65 C6` | placed → slot 1 as seq 6, **reply lost on the wire** | *(never seen)* | timeout — did C6 land? |
-| 8 | `FC66` | nothing; just reports | `PEND 4`, **`PEND 6`**, `PEND 3` | seq 6 is new and unrecognised → C6 **did** land, in slot 1. Bind it, do not resend |
+| 1 | `FC65 C1` | place C1 → slot 0 as seq 1, then read | **`PEND 1`**, `IDLE`, `IDLE` | seq 1 is new → C1 bound to slot 0, immediately |
+| 2 | `FC65 C2` | place C2 → slot 1 as seq 2, then read | `EXEC 1`, **`PEND 2`**, `IDLE` | C2 bound; C1 executing |
+| 3 | `FC65 C3` | place C3 → slot 2 as seq 3, then read | `EXEC 1`, `PEND 2`, **`PEND 3`** | C3 bound; queue full |
+| | | ▸ C1 finishes → slot 0 `COMPLETE 1`, resp8 = value | | |
+| 4 | `FC65 C4` | no IDLE, no *reported* terminal → **nothing placed**; read reports slot 0 and marks it `R` | **`COMPLETE 1(v)`**, `EXEC 2`, `PEND 3` | **C1's result delivered.** No new seq → C4 not taken, resend |
+| 5 | `FC65 C4` | slot 0 is `R` → reuse it, place C4 as seq 4, then read | **`PEND 4`**, `EXEC 2`, `PEND 3` | C4 bound to slot 0 |
+| | | ▸ C2 finishes → slot 1 `COMPLETE 2` | | |
+| 6 | `FC65 C5` | no IDLE, no `R` → nothing placed; report slot 1, mark `R` | `PEND 4`, **`COMPLETE 2(v)`**, `PEND 3` | C2's result delivered; C5 not taken |
+| 7 | `FC65 C5` | slot 1 is `R` → reuse, place C5 as seq 5 | `PEND 4`, **`PEND 5`**, `EXEC 3` | C5 bound |
+| 8 | `FC65 C6` | placed → slot 2 as seq 6, **reply lost on the wire** | *(never seen)* | timeout — did C6 land? |
+| 9 | `FC66` | nothing; just reports | `PEND 4`, `EXEC 5`, **`PEND 6`** | seq 6 unrecognised → C6 **did** land, in slot 2. Bind it, do not resend |
 
-Note transaction 1: because the snapshot predates the enqueue, a command's
-binding is always learned on the **following** transaction. That costs nothing
-during a burst, and it is what keeps a reused terminal from being lost.
+Nothing is ever lost here: every terminal is transmitted before its slot becomes
+recyclable, and the master's binding arrives in the transaction that created it.
+
+**The cost is visible at transactions 4 and 6** — a full queue spends one
+transaction reporting-and-freeing before the next can be placed. So a saturated
+3-slot queue alternates *report* and *place*, giving **2 transactions per DALI
+frame**, which is exactly what we were trying to escape.
+
+That is not a flaw in write-then-read; it is the queue being too shallow. With
+4 slots the recycling transaction overlaps a still-executing command and the
+alternation disappears. **This needs measuring, not assuming** — see
+[open question 6](#7-open-questions).
 
 ### The same cycle over FC23, for comparison
 
@@ -362,11 +379,11 @@ document's projections have been wrong twice already.
 
 1. **Pacing.** FC65 makes one transaction per DALI frame *sufficient*, but the
    client currently re-polls immediately (`next_at = now`), so it will still
-   issue ~2.4 transactions per 33 ms frame and simply collect `0xFF` for most of
+   issue ~2.4 transactions per 33 ms frame and collect nothing new from most of
    them. Harmless with one gateway (nothing else wants the bus) and actively
    good for latency, but with **two** gateways a spinning client starves the
-   other bus. Should the client back off to a completion estimate when
-   `accepted_slot == 0xFF`, or keep spinning and let the scheduler arbitrate?
+   other bus. Should the client back off to a completion estimate when no slot
+   is placeable, or keep spinning and let the scheduler arbitrate?
 
 2. ~~**`resend` semantics.**~~ **Resolved by the sequence** (§2.5). A resend is
    safe precisely when no new `seq` appeared, which the gateway reports rather
@@ -380,8 +397,22 @@ document's projections have been wrong twice already.
 4. **Two reconcile policies.** The FC23 path's ambiguity handling
    (`resolve_ambiguous`, the `k == submit_slot` trust rule) exists because a
    submit can land while its response is lost. FC65 removes that ambiguity
-   entirely — acceptance is explicit. Keep them as separate functions, or one
-   with a mode flag?
+   entirely — a new `seq` is proof of acceptance. Keep them as separate
+   functions, or one with a mode flag?
+
+5. **The last lossy path** (§3): a terminal whose only reply was lost can be
+   recycled before the master ever saw it. Closing it costs 2 bytes — the reply
+   carries `MBQ_SLOTS + 1` status entries, the extra being whatever terminal
+   this write displaced. 12 bytes instead of 10, and no lossy path at all.
+   Worth 1.04 ms per transaction?
+
+6. **Slot count, again.** The `reported` bit means a full queue spends one
+   transaction recycling before the next placement, so a saturated **3**-slot
+   queue alternates report/place — 2 transactions per DALI frame, which is what
+   FC23 already does. 4 slots should overlap the recycling with a still-executing
+   command and remove the alternation, at 2 more bytes per reply. This is the
+   question the whole exercise turns on and it must be **measured**: every
+   projection in this document has been wrong at least once.
 
 ---
 

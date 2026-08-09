@@ -12,11 +12,15 @@ sides.
 > constant, round-robin fairness at the controller, diagnostics in cold-path
 > registers rather than the reply.
 >
-> **Implementation status: NOT YET BUILT.** The gateway currently implements
-> the draft-1 FC65/FC66 and the FC23 slot queue; the controller drives FC23
-> only. Both are replaced by this design — see [§9](#9-what-v4-removes) and
-> the [implementation plan](#10-implementation-plan). Until it lands, the code
-> wins for interpreting captures.
+> **Implementation status (2026-08-09): BUILT AND RUNNING ON THE BENCH,
+> VALIDATION IN PROGRESS.** Both halves are implemented on `task/08-queue-v4`
+> (gateway `TinyModbus`, controller `switch_gateway_firmware`) and talking to
+> each other on real hardware. FC23 and the draft FC65/FC66 are gone. Gate
+> progress and open defects are tracked in `tasks/08-queue-v4.md`; **the
+> pacing rule in §5 was got wrong first time and is the one thing to read
+> carefully before touching the client.** Where this document and the code
+> disagree, this document is the intent and the code is the bug — except for
+> anything the validation log has since disproved.
 
 ---
 
@@ -29,7 +33,10 @@ gateway's **response queue**; the reply reports the fate of the enqueue (an
 the response queue. Results are retained until explicitly acked, so no reply
 loss can destroy one. In steady state each transaction enqueues one command,
 acks the previous result, and collects the next — **one ~14-byte transaction
-per DALI frame**. Reboots are detected by result deadlines plus two structural
+per DALI frame**. That last property is not free: it requires the client to
+**wait** for the oldest command to be due rather than polling to find out
+(§5), and the first bench build got 2.04 transactions per command by polling
+eagerly. Reboots are detected by result deadlines plus two structural
 rules (seq collision, impossible-empty-head), with the existing sysinfo
 `boot_count` register as the cold-path arbiter for the one genuinely ambiguous
 corner. The gateway holds nothing the master cannot reconstruct.
@@ -647,7 +654,8 @@ the v3 draft join the history), PR via forgejo.
 | reboot detection | timeout + rules R2–R4, no hot-path boot byte | command durations are well known; the two structural rules close the inference holes; sysinfo `boot_count` arbitrates the one double-fault corner off the hot path |
 | response carries two sequences | accept byte (3+5) + head entry (3+5+8) | one 5-bit field cannot carry both the enqueue's fate and the head's identity; the split also makes lost-transaction recovery atomic (R1) |
 | queue depth | 2, build-time constant | "current + next" is the requirement; depth 3 is a one-line change if the depth-2 soak shows DALI starvation; the wire is depth-agnostic |
-| starvation | controller round-robins slaves with work | fairness is scheduler policy, not protocol; pacing retained for bus economy only |
+| starvation | controller round-robins slaves with work | fairness is scheduler policy, not protocol |
+| pacing | client waits for the oldest command to be due whenever it may not enqueue | **not "bus economy only" as first written — it is what delivers the one-transaction-per-frame property.** Measured: without it, 2.04 txns/command, worse than the FC23 it replaces |
+| FC23 queue fallback | removed | matched-set deploys make a live fallback worthless, and a second queue stack is a second set of reconcile semantics to keep correct — where every v1/v2 bug lived. (Not flash-forced: measured headroom is 5.3 KB.) |
 | observability | cold-path diag registers + CLI stats | hot-path bytes are the scarce resource; the soak's self-verifying probe doesn't need wire-level visibility |
-| FC23 queue fallback | removed | two queue stacks don't fit 16 KB flash; matched-set deploys make a live fallback worthless |
 | function code | 0x41, redefined | 0x40 is outside the MODBUS user-defined ranges (65–72, 100–110); draft-1 FC65 never shipped in a controller |

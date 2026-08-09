@@ -12,6 +12,7 @@
 #include "errors.h"
 #include "sysinfo.h"
 #include "cq.h"
+#include "fc41.h"
 #include "dali.h"
 #include "dali_sync.h"
 
@@ -98,42 +99,22 @@ static volatile bool initial_silence_observed = false;
 #define FC_WRITE_COILS       0x0F
 #define FC_WRITE_MULTI_REG   0x10
 
-// THE queue function code. One user-defined code carries all queue traffic: a
-// request optionally enqueues one DALI command and optionally acks (deletes) the
-// head of the response queue, and the reply reports the fate of the enqueue plus
-// the current head. In steady state that is one ~14-byte transaction per DALI
-// frame, against the 2.04 transactions per frame FC23 measured — FC23 made the
-// master NAME the slot it wrote to, so it could only submit into one a PREVIOUS
-// read had shown free, and that dependency cost a poll per frame.
+// The queue function code, its request lengths, its wire flag bits and its
+// accept-status codes all live in fc41.h — one transcription of the spec's §1,
+// shared with the host test that enumerates the validation table.
 //
-// MODBUS Application Protocol V1.1b reserves 65-72 and 100-110 for user
-// definition, so 0x41 is conformant rather than an extension. Framing, CRC,
-// silence and exception replies are all ordinary RTU; only the payload shape is
-// custom. (The draft-1 FC65/FC66 pair used 0x41/0x42 for a different, never
-// deployed, shape — v4 is a clean break on the same code, and 0x42 is retired.)
-#define FC_QUEUE             0x41
-
-// Request lengths, INCLUDING the CRC. The three shapes are distinguished — and
-// validated — by length together with the flag bits; see frame_is_valid.
-#define FCQ_REQ_POLL         5u   // slave, fc, [flags|ack], crc x2 — ack and/or poll
-#define FCQ_REQ_ENQ          7u   // ...+ addr, data                — enqueue
-#define FCQ_REQ_ENQ_DTR0     8u   // ...+ addr, data, dtr0          — enqueue w/ preload
-
-// Flags in bits 7-5 of the request's third byte. These are the WIRE positions
-// and they are NOT the internal QF_* command bits — see queue_flags_to_qf().
-#define QW_TWICE             0x80u
-#define QW_DTR0              0x40u
-#define QW_ANSWER            0x20u
-#define QW_FLAGS_bm          0xE0u
-
-// Accept status, the top 3 bits of the reply's accept byte. A full queue is
-// reported IN BAND like this rather than as a Modbus exception: an exception
+// In steady state FC 0x41 is one ~14-byte transaction per DALI frame, against
+// the 1.73 transactions per command FC23 measured on this rig: FC23 made the
+// master NAME the slot it wrote to, so it could only submit into one a PREVIOUS
+// read had shown free, and that dependency cost a poll per frame. (The draft-1
+// FC65/FC66 pair used 0x41/0x42 for a different, never deployed, shape — v4 is
+// a clean break on the same code, and 0x42 is retired.)
+//
+// A_FULL is reported IN BAND rather than as a Modbus exception: an exception
 // would discard the head report in the same breath, and the head is exactly what
 // the master needs in order to learn that a slot has freed. It also leaves
 // nothing for a transport auto-retry to latch onto, which is what makes the
 // task-07 DEVICE_BUSY double-execution hazard unconstructible here.
-#define A_ACCEPTED           0u
-#define A_FULL               1u
 
 typedef enum {
     MB_ERR_ILLEGAL_FUNCTION    = 0x01,
@@ -654,27 +635,18 @@ static bool frame_is_valid(void) {
             expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
             break;
         }
-        case FC_QUEUE: {
-            // The spec's validity table, and it is a TABLE rather than a single
-            // length because the three request shapes are distinguished by
-            // length AND flags together:
+        case FC_QUEUE:
+            // The one place the length/flag table is not a single constant: the
+            // three request shapes are distinguished by length AND flags
+            // together, so the decision lives in fc41.h as a pure function that
+            // the host test enumerates exhaustively.  buf[2] is safe to read —
+            // the rx_sz >= 5 gate above has already passed.
             //
-            //   5 B  ack and/or poll, no enqueue   flags must be 000
-            //   7 B  enqueue, no DTR0 preload      QF_DTR0 must be CLEAR
-            //   8 B  enqueue with DTR0 preload     QF_DTR0 must be SET
-            //
-            // Any other length, or an inconsistency, falls through to 255 and is
-            // discarded WITHOUT A REPLY, exactly as a corrupt frame would be —
-            // to the master it is then indistinguishable from a lost frame and
-            // shares its one recovery path.  Rejecting rather than guessing
-            // matters because the DTR0 byte's presence is what decides whether
-            // buf[5] is a payload byte or the CRC.
-            uint8_t flags = (uint8_t)(buf[2] & QW_FLAGS_bm);
-            if      (rx_sz == FCQ_REQ_POLL     && flags == 0u)        expected_size = FCQ_REQ_POLL;
-            else if (rx_sz == FCQ_REQ_ENQ      && !(flags & QW_DTR0)) expected_size = FCQ_REQ_ENQ;
-            else if (rx_sz == FCQ_REQ_ENQ_DTR0 && (flags & QW_DTR0))  expected_size = FCQ_REQ_ENQ_DTR0;
+            // A false here leaves expected_size at 255, which no frame can match
+            // (MAX_PKT_SZ is 40), so the frame is discarded WITHOUT A REPLY,
+            // exactly as a corrupt one would be.
+            if (fc41_len_ok(rx_sz, buf[2])) expected_size = rx_sz;
             break;
-        }
         default:
             // Unknown function code. Accept it on CRC alone — we cannot know its
             // expected length — so it reaches the dispatcher and gets a proper

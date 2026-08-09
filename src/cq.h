@@ -122,6 +122,11 @@ enum {
 // it can tear across the increment and misreport one sample. That is accepted
 // deliberately: fencing it would put the cli in this file that the header
 // forbids, for a cold-path diagnostic whose next read is correct anyway.
+// The two interesting ones read in OPPOSITE directions, and registers.h spells
+// this out for whoever finds them non-zero on a bench: `full` is a canary —
+// A_FULL is unreachable while the master honours its in-flight cap, so any
+// non-zero value means the master's accounting is wrong — whereas `stalls` is
+// the backpressure rule working as designed and is not alarming by itself.
 typedef struct {
     uint16_t accepts;   // commands enqueued (A_ACCEPTED replies sent)
     uint16_t full;      // enqueue attempts refused, queue full (A_FULL replies)
@@ -139,11 +144,16 @@ void cq_init(void);
 // ---- Modbus side (main context) --------------------------------------------
 
 // Enqueue one opaque command. Returns the seq it was stamped with (1..31), or
-// CQ_SEQ_NONE (0) if the command queue is full — which is NOT an error but the
-// protocol's in-band back-pressure signal (A_FULL); the master paces and
-// resends. Returning an exception instead would throw away the head report in
-// the same breath, and the head is exactly what the master needs to learn that a
-// slot freed.
+// CQ_SEQ_NONE (0) if the command queue is full, which the caller reports in band
+// as A_FULL rather than as an exception — an exception would throw away the head
+// report in the same breath, and the head is exactly what the master needs to
+// learn that a slot freed.
+//
+// A full queue is NOT this protocol's back-pressure mechanism (that is the
+// response queue, via cq_next). It should never happen at all: the master caps
+// its own in-flight count at CMDQ_DEPTH and its count over-estimates ours, so
+// A_FULL means the master is miscounting. Handle it gracefully, count it, and
+// treat a non-zero counter as a fault to investigate.
 uint8_t cq_accept(const uint8_t cmd[CQ_CMD_BYTES]);
 
 // Ack: delete the head of the response queue IFF the head's seq equals `seq`.

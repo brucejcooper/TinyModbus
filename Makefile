@@ -16,7 +16,20 @@ endif
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)
-COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=2 -fstack-usage -ffunction-sections -fdata-sections
+# FW_VER_MAJOR/MINOR are the numbers in the FC04 0x0200 version string
+# ("DALI v<maj>.<min> <serial>"), and under queue v4 they are the QUEUE
+# GENERATION MARKER the controller latches on (QUEUE-PROTOCOL.md §8).
+#
+#   0.x  pre-v4: FC23 slot queue, or the never-deployed draft FC65/66
+#   1.0  queue v4: FC 0x41, response queue, ack-by-seq
+#
+# Bumped 0.2 -> 1.0 by task 08. v4 removes the fallback path, so controller and
+# gateway are a matched set and the controller must be able to refuse a
+# mismatched gateway loudly rather than limp; that needs an unambiguous,
+# monotone boundary, and MAJOR >= 1 is it. Do not bump MAJOR again for anything
+# short of another wire-breaking queue generation — the controller's
+# MBQ_GW_MIN_VER_MAJOR is keyed to it.
+COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=1 -DFW_VER_MINOR=0 -fstack-usage -ffunction-sections -fdata-sections
 LDFLAGS    	= -Wl,--gc-sections
 AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )

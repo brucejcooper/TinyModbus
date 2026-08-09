@@ -74,14 +74,28 @@
 // the CLI or the bench, never polled hot.
 //
 //   reg0  0x0320  accepts        commands enqueued (A_ACCEPTED replies)
-//   reg1  0x0321  a_full         enqueues refused, queue full (A_FULL replies)
+//   reg1  0x0321  a_full         enqueues refused, queue full (A_FULL replies).
+//                                *** NON-ZERO IS A CANARY, NOT TRAFFIC. ***
+//                                A_FULL is UNREACHABLE in correct operation: the
+//                                master decrements its in-flight count only when
+//                                it SEES a result, while this gateway frees a
+//                                command slot the moment the command completes,
+//                                so the master's count always over-estimates our
+//                                occupancy — if it believes there is room, there
+//                                is.  A non-zero reading therefore means the
+//                                master's accounting has gone wrong, not that
+//                                the queue got busy.  Investigate it; do not
+//                                read it as back-pressure working
 //   reg2  0x0322  executes       commands handed to the DALI adapter
 //   reg3  0x0323  results        results pushed onto the response queue
 //   reg4  0x0324  acks           response entries popped by a matching ack
 //   reg5  0x0325  stalls         arbiter refusals caused by a FULL response
-//                                queue — i.e. the backpressure rule engaging,
-//                                which is the counter the backpressure
-//                                validation gate reads
+//                                queue.  Unlike a_full, this one IS reachable in
+//                                normal operation — it is the backpressure rule
+//                                doing its job whenever the master stops acking,
+//                                so a non-zero value is not alarming by itself.
+//                                It is the counter the backpressure validation
+//                                gate reads to prove the rule engaged
 //   reg6  0x0326  q_discard      FC 0x41 frames dropped with no reply for a bad
 //                                length or a length/flag inconsistency.  Held
 //                                here rather than in the RX diagnostic block
@@ -89,8 +103,7 @@
 //   reg7  0x0327  spare          reads 0
 //
 // Steady-state sanity: accepts == executes == results == acks, each lagging the
-// one before it by at most the queue depths, and stalls == 0 unless the master
-// is deliberately withholding acks.  This layout is duplicated in the
+// one before it by at most the queue depths.  This layout is duplicated in the
 // controller's `mbq` stats parser and in CLAUDE.md — all three must move
 // together.
 #define FC04_QDIAG_BLOCK    0x0320u

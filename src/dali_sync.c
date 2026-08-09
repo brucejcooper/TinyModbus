@@ -8,10 +8,13 @@
  * lose.
  *
  * Concurrency: the queue's completion write (cq_complete — the result's bytes
- * BEFORE the counter that publishes them) runs in the LVL1 DALI completion
- * handler; everything else here runs in main context. start_next_dali_work
- * commits its launch under a brief ATOMIC re-check against the LVL0 idle-timer /
- * PIT / edge callbacks.
+ * BEFORE the counter that publishes them) is reached from TWO interrupt levels,
+ * not one: LVL1 for a normal completion (dali_sync_completion) and LVL0 for the
+ * bus-stuck escape (dali_sync_abort_busfault). Everything else here runs in main
+ * context. start_next_dali_work commits its launch under a brief ATOMIC re-check
+ * against the LVL0 idle-timer / PIT / edge callbacks. See cq.h for why the two
+ * completion paths cannot nest, which is what keeps the queue's unfenced
+ * single-writer discipline sound.
  */
 
 #include <avr/io.h>
@@ -39,8 +42,7 @@ static uint8_t s_cq_seq = CQ_SEQ_NONE;
 static cq_cmd_t s_raw_cmd;
 
 // Where we are in the executing command. Meaningless unless we own the channel.
-// Together
-// with s_raw_cmd this is the WHOLE issuance state — see dali_sync.h.
+// Together with s_raw_cmd this is the WHOLE issuance state — see dali_sync.h.
 static volatile dali_step_t s_step;
 
 void dali_sync_init(void) {
@@ -226,6 +228,11 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 //
 // Deliberately does NOT re-enter the wait-for-idle path — the caller is already
 // in it and drives the transition itself.
+//
+// RUNS AT LVL0, not LVL1: the caller chain is TCA0_OVF -> dali_tick() ->
+// bus_stuck_timeout(). This is the SECOND of cq_complete's two ISR entry points
+// and the reason cq.h states its contract as "ISR context at either level"
+// rather than naming the DALI completion handler alone.
 void dali_sync_abort_busfault(void) {
     if (dali_sync_owns_channel()) {
         tm_err_t ce = cq_complete(s_cq_seq, H_FAILED, DALI_RESP_BUSFAULT);

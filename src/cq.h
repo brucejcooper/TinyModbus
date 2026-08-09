@@ -29,9 +29,28 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * CONCURRENCY: ONE WRITER PER BYTE, AND NO INTERRUPT FENCES. DELIBERATELY.
  *
- * cq_complete() runs in the LVL1 DALI completion ISR. EVERYTHING else runs in
- * main context (the Modbus handler and the work arbiter). There are no fences in
- * cq.c and adding one is a bug, not a hardening: a global cli here blocks the
+ * cq_complete() runs in ISR CONTEXT AT EITHER OF TWO INTERRUPT LEVELS, and the
+ * distinction matters enough to state precisely:
+ *
+ *   LVL1  the normal path — the DALI completion handler (TCB0 CAPT) via
+ *         dali_sync_completion().
+ *   LVL0  the bus-stuck escape — TCA0_OVF -> dali_tick() -> bus_stuck_timeout()
+ *         -> dali_sync_abort_busfault(), which fails the in-flight command
+ *         rather than leaving it EXECUTING forever.
+ *
+ * EVERYTHING else runs in main context (the Modbus handler and the work
+ * arbiter). Two cq_complete() calls nesting would both read-modify-write
+ * s_rq_pushed — the one race this design cannot absorb — so it is worth knowing
+ * WHY that cannot happen: TCB0's CAPT interrupt is disabled outside the DALI
+ * receive state (dali_state_receiving.c), so no LVL1 completion can fire during
+ * the LVL0 escape path. THAT IS LOAD-BEARING; re-enabling TCB0 CAPT more widely
+ * would need this reconsidered.
+ *
+ * The single-writer rules below survive either level regardless, because what
+ * they actually partition is main against not-main.
+ *
+ * There are no fences in cq.c and adding one is a bug, not a hardening: a
+ * global cli here blocks the
  * DALI bit-timing callbacks and the USART RX ISR, and an over-long ATOMIC_BLOCK
  * on this path is precisely what caused the 2026-06-05 RX starvation incident
  * (see CLAUDE.md) — a scan held interrupts off for hundreds of µs and overran
@@ -175,18 +194,25 @@ void cq_head(uint8_t out[2]);
 // Index of the command to run next, or CQ_NONE if there is nothing to start.
 //
 // BACKPRESSURE (load-bearing, spec §0): this returns CQ_NONE when the response
-// queue is full even though a command is pending, and counts the refusal in
-// `stalls`. A full response queue stalls DALI execution rather than ever
-// dropping a result. The master always has a way out, because the ack in a
-// request is processed BEFORE the enqueue: one transaction frees an entry and
-// refills the pipeline in the same frame.
+// queue is full even though a command is pending. A full response queue stalls
+// DALI execution rather than ever dropping a result. The master always has a way
+// out, because the ack in a request is processed BEFORE the enqueue: one
+// transaction frees an entry and refills the pipeline in the same frame.
+//
+// `stalls` counts EPISODES, not refusals — the rising edge only. The arbiter is
+// polled thousands of times a second, so a per-call counter would wrap every few
+// seconds and tell you nothing about how often backpressure actually engaged.
 uint8_t cq_next(void);
 
 // Take entry `idx` (from cq_next): copy its command into *out_cmd, its seq into
 // *out_seq, and mark it EXECUTING.
 //   TM_OK            *out_cmd and *out_seq hold the command
-//   TM_ERR_BAD_SLOT  idx out of range, or the entry is not PENDING; *out_cmd is
-//                    ZEROED and *out_seq set to CQ_SEQ_NONE
+//   TM_ERR_BAD_SLOT  idx out of range, NOT the queue head, or not PENDING;
+//                    *out_cmd is ZEROED and *out_seq set to CQ_SEQ_NONE
+// Only the head is startable, and that is enforced here rather than assumed of
+// the caller: it is what keeps execution strict FIFO, and what stops a caller
+// that passed its own index from putting two commands in flight and quietly
+// invalidating the response-queue reservation cq_next made.
 // The zeroing matters: a caller that ignored the failure would otherwise re-fire
 // whatever command the buffer still held — a repeat of the previous DALI frame,
 // which for a non-idempotent UP/DOWN step is exactly the double-apply the
@@ -199,9 +225,10 @@ tm_err_t cq_begin(uint8_t idx, cq_cmd_t *out_cmd, uint8_t *out_seq);
 //   TM_ERR_BAD_SLOT  no EXECUTING command carries that seq — nothing changed
 //   TM_ERR_BUSY      response queue full: the slot is FREED and THE RESULT IS
 //                    DROPPED
-// TM_ERR_BUSY is unconstructible while the backpressure rule holds (cq_next
-// reserved the entry before this command ever started, and only one command
-// executes at a time). It is still handled rather than asserted, and it frees
+// TM_ERR_BUSY is unconstructible while the backpressure rule holds: cq_next
+// reserved the entry before this command ever started, and only one command can
+// be executing — which cq_begin ENFORCES (head only) rather than assuming of
+// its caller. It is still handled rather than asserted, and it frees
 // the slot on the way out, because the alternative failure mode is worse: a
 // stranded EXECUTING slot wedges the queue until reboot, whereas a dropped
 // result is a case the master already has a rule for (R4, the result deadline).

@@ -142,7 +142,6 @@ void dali_state_receiving_enter(void);
 // Single authority for post-command state transitions — called from ISR context.
 // Offers the issuance layer a chance to re-fire (the second send of a
 // send-twice), otherwise completes the command and enters the next state. The
-// register-update / callback / queue-pop duties in the previous description
 // register-update / callback / queue-pop duties are not this layer's.
 void dali_result_received(dali_response_type_t type, uint8_t value);
 

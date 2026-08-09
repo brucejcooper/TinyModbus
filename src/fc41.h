@@ -15,6 +15,13 @@
  * silence and exception replies are all ordinary RTU; only the payload shape is
  * custom.
  *
+ * PEER DEFINITION: controller/src/mbq_client.h — separate repo, so these
+ * constants cannot be shared and are mirrored by hand. THE TWO MUST AGREE BIT
+ * FOR BIT. They are a matched set with no fallback path (§8), and drift here
+ * would not fail loudly: it would present as every command meaning something
+ * slightly different from what was asked for. Change one, change the other, in
+ * the same task.
+ *
  * Every packed byte has the same shape — control in the top 3 bits, sequence in
  * the low 5 — and sequences run 1..31 with 0 reserved for "none":
  *

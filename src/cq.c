@@ -48,6 +48,20 @@ static uint8_t          s_rq_popped;   // main writes
 
 static uint8_t s_seq;    // last assigned seq; main-only
 
+// Rising-edge latch for the stall counter. Main-only.
+//
+// Without it, `stalls` counts POLLS, not stalls: the main loop calls
+// start_next_dali_work() -> cq_next() free-running, and while a stall is in
+// progress neither of that function's early exits fires (nothing is executing
+// and the bus is idle), so every loop pass lands on the refusal — measured at
+// roughly 18 000 increments per second, wrapping the 16-bit counter about every
+// 3.6 s. The counter would be non-zero, so the backpressure validation gate
+// would appear to pass, while the value itself said nothing: you could not tell
+// one stall episode from fifty, and two reads a second apart would disagree.
+// That is the task-07 failure shape exactly — correct behaviour, useless
+// evidence, hidden behind a check that only asks "is it non-zero".
+static bool s_stalled;
+
 static volatile cq_counters_t s_ctr;
 
 static inline uint8_t ring_next(uint8_t i, uint8_t depth) {
@@ -72,6 +86,7 @@ void cq_init(void) {
     s_head = 0; s_live = 0;
     s_rq_pushed = 0; s_rq_popped = 0;
     s_seq = CQ_SEQ_NONE;
+    s_stalled = false;
     s_ctr.accepts = 0; s_ctr.full = 0; s_ctr.executes = 0;
     s_ctr.results = 0; s_ctr.acks = 0; s_ctr.stalls = 0;
 }
@@ -146,16 +161,33 @@ void cq_head(uint8_t out[2]) {
 
 uint8_t cq_next(void) {
     cq_reap();
-    if (s_live == 0u || s_cmdq[s_head].state != CQ_PENDING) return CQ_NONE;
+    if (s_live == 0u || s_cmdq[s_head].state != CQ_PENDING) { s_stalled = false; return CQ_NONE; }
     // BACKPRESSURE. Stall DALI rather than start work whose result would have
     // nowhere to go — retention is the guarantee the whole recovery design rests
     // on, so a dropped result is the one outcome not worth any throughput.
-    if (rq_count() >= RESPQ_DEPTH) { s_ctr.stalls++; return CQ_NONE; }
+    //
+    // The counter takes the RISING EDGE ONLY, so it reads as "times backpressure
+    // engaged" rather than "times we were asked while stalled" — see s_stalled.
+    // Every non-stall outcome clears the latch, including "nothing pending", so
+    // a later episode is counted as its own even if the queue drained in between.
+    if (rq_count() >= RESPQ_DEPTH) {
+        if (!s_stalled) { s_stalled = true; s_ctr.stalls++; }
+        return CQ_NONE;
+    }
+    s_stalled = false;
     return s_head;
 }
 
 tm_err_t cq_begin(uint8_t idx, cq_cmd_t *out_cmd, uint8_t *out_seq) {
-    if (idx >= CMDQ_DEPTH || s_cmdq[idx].state != CQ_PENDING) {
+    // `idx != s_head` is what makes "only one command executes at a time" an
+    // invariant of THIS MODULE rather than an assumption about its caller — and
+    // that invariant is load-bearing twice over: it is what makes execution
+    // strict FIFO in accept order, and it is what makes cq_complete's
+    // TM_ERR_BUSY unconstructible (one executing command means the response
+    // entry cq_next reserved is still the only one that can be consumed). Test
+    // it before the PENDING check so a caller passing its own index is refused
+    // even when that slot happens to be legitimately pending.
+    if (idx >= CMDQ_DEPTH || idx != s_head || s_cmdq[idx].state != CQ_PENDING) {
         for (uint8_t b = 0; b < CQ_CMD_BYTES; b++) out_cmd->b[b] = 0;
         *out_seq = CQ_SEQ_NONE;
         return TM_ERR_BAD_SLOT;

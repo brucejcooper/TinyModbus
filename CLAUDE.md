@@ -9,15 +9,20 @@ The Makefile already sets `PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)` so `
 ## RAM budget
 
 ATtiny1604 has 1 KB SRAM. Static data (BSS + data + COMMON) must stay well under
-that to leave room for the stack (~150 bytes minimum). Currently ~177 B, so
-there is plenty of headroom — the gateway caches nothing about the bus, which is
+that to leave room for the stack (~150 bytes minimum). Currently **152 B**
+(task 08), leaving 872 B — the gateway caches nothing about the bus, which is
 what keeps it small. Key consumers:
 
-- `s_slot[8]` (mbq_slots.c): 64 bytes — the command queue, 8 bytes per slot.
 - `buf` (modbus.c): 40 bytes (`MAX_PKT_SZ = 16*2+8`), which limits a single
   FC03/FC04 read to 16 registers (`MAX_REG_RD`).
+- The queue core (cq.c): 37 bytes — command queue 12 (`CMDQ_DEPTH` × 6),
+  response queue 8 (`RESPQ_DEPTH` × 2), diagnostic counters 12, cursors 5.
 - RX diagnostic counters + the last failed frame (modbus.c), and the sysinfo
   values (sysinfo.c).
+
+Deepest measured stack frame is `modbus_process` at 48 B (`-fstack-usage`), and
+the worst nested-ISR chain adds ~35 B, so real worst-case use is ~110 B against
+the 872 B available.
 
 Packed enums (`__attribute__((packed))`) on `dali_kind_t`, `dali_step_t`,
 `tm_err_t` and `tm_fault_site_t` force 1-byte storage instead of the AVR's
@@ -25,6 +30,32 @@ default 2-byte int-sized enum. The Modbus version string (FC04 `0x0200`) is
 built on demand directly into `buf` rather than kept in a static buffer.
 
 ## Diagnostics
+
+### FC04 blocks are EXACT-LENGTH reads
+
+Asking for any other count returns ILLEGAL DATA ADDRESS rather than a short
+read, so a client built against a different map fails loudly. `registers.h` is
+authoritative; this table exists because the controller's `mbq` stats parser and
+its own CLAUDE.md mirror it, and all of them must move together.
+
+| block | address | count | contents |
+|---|---|---|---|
+| version | `0x0200` | 16 | `"DALI v<maj>.<min> <20-hex-serial>"` |
+| RX diagnostics | `0x0300` | 16 | overflow, frame err, CRC err, frames ok, last failed frame, internal faults |
+| sysinfo | `0x0310` | 4 | uptime (32-bit), boot count, reset reason |
+| queue counters | `0x0320` | 8 | accepts, a_full, executes, results, acks, stalls, q_discard, spare |
+
+Queue counters (task 08, `QUEUE-PROTOCOL.md` §6) are 16-bit wrapping. Two of
+them read in **opposite directions** and it matters:
+
+- **`a_full` non-zero is a canary**, not traffic. A_FULL is unreachable while the
+  master honours its in-flight cap, so any non-zero value means the master's
+  accounting is wrong. Investigate it.
+- **`stalls` non-zero is normal.** It counts backpressure *episodes* (rising
+  edge, not polls — the arbiter is polled thousands of times a second) and is
+  simply the rule working whenever the master stops acking.
+
+### Clang false positives
 
 Clang (macOS) will report false-positive errors for AVR-specific attributes (`__progmem__`, `__AVR_TINY_PM_BASE_ADDRESS__`, ISR attributes, EEPROM macros). These are harmless - the code targets avr-gcc, not clang.
 

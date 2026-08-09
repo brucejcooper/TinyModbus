@@ -254,8 +254,14 @@ static void test_backpressure(void) {
     CHECK(seq == (uint8_t)(RESPQ_DEPTH + 1u));
     CHECK(cq_next() == CQ_NONE);
     CHECK(cq_counters()->stalls == 1);
-    CHECK(cq_next() == CQ_NONE);                 // still stalled, still counted
-    CHECK(cq_counters()->stalls == 2);
+
+    // The counter takes the RISING EDGE. The arbiter is polled thousands of
+    // times a second, so counting refusals would wrap the 16-bit counter every
+    // few seconds and make the backpressure validation gate unreadable — it
+    // would read non-zero and so appear to pass, while telling you nothing about
+    // how often backpressure engaged. One episode must read as one.
+    for (int i = 0; i < 500; i++) CHECK(cq_next() == CQ_NONE);
+    CHECK(cq_counters()->stalls == 1);
 
     // The head is still readable while stalled: the master must be able to see
     // what to ack, or the stall would be unrecoverable.
@@ -268,7 +274,7 @@ static void test_backpressure(void) {
     CHECK(cq_ack(1u) == true);
     uint8_t idx = cq_next();
     CHECK(idx != CQ_NONE);
-    CHECK(cq_counters()->stalls == 2);           // a successful selection is not a stall
+    CHECK(cq_counters()->stalls == 1);           // a successful selection is not a stall
 
     cq_cmd_t got; uint8_t bseq = 0;
     CHECK(cq_begin(idx, &got, &bseq) == TM_OK);
@@ -289,6 +295,16 @@ static void test_backpressure(void) {
     cq_head(head);
     CHECK(head[0] == 0 && head[1] == 0);
     CHECK(cq_counters()->results == (uint16_t)(RESPQ_DEPTH + 1u));
+
+    // A LATER, SEPARATE episode counts separately. The queue fully drained in
+    // between, so the latch must have cleared — if it only cleared on a
+    // successful selection, this second stall would go uncounted and a soak that
+    // stalled repeatedly would report a single episode.
+    for (uint8_t i = 0; i < RESPQ_DEPTH; i++) CHECK(run_one(i, H_OK, i) != CQ_SEQ_NONE);
+    mkcmd(cmd, 201);
+    CHECK(cq_accept(cmd) != CQ_SEQ_NONE);
+    CHECK(cq_next() == CQ_NONE);
+    CHECK(cq_counters()->stalls == 2);
 }
 
 // ── 8. Misuse of the arbiter hooks is refused, not obeyed ────────────────────
@@ -326,9 +342,23 @@ static void test_hook_guards(void) {
     CHECK(cq_complete(seq, H_OK, 0) == TM_ERR_BAD_SLOT);
     CHECK(cq_counters()->results == 0);
 
-    // Begin it, then complete the WRONG seq: also refused, and the real command
-    // is still executing afterwards.
+    // ONLY THE HEAD IS STARTABLE, and the module enforces it rather than
+    // trusting the caller to pass what cq_next returned. Accept a second command
+    // so a non-head PENDING entry exists, and confirm cq_begin refuses it: two
+    // EXECUTING commands would break FIFO order AND invalidate the response-queue
+    // reservation that makes cq_complete's TM_ERR_BUSY unconstructible.
+    uint8_t cmd2[CQ_CMD_BYTES];
+    mkcmd(cmd2, 2);
+    CHECK(cq_accept(cmd2) == (uint8_t)(seq + 1u));
     uint8_t idx = cq_next();
+    CHECK(idx == 0u);                                    // the head
+    memset(got.b, 0xAB, sizeof got.b);
+    CHECK(cq_begin(1u, &got, &bseq) == TM_ERR_BAD_SLOT);  // pending, but not the head
+    for (uint8_t i = 0; i < CQ_CMD_BYTES; i++) CHECK(got.b[i] == 0);
+    CHECK(bseq == CQ_SEQ_NONE);
+
+    // Begin the head, then complete the WRONG seq: also refused, and the real
+    // command is still executing afterwards.
     CHECK(cq_begin(idx, &got, &bseq) == TM_OK);
     CHECK(cq_complete((uint8_t)(seq + 1u), H_OK, 0) == TM_ERR_BAD_SLOT);
     CHECK(cq_complete(seq, H_OK, 0x44u) == TM_OK);

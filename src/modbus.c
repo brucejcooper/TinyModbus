@@ -388,8 +388,9 @@ static void process_fc04(void) {
     }
 
     // Every FC04 block is a special case handled above; anything else is an
-    // was a generic tail that set buf[2] = count*2 and transmitted WITHOUT filling
-    // the payload — harmless only because fc04_range_allowed() returns false
+    // ILLEGAL_ADDRESS. Where this now falls through, there used to be a generic
+    // tail that set buf[2] = count*2 and transmitted WITHOUT filling the payload
+    // — harmless only because fc04_range_allowed() returned false
     // unconditionally, and a stale-buffer leak the moment anyone allow-listed a
     // range. The allow-list hook is gone with it; a new block adds its own case
     // above, next to the code that fills the buffer it promises.
@@ -402,8 +403,7 @@ static void process_fc04(void) {
 // the requested range is not in the holding register map.
 // Build a holding-register read response body into buf: buf[2] = count*2, then
 // `count` big-endian registers from `addr`.  Returns false (buf half-filled) if
-// any register in the range is unmapped — caller sends ILLEGAL_ADDRESS.  Shared
-// by FC03 and the read half of FC23.
+// any register in the range is unmapped — caller sends ILLEGAL_ADDRESS.
 //
 // Iterate by index, not `reg < addr + count`: with addr=0xFFFF, count=2 the
 // upper bound wraps to 0x0001 and the loop would never run while buf[2] already

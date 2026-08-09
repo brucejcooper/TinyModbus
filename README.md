@@ -393,6 +393,20 @@ The firmware detects transmissions from other DALI masters on the bus: if a risi
 
 ## Modbus Interface
 
+> ⚠️ **This section is OUT OF DATE as of queue v4 (task 08) and is being
+> rewritten.** Everything below describing the command queue — the FC23
+> read/write pattern, the `0x1000` submit window, the `0x1010` slot status block
+> and the per-slot lifecycle — describes the RETIRED v2 design. Those function
+> codes and address ranges now return ILLEGAL FUNCTION / ILLEGAL DATA ADDRESS.
+>
+> **The queue is now one function code, FC 0x41**, carrying an optional enqueue
+> plus an optional ack, with a gateway-side response queue retained until acked.
+> `QUEUE-PROTOCOL.md` is the normative specification and `src/fc41.h` is the wire
+> format; a new diagnostic block lives at FC04 `0x0320` (exactly 8 registers).
+> Do not build a client against the register map below.
+>
+> The sysinfo, version, diagnostic and config registers are unaffected.
+
 ### Connection
 
 Modbus RTU, RS-485, **9600 baud, 8N1**.

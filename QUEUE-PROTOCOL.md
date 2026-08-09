@@ -3,6 +3,23 @@
 Authoritative description of how the controller (RP2040 master) drives the
 TinyModbus gateway's DALI command queue.
 
+> ### Implementation status — READ FIRST
+>
+> | | FC23 | FC65 / FC66 |
+> |---|---|---|
+> | gateway (`TinyModbus/src/modbus.c`) | shipping | **untagged draft only** |
+> | controller transport (`src/modbus.c`) | shipping | **untagged draft only** |
+> | controller client (`mbq_client.c`) | shipping | **not started** |
+>
+> **This document describes the TAGGED design (§2.5), which no code implements
+> yet.** The committed FC65 draft predates the tag: its request is 8 bytes with
+> no `tag`, and its reply is `3 + 2N` with an `accepted_slot` that is `0xFF` when
+> the queue is full. Treat the source as the earlier proposal and this document
+> as the intended one; they are reconciled when the client is built.
+>
+> Nothing on a device is affected — `mbq_client` still drives the queue purely
+> over FC23, so FC65 is unreachable in the running firmware.
+
 Two transports carry the same queue:
 
 | | function code | status |

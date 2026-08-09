@@ -6,8 +6,9 @@ An ATtiny1604-based Modbus RTU to DALI gateway. It acts as a Modbus slave device
 >
 > **It caches nothing about the bus.** No arc levels, no status, no presence or
 > dirty bitmaps, no group masks, no commissioning state, no scan cursors. The
-> master submits opaque commands to an 8-slot queue; the gateway executes them
-> in accept order and reports each slot's outcome. That is the whole contract.
+> master submits opaque commands over a single function code; the gateway
+> executes them in accept order and hands each result back exactly once, holding
+> it until the master acks it. That is the whole contract.
 >
 > This is deliberate — "no cache of a cache": **the ballasts are the
 > authority, the controller holds the one and only cache, the gateway holds
@@ -107,7 +108,7 @@ S = start bit (logic 1), P = stop bits (logic 1, return bus to idle)
 | 1  | group (0–15) | 1 | Command to group |
 | 1  | 111111 | 0/1 | Broadcast (A0=0 → DAPC, A0=1 → command) |
 
-The per-ballast level bank in this firmware uses short addresses (0–63). Command-queue records accept any valid DALI address byte, so group and broadcast commands are also supported through the queue.
+A queued command carries the address byte verbatim, so short addresses, groups, broadcast and the special commands are all reachable through the queue — the gateway does not interpret any of them.
 
 ### Command Types
 
@@ -206,31 +207,39 @@ Commissioning is **driven by the controller** over the command queue; this firmw
 
 The firmware is a **queue executor**. There is no work selector, no
 reconciliation cache and no background polling: the only thing that ever causes
-a DALI frame is a command the master put in a slot.
+a DALI frame is a command the master enqueued.
 
 ```
 Modbus master                     gateway                        DALI bus
-  FC23 write slot k  ─────────►  mbq_slots: slot k = PENDING
+  FC 0x41 enqueue  ──────────►  cmdq: command stamped seq n
                                        │
-  FC23/FC03 read status ◄──────  slot statuses (8 registers)
-                                       │
+  reply: accept byte  ◄────────  ... + the head of the response queue
+         + head entry                  │
                                  main loop: start_next_dali_work()
-                                       │  lowest accept-sequence PENDING slot
+                                       │  head of cmdq, if respq has room
                                        ▼
                                  dali_sync: unpack [addr,data,flags,dtr0]
                                        │                            ──────►
                                        ▼                            ◄──────
-                                 completion (ISR): mbq_complete(slot,
-                                       status, response8)
+                                 completion (ISR): cq_complete(seq,
+                                       status, response8) → respq
+                                       │
+  FC 0x41 ack seq n  ─────────►  respq: entry n popped
 ```
 
-**Slot lifecycle** — `idle → pending → executing → complete | failed`. The
-master reads a command's fate directly from its slot; there is no id ledger and
-nothing to reconstruct after a disruption. A slot the master believes is active
-reading back `idle` means the gateway rebooted ("idle means gone").
+**Command lifecycle** — `free → pending → executing`, and then the command is
+gone. There is no terminal state, because a finished command is not a command:
+it is an entry on the **response queue**, held under its sequence number until
+the master acks it. The master never reads anything to discover a command
+finished — the result arrives in the next reply.
 
-**Execution order** is the gateway-assigned accept sequence: the slot stamped
-first executes first, wrap-aware over the small live window.
+**Execution order** is strict FIFO in accept order. The gateway stamps each
+accepted command with a sequence number (1–31), which is the only identity a
+command has.
+
+**Backpressure.** The arbiter will not start a command unless the response queue
+has a free entry, so a master that stops acking stalls DALI execution rather
+than ever losing a result.
 
 **Multi-frame atomicity.** `dali_busy` is held across a whole command, so a
 `QF_DTR0` pair (`0xA3<dtr0>` then the frame) goes out back-to-back with nothing
@@ -238,15 +247,19 @@ interleaved. Commissioning — which is a long sequence of interdependent frames
 achieves the same exclusivity from the *controller* side by submitting one frame
 at a time and admitting nothing else for that slave.
 
-**Ordering guarantee (acceptance-critical).** `mbq_complete` writes `response8`
-BEFORE `status`, under the TCB0+ATOMIC fence, and `mbq_read_status` fences each
-slot's read. A single-register Modbus read is atomic, so a master can never see
-a terminal status paired with a stale response byte.
+**Ordering guarantee (acceptance-critical).** `cq_complete` writes a response
+entry's two bytes and only THEN publishes it by bumping a single-byte counter;
+`cq_head` reads the counter before the entry. `cq_accept` writes the command
+bytes and seq before publishing the slot as pending, and `cq_next` reads the
+state before trusting them. A reader can therefore never see a published entry
+holding stale bytes. There are no interrupt fences involved, deliberately —
+every shared byte has exactly one writer, and a `cli` on this path is what
+caused the 2026-06-05 RX-starvation incident.
 
 **Bus-fault handling.** If the DALI line is held asserted past the escape
-timeout (200 TE, ~83 ms), the in-flight slot is completed `failed` with a
-bus-fault code rather than abandoned — otherwise it would sit `executing`
-forever and the master would wait on a command that can never finish.
+timeout (200 TE, ~83 ms), the in-flight command is completed `H_FAILED` with a
+bus-fault code rather than abandoned — otherwise it would sit EXECUTING forever
+and the master would wait on a command that can never finish.
 
 ### What moved to the controller, and why
 
@@ -259,9 +272,10 @@ forever and the master would wait on a command that can never finish.
 | boot scan, rescan cursor, scan trigger | controller's boot interrogation + background sweep |
 | commissioning state machine | controller drives INITIALISE…TERMINATE as queued frames |
 
-Size effect of the strip: **flash 15474 → 10014 bytes (−35 %)**, **SRAM 532 →
-171 bytes (−68 %)**. `g_regs` no longer exists — its only fields were the four
-caches above.
+Size effect of the strip, measured at the time: **flash 15474 → 10014 bytes
+(−35 %)**, **SRAM 532 → 171 bytes (−68 %)**. `g_regs` no longer exists — its
+only fields were the four caches above. (For where the budget stands today, see
+"Stack budget" under Known Limitations.)
 
 ---
 
@@ -376,8 +390,9 @@ Enforces the DALI requirement that the bus be idle for at least 22 Te before the
 ### Work selection
 
 There is one source of DALI work: the command queue. Each main-loop pass, if the
-bus is idle and no command is in flight, `start_next_dali_work()` takes the
-lowest accept-sequence PENDING slot, marks it EXECUTING and dispatches it.
+bus is idle and no command is in flight, `start_next_dali_work()` takes the head
+of the command queue — provided the response queue has room for its result —
+marks it EXECUTING and dispatches it.
 
 The sync-flag table, the rotating reconciliation cursor, the periodic rescan and
 the priority chain that arbitrated between them are **not present**. The
@@ -393,56 +408,53 @@ The firmware detects transmissions from other DALI masters on the bus: if a risi
 
 ## Modbus Interface
 
-> ⚠️ **This section is OUT OF DATE as of queue v4 (task 08) and is being
-> rewritten.** Everything below describing the command queue — the FC23
-> read/write pattern, the `0x1000` submit window, the `0x1010` slot status block
-> and the per-slot lifecycle — describes the RETIRED v2 design. Those function
-> codes and address ranges now return ILLEGAL FUNCTION / ILLEGAL DATA ADDRESS.
->
-> **The queue is now one function code, FC 0x41**, carrying an optional enqueue
-> plus an optional ack, with a gateway-side response queue retained until acked.
-> `QUEUE-PROTOCOL.md` is the normative specification and `src/fc41.h` is the wire
-> format; a new diagnostic block lives at FC04 `0x0320` (exactly 8 registers).
-> Do not build a client against the register map below.
->
-> The sysinfo, version, diagnostic and config registers are unaffected.
-
 ### Connection
 
-Modbus RTU, RS-485, **9600 baud, 8N1**.
+Modbus RTU, RS-485, 8N1.
 
-Slave address, baud rate, and rescan interval all live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud / 64 s rescan. Writes to holding registers 0x1F01 / 0x1F02 / 0x1F03 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
+Slave address and baud rate live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud; `make configure` writes 19200 unless told otherwise. Writes to holding registers 0x1F02 / 0x1F03 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
 
-### Function Codes
+### Function codes
 
-| Code | Name | Description |
-|------|------|-------------|
-| 0x03 | Read Holding Registers | Read per-ballast level cache, group masks, the queue status block, and USERROW config registers (max 16 regs per request) |
-| 0x04 | Read Input Registers | slot status block, version / diag / sysinfo |
-| 0x06 | Write Single Holding Register | Update per-ballast level cache, group mask, or an action/config register (0x1F00+) |
-| 0x10 | Write Multiple Holding Registers | Write a contiguous holding block — including the command-queue command block (0x1000–0x100F) |
-| 0x17 | Read/Write Multiple Registers | Submit queue commands (write range) and collect status/results (read range) in one transaction — see "Raw Command Queue" |
+| Code | Name | Use |
+|---|---|---|
+| 0x03 | Read Holding Registers | USERROW config registers (max 16 regs per request) |
+| 0x04 | Read Input Registers | version / RX diagnostics / sysinfo / queue counters |
+| 0x06 | Write Single Holding Register | a config or action register (0x1F00+) |
+| 0x10 | Write Multiple Holding Registers | a contiguous holding block — config registers only |
+| 0x41 | **Queue** (user-defined) | **the command queue** — enqueue a DALI command and/or ack a result, in one transaction |
 
-Coils (FC01 / FC05 / FC0F) are not supported: per-ballast on/off / level changes go through the per-ballast brightness bank (0x0000-0x003F) which arms the asynchronous DALI work selector and ACKs immediately; broadcast / group / specialty DALI sends go through the **raw command queue** (command block 0x1000–0x100F via FC10/FC23).  Frames using the retired function codes get an ILLEGAL_FUNCTION exception reply.
+Everything else gets an `ILLEGAL FUNCTION` (0x01) reply. That includes coils
+(FC01 / FC05 / FC0F), which were never supported, and **FC23 (0x17), which was
+the queue path under v2 and is now gone entirely** — a controller still speaking
+FC23 is a version mismatch and is meant to fail loudly. FC 0x41 is user-defined
+per MODBUS V1.1b (codes 65–72 and 100–110 are reserved for user definition), so
+it is a conformant code rather than an extension: framing, CRC, silence and
+exception replies are all ordinary RTU, and only the payload shape is custom.
 
 ### Register map
 
-The map is deliberately small. **Nothing exposes gateway state**; those
-addresses return ILLEGAL DATA ADDRESS (0x02) — a client reading them
-addresses is a version mismatch and should fail loudly rather than get zeros.
+The map is deliberately small, and **the command queue is not in it**. Under v4
+commands and acks travel as FC 0x41 payload, not as register writes, so there is
+nothing here to poll. **Nothing exposes gateway state**; addresses outside this
+table return ILLEGAL DATA ADDRESS (0x02) — a client reading them is a version
+mismatch and should fail loudly rather than get plausible zeros.
+
+Every FC04 block is an **exact-length** read: the counts below are the only ones
+accepted, and any other count is ILLEGAL DATA ADDRESS rather than a short read.
+`src/registers.h` is authoritative.
 
 | Address | FC | Width | Content |
 |---|---|---|---|
-| `0x1000–0x100F` | 10, 17(w) | ≤16 regs | **Command block** (master-write). 8 slots × 2 regs; `0x1000 + 2*slot` = one 32-bit opaque command. A write covers 1–8 *contiguous* slots and is **all-or-nothing**: if any targeted slot is active the whole write is rejected `DEVICE_BUSY (0x06)`. The write count is in REGISTERS — `n_slots = wr_count / 2`. |
-| `0x1010–0x1017` | 03, 04, 17(r) | 8 regs | **Slot status block**, one register per slot, served identically in holding and input space (FC23's read range is holding-only, so it targets this). `[status:8 \| response8:8]`; status = `0 idle / 1 pending / 2 executing / 3 complete / 4 failed`; response8 = the backward-frame answer on complete (0 for a no-answer command) or the failure code on failed. Any 1–8 contiguous slots may be read. |
-| `0x0200–0x020F` | 04 | 16 regs | Version string `DALI v<maj>.<min> <serial>`. Read exactly 16. |
-| `0x0300–0x030F` | 04 | 16 regs | RX diagnostics: `reg0` rx_overflow, `reg1` frame_error, `reg2` crc_error, `reg3` frames_ok, `reg4` last_fail_len, `reg5–12` the last CRC-failed frame. Zeroed on reset. Read exactly 16. |
+| `0x0200–0x020F` | 04 | 16 regs | Version string `DALI v<maj>.<min> <20-hex-serial>`. Read exactly 16. |
+| `0x0300–0x030F` | 04 | 16 regs | RX diagnostics: `reg0` rx_overflow, `reg1` frame_error, `reg2` crc_error, `reg3` frames_ok, `reg4` last_fail_len, `reg5–12` the last CRC-failed frame, `reg13` internal fault count, `reg14` `[tm_err_t \| tm_fault_site_t]` of the first internal fault. Zeroed on reset. Read exactly 16. |
 | `0x0310–0x0313` | 04 | 4 regs | Sysinfo: `reg0–1` uptime_s (32-bit BE), `reg2` boot_count (since cold power-on), `reg3` reset_reason (`RSTCTRL.RSTFR`: bit0 PORF, 1 BORF, 2 EXTRF, 3 WDRF, 4 SWRF, 5 UPDIRF). No EEPROM — uptime is RAM, boot_count is magic-guarded `.noinit`, reset_reason is hardware-latched. Read exactly 4. |
+| `0x0320–0x0327` | 04 | 8 regs | **Queue counters** (new in v4). Read exactly 8 — see "Queue diagnostics" below. |
 | `0x1F02` | 03, 06 | 1 reg | Modbus slave address (1–247). USERROW-persisted, applied on reboot. |
 | `0x1F03` | 03, 06 | 1 reg | Baud index: 0 = 9600, 1 = 19200, 2 = 38400. USERROW-persisted, applied after the ACK. |
 | `0x1F05` | 06 | 1 reg | System reset. Write `0xA5A5` to force a software reset once the ACK has left the wire. Any other value → ILLEGAL DATA ADDRESS. |
 
-**Not implemented — all return ILLEGAL DATA ADDRESS:**
+**Retired — all return ILLEGAL DATA ADDRESS:**
 
 | Address | Was |
 |---|---|
@@ -451,68 +463,224 @@ addresses is a version mismatch and should fail loudly rather than get zeros.
 | `0x0100–0x0103` | present bitmask |
 | `0x0104–0x0107` | dirty bitmask |
 | `0x0110–0x014F` | group membership masks |
+| `0x1000–0x100F` | **v2 command block** (8 slots × 2 registers). Retired with queue v4: commands are FC 0x41 payload now. |
+| `0x1010–0x1017` | **v2 slot status block** (one register per slot). Retired with queue v4: results come back in the FC 0x41 reply. |
 | `0x1F00` | SCAN_TRIGGER |
 | `0x1F01` | RESCAN_INTERVAL |
 | `0x1F04` | COMMISSION trigger/status |
 
-Coils (FC01/FC05/FC0F) are not supported and return ILLEGAL FUNCTION.
+### The command queue (FC 0x41)
 
-#### Function codes
+**`QUEUE-PROTOCOL.md` is the normative specification** — what follows describes
+what the device offers, not the contract's fine print. `src/fc41.h` is the wire
+format in code.
 
-| Code | Name | Use |
+One function code carries all queue traffic. A request optionally **enqueues**
+one DALI command and optionally **acks** (deletes) the head of the gateway's
+**response queue**. The reply reports the fate of the enqueue — an **accept
+byte** carrying a gateway-assigned sequence number — and the current **head** of
+the response queue. In steady state that is one ~14-byte transaction per DALI
+frame: each request enqueues one command, acks the previous result and collects
+the next.
+
+#### Frame formats
+
+Every packed byte has the same shape — **control in the top 3 bits, sequence in
+the low 5**. Sequences run **1–31**; `0` is reserved and means "none" (no ack
+requested, no seq assigned, queue empty).
+
+```
+ bit   7    5   4          0
+     ┌───────┬───────────────┐
+     │ ctl:3 │     seq:5     │
+     └───────┴───────────────┘
+```
+
+**Request — 5, 7 or 8 bytes** (CRC included):
+
+```
+┌─────┬──────┬─────────────────┬──────┬──────┬──────┬────────┬────────┐
+│slave│ 0x41 │ [flags:3|ack:5] │ addr │ data │ dtr0 │ CRC lo │ CRC hi │
+└─────┴──────┴─────────────────┴──────┴──────┴──────┴────────┴────────┘
+                                └── enqueue payload, 7–8 B frames ──┘
+```
+
+Flags occupy bits 7–5 of the third byte: `QW_TWICE` 0x80, `QW_DTR0` 0x40,
+`QW_ANSWER` 0x20. (These are the **wire** positions and are deliberately not the
+internal `QF_*` bits the DALI adapter tests; the parser normalises between them.)
+`ack` is the low 5 bits: if non-zero, delete the head of the response queue iff
+the head's seq matches. A mismatch is a silent no-op — the head reported in the
+reply is all the master needs to re-converge — which is what makes an
+ack-carrying frame safe to resend verbatim after a timeout.
+
+| length | meaning | validity rule |
 |---|---|---|
-| 0x03 | Read Holding Registers | slot status block, USERROW config (max 16 regs) |
-| 0x04 | Read Input Registers | slot status block, version / diag / sysinfo |
-| 0x06 | Write Single Holding Register | USERROW config, system reset |
-| 0x10 | Write Multiple Holding Registers | the command block |
-| 0x17 | Read/Write Multiple Registers | **the normal path** — submit commands (write range) and collect status (read range) in one transaction |
+| **5 B** | ack and/or poll, no enqueue | flags must be `000` |
+| **7 B** | enqueue without DTR0 preload (+ optional ack) | `QW_DTR0` clear |
+| **8 B** | enqueue with DTR0 preload (+ optional ack) | `QW_DTR0` set |
 
-The DALI address byte inside a command record can be any valid DALI address byte — short address, group address, broadcast (0xFE), or special command (e.g. 0xA3 SET_DTR0, or the commissioning specials the controller uses to drive INITIALISE…TERMINATE). The gateway does not interpret it, and there is no cache to invalidate: what a command *means* is entirely the controller's business.
+Any other length, or a length/flag inconsistency, is **discarded without a
+reply** and counted in `q_discard`, exactly as a corrupt frame would be — to the
+master the two are indistinguishable and share one recovery path. The length
+rule is not tidiness: the DTR0 flag is what decides whether byte 5 is a payload
+byte or the first CRC byte, so a crafted length must not be able to walk
+through. The check is the pure function `fc41_len_ok()` in `src/fc41.h`, which
+the host test enumerates exhaustively. Broadcast (address 0) is silently
+ignored — an enqueue is inherently addressed, because the reply carries the
+binding.
 
-### Raw Command Queue
-
-The gateway holds an **8-slot, self-describing command queue**. Each slot has its own command register pair and its own status register, and the **slot is the command's identity** — there is no controller-assigned id, no result ring, and no id sequence to keep in step. A master writes a command into a free slot and polls that slot's status until it reaches a terminal state. The queue itself is **DALI-agnostic**: it carries an opaque 32-bit command and returns an 8-bit response; the meaning of those bytes is the DALI adapter's contract, below. This replaced the task-04 id-tagged FIFO (submit window + result ring + `accepted_id`/`completed_id`), whose id ledger the master had to track and re-baseline across reboots — the whole class of reboot/glitch recovery-corruption bugs that fought is gone because nothing is inferred from an id sequence.
-
-**Slot lifecycle** — each slot's `status` byte walks: `0 idle` → `1 pending` (a command is written and queued) → `2 executing` (on the DALI bus now) → `3 complete` / `4 failed` (terminal, holding a response). A terminal slot stays terminal until the master overwrites it with a new command (which returns it to `pending`).
-
-**Command block** (holding 0x1000–0x100F, master-write; FC10 or FC23 write range) — slot `k`'s command is 2 registers at `0x1000 + 2*k`, an opaque 32-bit value:
-
-```
-reg0 (0x1000 + 2*k):  [byte0 | byte1]
-reg1 (0x1001 + 2*k):  [byte2 | byte3]
-```
-
-A write covers **1–8 contiguous slots** (register count 2/4/…/16) and is **all-or-nothing**: if **any** targeted slot is currently ACTIVE (pending or executing), the gateway rejects the *entire* write with exception **0x06 (SLAVE_DEVICE_BUSY)** and changes nothing. `idle` and collected-terminal (complete/failed) slots are writable — writing a terminal slot reuses it. Because the FC23 write executes before its read, a rejected submit and a successful one are both distinguishable in the same round trip (the 0x06 exception, or the fresh slot statuses in the read-back). The gateway executes accepted commands in a wrap-aware **accept-sequence** order (the order slots were filled), independent of slot index.
-
-**Status block** (0x1010–0x1017, one register per slot, served identically under FC03 and FC04):
+**Reply — 6 or 7 bytes.** The accept byte is present **iff the request attempted
+an enqueue**; the shape follows the *request*, not the outcome, so an `A_FULL`
+reply is still 7 bytes. The master always knows which to expect because it sent
+the request.
 
 ```
-0x1010 + k:  [status:8 | response8:8]
+7 B:  slave, 0x41, [astatus:3|aseq:5], [hstatus:3|hseq:5], resp8, CRC lo, CRC hi
+6 B:  slave, 0x41,                     [hstatus:3|hseq:5], resp8, CRC lo, CRC hi
 ```
 
-`status` is the lifecycle value above; `response8` is meaningful only in a terminal state. The gateway writes `response8` **before** `status` under a fence a Modbus status read cannot straddle, so a read that sees a terminal `status` always sees the matching `response8` (never a stale one).
+- **Accept byte** — the fate of *this* enqueue. `A_ACCEPTED` (0) means enqueued
+  and `aseq` (1–31) is the command's identity; `A_FULL` (1) means the command
+  queue was full, nothing was enqueued and `aseq` is 0.
+- **Head entry** — the oldest unacked result, unchanged until acked. `hseq` = 0
+  means the response queue is empty. With `hstatus` = `H_OK` (0), `resp8` is the
+  backward-frame answer (or 0 for a command that expected none); with `hstatus`
+  = `H_FAILED` (1), `resp8` is a failure code: `0x01` NAK (no or too-short
+  backward frame where one was expected), `0x02` COLLISION (garbled backward
+  frame — two or more gear answered), `0x03` BUSFAULT (short pulse, stuck bus).
+  COLLISION is distinct from NAK so the controller's any-on probe can read a
+  collision as "≥1 on" and silence as "none on".
 
-**FC23 (0x17) pattern:** the write executes **before** the read, so one FC23 both submits new commands (write range = the command block, 0x1000) and reads back **all 8 slot statuses** (read range = the status block, 0x1010, holding-only) — the master reconciles its view of every slot against the live truth in the same round trip. A read-only FC23 (write count 0) is a pure status poll.
+**There are no Modbus exceptions on this path.** A full command queue is
+reported in band as `A_FULL` rather than as an exception, because an exception
+would throw away the head report in the same breath — and the head is exactly
+what tells the master a slot has freed. It also leaves nothing for a transport
+auto-retry to latch onto.
 
-**Gateway reboot:** a reset clears every slot to `idle`. A master that believed a slot was active therefore reads it back `idle` — the unambiguous **"idle means gone"** signal, with no boot-count or id-ledger comparison needed. (See the controller's `mbq_client.c` for the master-side reconciliation and the standalone protocol spec `controller/docs/modbus-command-queue.md`.)
+#### Processing order
 
-#### DALI adapter (the payload contract)
+Per accepted request, **strictly**: **ack → enqueue → build the reply**. That
+order is part of the protocol, not an implementation detail. Acking first frees
+a response-queue entry that the same transaction's enqueue can then use, which
+is what makes one transaction per DALI frame achievable; any other order costs a
+whole Modbus transaction per frame.
 
-The 32-bit opaque command is packed by the DALI adapter as four bytes:
+#### Two queues
+
+| | depth | holds |
+|---|---|---|
+| command queue | `CMDQ_DEPTH` = **2** | 1 executing + 1 pending. Accepted commands, executed strict FIFO in accept order. |
+| response queue | `RESPQ_DEPTH` = **4** | results, **retained until acked**. Steady-state occupancy is 2. |
+
+A command's whole life is `free → pending → executing`; when it finishes it is
+no longer a command but a response-queue entry, and its slot is free. Both
+depths are build-time constants and **nothing on the wire depends on them** —
+the master's in-flight cap is matched on its own side. (Raising `CMDQ_DEPTH` is
+not the one-line change it looks like; see the depth note in
+`QUEUE-PROTOCOL.md` §0.)
+
+**Backpressure.** The arbiter will not start a command unless the response queue
+has a free entry: a full response queue **stalls DALI execution rather than ever
+dropping a result**. The master always has a way out, because the ack is
+processed before the enqueue — one transaction frees an entry and refills the
+pipeline.
+
+**Sequence numbers are assigned exclusively by the gateway.** The master never
+proposes one; it learns each command's identity from the accept byte. A seq
+stays pinned in the gateway until its result is acked, and acks are head-only
+and in order, so a live seq cannot recur without a reboot.
+
+#### Reboots
+
+The gateway keeps **nothing** across a reboot — no queues, no sequence counter,
+no ledger — and that is the point: the counter simply restarts and the master
+learns the new numbers. There is nothing to reconcile.
+
+The master detects a reboot from **sequence behaviour**: an accept byte
+returning a seq it still tracks, or a head bearing a seq it never submitted, are
+each proof of a restart, backed by the **`boot_count`** register (FC04 `0x0310`)
+as the cold-path arbiter for the one genuinely ambiguous case. The v2 rule —
+"a slot the master believed active reads back idle, so the gateway rebooted" —
+is gone with the slots. `QUEUE-PROTOCOL.md` §4 has the full rule set and the
+order they must be evaluated in.
+
+#### The DALI adapter (the payload contract)
+
+The queue itself is **DALI-agnostic**: it carries an opaque 4-byte command and
+returns an 8-bit response. What those bytes mean is the DALI adapter's contract,
+and it is what the request's enqueue payload becomes:
 
 ```
-byte0  addr    DALI forward-frame address byte (any: short / group / broadcast / special)
-byte1  data    DALI forward-frame data byte
-byte2  flags   bit0 QF_TWICE  — send the forward frame twice, no answer (SET/INITIALISE/RANDOMISE)
-               bit1 QF_DTR0   — emit 0xA3<dtr0> back-to-back immediately before the frame (atomic DTR0+SET pair)
-               bit2 QF_ANSWER — open the backward-frame window; response8 = the 8-bit answer
-               bits 3–7 reserved 0
-byte3  dtr0    value preloaded into DTR0 when QF_DTR0 is set; ignored otherwise
+addr    DALI forward-frame address byte (any: short / group / broadcast / special)
+data    DALI forward-frame data byte
+flags   QW_TWICE   — send the forward frame twice, no answer (SET / INITIALISE / RANDOMISE)
+        QW_DTR0    — emit 0xA3<dtr0> back-to-back immediately before the frame
+        QW_ANSWER  — open the backward-frame window; resp8 = the 8-bit answer
+dtr0    value preloaded into DTR0 when QW_DTR0 is set; absent otherwise
 ```
 
-`response8` in a terminal slot: on **complete**, the DALI backward-frame answer (or 0 for a no-answer command); on **failed**, a failure code — `0x01` NAK (no/short backward frame where one was expected), `0x02` COLLISION (garbled backward frame — ≥1 gear answered), `0x03` BUSFAULT (transport-level fault). COLLISION is distinct from NAK so the controller's any-on probe can read a collision as "≥1 on" and silence (NAK) as "none on".
+The parser rewrites the wire flags into the internal `QF_*` bits the adapter
+tests (`queue_flags_to_qf` in `modbus.c`) — the two sets have deliberately
+different bit positions, and only the `QW_*` values above appear on the wire.
 
-A `QF_DTR0` command's two frames land back-to-back with nothing interleaved (the slot holds the bus for the pair). After a level-changing frame the gateway marks the target ballast dirty for a priority re-query (group frames fan out to members via the group masks). A queued command **preempts the gateway's idle-time polling** — it runs within ~1–2 DALI frame times of arrival.
+The address byte can be anything valid — short address, group, broadcast (0xFE),
+or a special such as 0xA3 SET_DTR0 or the commissioning specials. The gateway
+does not interpret it and has no cache to invalidate: what a command *means* is
+entirely the controller's business. A `QW_DTR0` command's two frames land
+back-to-back with nothing interleaved; other DALI work waits behind the pair
+(~2 frame times).
+
+#### Queue diagnostics (FC04 `0x0320`, read exactly 8)
+
+Nothing rides the FC 0x41 reply beyond the protocol's own bytes — hot-path bytes
+are the scarce resource — so the queue's observability lives here, in cold-path
+registers meant to be read on demand from the CLI or the bench, never polled
+hot. All eight are 16-bit **wrapping** counters, big-endian:
+
+| reg | name | counts |
+|---|---|---|
+| `0x0320` | `accepts` | commands enqueued (`A_ACCEPTED` replies) |
+| `0x0321` | `a_full` | enqueues refused, command queue full (`A_FULL` replies) |
+| `0x0322` | `executes` | commands handed to the DALI adapter |
+| `0x0323` | `results` | results pushed onto the response queue |
+| `0x0324` | `acks` | response entries popped by a matching ack |
+| `0x0325` | `stalls` | backpressure episodes — arbiter refusals caused by a full response queue |
+| `0x0326` | `q_discard` | FC 0x41 frames dropped with no reply (bad length or length/flag inconsistency) |
+| `0x0327` | spare | reads 0 |
+
+Steady-state sanity is `accepts == executes == results == acks`, each lagging
+the one before it by at most the queue depths. Three of them want reading
+carefully, and two of them point in **opposite** directions:
+
+- **`a_full` non-zero is an anomaly worth investigating, not routine
+  back-pressure.** It means the master's pacing estimate ran early — it offered
+  a command while the gateway was still full. The queue handled it correctly
+  (that is what the in-band `A_FULL` is for) but a correctly paced master should
+  not be producing them.
+- **`stalls` non-zero is just backpressure working.** It counts *episodes* (the
+  rising edge, not every arbiter poll) and simply says the master stopped
+  acking for long enough to fill the response queue. Not alarming by itself;
+  it is also the counter the backpressure test reads to prove the rule engaged.
+- **`q_discard` non-zero means malformed FC 0x41 frames arrived** — a bad length
+  or a length/flag inconsistency. It lives here rather than in the RX
+  diagnostic block because it is a protocol fact, not a line fact. A discard is
+  invisible from the master's side by design, so this counter is the only place
+  it shows up.
+
+#### Why v4 exists
+
+Measured on the bench against the FC23 design v4 replaces, at saturation:
+
+| | FC23 | v4 |
+|---|---|---|
+| RS-485 bus occupancy | **99 %** | **37 %** |
+| Modbus transactions per DALI command | 1.73 | 1.03 |
+| throughput (DTR0 write/read pairs per second) | 14.71 | ~13.9–14.1 |
+
+Throughput is essentially unchanged — it was always bounded by DALI, not by
+Modbus — but it now costs about a third of the bus instead of all of it. That
+headroom is the whole point: it is what makes a second DALI gateway on the same
+RS-485 segment workable.
 
 ### Commissioning
 
@@ -538,9 +706,10 @@ See `controller/src/dali_commission.c`.
 
 ### Write propagation and fade tracking
 
-The gateway reports one thing per command: that slot's terminal status and
-response byte. It does not track fades, does not re-poll, and has no dirty bit
-to raise — those were properties of the cache it no longer has.
+The gateway reports one thing per command: the result that lands on the response
+queue under that command's sequence number. It does not track fades, does not
+re-poll, and has no dirty bit to raise — those were properties of the cache it
+no longer has.
 
 **Fade tracking is the controller's job.** A DAPC lands immediately but the
 level ramps, so the controller re-reads `QUERY STATUS` while bit 4 (FADE
@@ -591,11 +760,11 @@ make         # build, erase device, and flash
 
 `pymcuprog` is required for flashing. Programming is via UPDI on the test point using a USB-UART adapter.
 
-A standard `make` (build + erase + flash) does NOT touch USERROW — the slave address, baud rate, and rescan interval persist across reflashes. To write the persisted-config bytes:
+A standard `make` (build + erase + flash) does NOT touch USERROW — the slave address and baud rate persist across reflashes. To write the persisted-config bytes:
 
 ```sh
-make configure                                              # defaults: address 1, 9600 baud, 64 s rescan
-make configure SLAVE_ADDR=5 BAUD_INDEX=1                    # address 5, 19200 baud, default rescan
+make configure                                              # defaults: address 1, 19200 baud
+make configure SLAVE_ADDR=5 BAUD_INDEX=1                    # address 5, 19200 baud
 make configure SLAVE_ADDR=42 BAUD_INDEX=2
 ```
 
@@ -608,7 +777,7 @@ These are residual issues that the current firmware does not address. None are r
 ### Modbus
 
 - **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2–3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
-- **FC10 partial execution on register-map holes.**  The holding-register map has gaps at 0x0100–0x010F (FC04-only range), 0x1002–0x100A (action regs retired in subtask 4/5), 0x100B–0x100D (DTR setters retired in subtask 9), and 0x100E–0x100F.  A multi-register write spanning a gap aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: do not write across the holes.
+- **FC10 partial execution on register-map holes.**  The holding-register map is now just 0x1F02, 0x1F03 and 0x1F05, so everything between and around them is a hole — including 0x1F04, which sits between two live registers.  A multi-register write spanning a hole aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: write the config registers one at a time with FC06, which is what the controller does.
 - **FC04 0x0200 returns an ASCII version string, not a register address space.**  Reading exactly 16 input registers from address 0x0200 yields the 32-byte string `"DALI v<maj>.<min> <serial>"`.  Other lengths at this address fall through to the standard register-range check and return `ILLEGAL_ADDRESS`.
 - **`frame_is_valid` recognises the unsupported coil function codes (FC01 / FC05 / FC0F) for size-check purposes, and the broadcast filter still admits FC05 / FC0F.**  This is intentional: well-formed coil frames pass frame validation, reach the FC dispatcher, and receive a graceful `ILLEGAL_FUNCTION` exception reply (or — for a broadcast-addressed FC05 / FC0F — are silently absorbed) rather than being dropped at the size check.  Candidate for future tightening: removing the FC01 / FC05 / FC0F cases from `frame_is_valid` and from the broadcast filter would drop those frames at validation time instead.  Nothing breaks if it stays as-is; the current shape gives masters that probe for coil support a clearer "function not supported" answer.
 
@@ -616,10 +785,10 @@ These are residual issues that the current firmware does not address. None are r
 
 - **No multi-master collision detection during our own TX.**  If another master begins driving the bus while we are already transmitting, the resulting collision is not detected; the receiving ballast simply sees a malformed frame and ignores it.
 - **Receiver dead-band.**  Half-bit and full-bit pulse classification has a ±83 µs tolerance window (`DALI_HALF_BIT_USECS / 5`); pulses falling between the half-bit and full-bit ranges (~500–750 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
-- **A queued DTR0-first command holds the bus for its pair.**  A command-queue record with the `send-DTR0-first` flag issues two frames (`0xA3<dtr0>` then the frame, e.g. a config DTR0+SET pair) as one atomic unit, so DTR0 can't be clobbered between them.  Other DALI work waits behind the pair (~2 frame times).  Single-frame commands (DAPC level, group-bit changes, most raw commands) are unaffected — ≤ ~50 ms each.  (The old 6-send `SYNC_WRITE_MINMAX/POWER/FADE` sequences were retired with the config banks.)
+- **A queued DTR0-first command holds the bus for its pair.**  A command with the `QW_DTR0` flag issues two frames (`0xA3<dtr0>` then the frame, e.g. a config DTR0+SET pair) as one atomic unit, so DTR0 can't be clobbered between them.  Other DALI work waits behind the pair (~2 frame times).  Single-frame commands (DAPC level, group-bit changes, most raw commands) are unaffected — ≤ ~50 ms each.  (The old 6-send `SYNC_WRITE_MINMAX/POWER/FADE` sequences were retired with the config banks.)
 
 ### Hardware / runtime
 
-- **Stack budget — comfortable again after the config-bank retirement.**  Static allocation is **532 B** of the 1024 B SRAM (`.data + .bss + .noinit`, per `avr-size`), leaving **~492 B** for the stack.  The queue-v2 8-slot command + status arrays (`mbq_slots`) add ~58 B, but retiring the config banks (block1/2/3 + the 14 B `_reserved` anchor hole) freed ~398 B, a net ~340 B reduction from the pre-task-04 872 B.  Worst-case nested-ISR depth (TCA0 LVL0 chain + TCB0 LVL1 chain + main thread mid-`modbus_process`) is ~104 B, so headroom is now ~388 B (was ~10–30 B).  The largest contributor at main level is the `snprintf` in the FC04 version-string path (`modbus_process` reports 49 B `dynamic,bounded` in its `.su` file).  These `.su` figures are per-frame, not cumulative — for a hard peak-stack number run a call-graph stack analyzer.  If a new ISR vector is added, check the `.su` files (`-fstack-usage`) first.
+- **Stack budget — not a constraint on this firmware.**  Static allocation is **153 B** of the 1024 B SRAM (`.data + .bss + .noinit`, per `avr-size`), leaving **871 B** for the stack; flash is **10 472 / 16 384 B**.  The gateway caches nothing about the bus, which is what keeps it small: the whole queue core (command queue 12 B, response queue 8 B, counters 12 B, cursors 5 B) is 37 B, and the 40 B Modbus `buf` is the single largest item.  The deepest measured frame is `modbus_process` at 48 B (`-fstack-usage`, `dynamic,bounded` — the `snprintf` in the FC04 version-string path), and the worst nested-ISR chain (TCA0 LVL0 + TCB0 LVL1 on top of it) adds ~35 B, so real worst-case use is ~110 B against 871 B available.  These `.su` figures are per-frame, not cumulative — for a hard peak-stack number run a call-graph stack analyzer.  If a new ISR vector is added, check the `.su` files first.  `CLAUDE.md` → "RAM budget" carries the same breakdown and the two must move together.
 - **RS-485 DE pin floats briefly at reset.**  `main` drives PA4 low immediately, but there is a ~50–200 µs window after reset (before that store executes) where the pin is high-Z.  Subtask 1 enabled the BOD fuse at 2.6 V, narrowing the window by holding the chip in reset until Vcc is stable; an external pull-down on PA4 on the next PCB revision is the residual recommended fix.
 - **`USERROW` write halts the CPU.**  A `MBREG_SLAVE_ADDR` / `BAUD_INDEX` write performs a NVMCTRL page-erase-write that suspends CPU execution for ~3.4 ms.  Triggered by Modbus writes the firmware schedules so the halt lands in the master's silence window before our response, but a DALI frame in flight at that exact moment will be corrupted.  Avoid changing config during heavy DALI traffic.

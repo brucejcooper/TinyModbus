@@ -117,6 +117,22 @@ tm_err_t mbq_submit(uint8_t first_slot, const uint8_t *regs, uint8_t n_slots);
 // response must not carry stale bytes onto the wire.
 tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out);
 
+// Enqueue ONE command into whichever slot is free, chosen by the gateway rather
+// than named by the master. Returns the slot it landed in, or MBQ_NONE if every
+// slot is active (PENDING/EXECUTING) — which is a "try again", not an error.
+//
+// This exists because FC23 forces the master to name a specific register, so it
+// may only submit into a slot it ALREADY knows is free — and it learns that only
+// from a previous read. That costs a wasted read-only poll per DALI frame:
+// measured at 2.04 Modbus transactions per frame where 1.0 should do. Letting the
+// gateway pick removes the dependency, so every transaction can carry a command.
+//
+// Prefers IDLE over terminal (COMPLETE/FAILED) slots so an uncollected result is
+// only overwritten when there is no alternative. The caller must snapshot the
+// status block BEFORE calling this, or a completion reused this instant would
+// never be reported.
+uint8_t mbq_enqueue_any(const uint8_t *cmd);
+
 // Arbiter hook: the lowest accept-sequence PENDING slot (0..MBQ_SLOTS-1), or
 // MBQ_NONE if none is pending. Wrap-aware over the small live window.
 uint8_t mbq_next_pending(void);

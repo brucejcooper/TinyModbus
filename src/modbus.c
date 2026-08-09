@@ -99,6 +99,30 @@ static volatile bool initial_silence_observed = false;
 #define FC_WRITE_MULTI_REG   0x10
 #define FC_READ_WRITE_MULTI  0x17   // FC23: write submit window, then read status/holding
 
+// User-defined function codes. MODBUS Application Protocol V1.1b reserves
+// 65-72 and 100-110 for exactly this, so these are conformant, not an
+// extension of the standard set. Framing, CRC, silence and exception replies
+// are all ordinary RTU — the only thing custom is the payload shape.
+//
+// They exist because FC23 makes the master NAME the slot it writes to, so it can
+// only submit into one it already knows is free, which it learns from a previous
+// read. That forces a wasted read-only poll per DALI frame (measured: 2.04
+// transactions per frame). FC_MBQ_ENQUEUE lets the GATEWAY choose the slot, so
+// every transaction can carry a command and a status read-back together.
+//
+// Second-order win: 8 request bytes against FC23's 17, because FC23 must restate
+// a read address, read count, write address, write count and byte count that are
+// the same on every single transaction.
+#define FC_MBQ_ENQUEUE       0x41   // enqueue 1 command in any free slot + read status
+#define FC_MBQ_STATUS        0x42   // read status only (nothing to enqueue)
+
+// addr(1) fc(1) cmd(4) crc(2)
+#define FC41_REQ_LEN         8u
+// addr(1) fc(1) crc(2)
+#define FC42_REQ_LEN         4u
+// addr(1) fc(1) accepted_slot(1) status(2*MBQ_SLOTS) — start_tx appends the CRC
+#define FCQ_RSP_PAYLOAD      (3u + 2u * MBQ_SLOTS)
+
 typedef enum {
     MB_ERR_ILLEGAL_FUNCTION    = 0x01,
     MB_ERR_ILLEGAL_ADDRESS     = 0x02,
@@ -540,6 +564,39 @@ static void process_fc10(void) {
 // both submits new commands and collects the status/results of earlier ones
 // (the submit-N / collect-N-1 pipeline).  The response carries the post-write
 // read block, exactly like an FC03 read.
+// FC65 / FC66 — the queue's own function codes. See FC_MBQ_ENQUEUE above.
+//
+// ORDER IS LOAD-BEARING: the status block is snapshotted BEFORE the enqueue.
+// mbq_enqueue_any may reuse a COMPLETE/FAILED slot when no IDLE one is left, and
+// a result overwritten before it was serialised would never reach the master —
+// the command would look lost. Snapshot first and the master always sees the
+// completion in the same transaction that replaces it.
+static void build_queue_reply(uint8_t accepted_slot, const uint8_t *snap) {
+    buf[2] = accepted_slot;
+    for (uint8_t i = 0; i < 2u * MBQ_SLOTS; i++) buf[3 + i] = snap[i];
+    start_tx(FCQ_RSP_PAYLOAD);
+}
+
+static void process_fc_enqueue(void) {
+    uint8_t snap[2u * MBQ_SLOTS];
+    (void)mbq_read_status(0u, MBQ_SLOTS, snap);   // snapshot BEFORE the enqueue
+    // Copy the command out of buf before build_queue_reply overwrites buf[2..].
+    uint8_t cmd[MBQ_CMD_BYTES];
+    for (uint8_t i = 0; i < MBQ_CMD_BYTES; i++) cmd[i] = buf[2 + i];
+    uint8_t slot = mbq_enqueue_any(cmd);
+    // A full queue is NOT an exception: it is the normal back-pressure signal and
+    // the master retries the same command next transaction. Returning
+    // SLAVE_DEVICE_BUSY instead would throw away the status block in the same
+    // breath, which is the very thing the master needs to learn a slot freed.
+    build_queue_reply(slot, snap);
+}
+
+static void process_fc_status(void) {
+    uint8_t snap[2u * MBQ_SLOTS];
+    (void)mbq_read_status(0u, MBQ_SLOTS, snap);
+    build_queue_reply(MBQ_NONE, snap);
+}
+
 static void process_fc23(void) {
     uint16_t rd_addr  = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t rd_count = ((uint16_t)buf[4] << 8) | buf[5];
@@ -613,6 +670,8 @@ static bool frame_is_valid(void) {
             expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
             break;
         }
+        case FC_MBQ_ENQUEUE: expected_size = FC41_REQ_LEN; break;
+        case FC_MBQ_STATUS:  expected_size = FC42_REQ_LEN; break;
         case FC_READ_WRITE_MULTI: {
             // addr,fc,rd_start(2),rd_cnt(2),wr_start(2),wr_cnt(2),wr_bytecount,
             // wr_data[wr_bytecount],crc(2) = 13 + wr_bytecount.  buf[10] is the
@@ -766,6 +825,8 @@ void modbus_process(void) {
         case FC_WRITE_SINGLE_REG:  process_fc06(); break;
         case FC_WRITE_MULTI_REG:   process_fc10(); break;
         case FC_READ_WRITE_MULTI:  process_fc23(); break;
+        case FC_MBQ_ENQUEUE:       process_fc_enqueue(); break;
+        case FC_MBQ_STATUS:        process_fc_status(); break;
         default:                   send_error(MB_ERR_ILLEGAL_FUNCTION); break;
     }
 

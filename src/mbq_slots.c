@@ -117,6 +117,19 @@ tm_err_t mbq_read_status(uint8_t sidx, uint8_t count, uint8_t *out) {
     return err;
 }
 
+uint8_t mbq_enqueue_any(const uint8_t *cmd) {
+    uint8_t pick = MBQ_NONE;
+    // Two passes: IDLE first, terminal second. A COMPLETE/FAILED slot still holds
+    // a result the master may not have collected, so it is the fallback.
+    for (uint8_t i = 0; i < MBQ_SLOTS; i++)
+        if (s_slot[i].st.status == MBQ_S_IDLE) { pick = i; break; }
+    if (pick == MBQ_NONE)
+        for (uint8_t i = 0; i < MBQ_SLOTS; i++)
+            if (!slot_active(s_slot[i].st.status)) { pick = i; break; }
+    if (pick == MBQ_NONE) return MBQ_NONE;
+    return (mbq_submit(pick, cmd, 1u) == TM_OK) ? pick : MBQ_NONE;
+}
+
 uint8_t mbq_next_pending(void) {
     // Lowest accept-sequence PENDING slot; wrap-aware (modular) compare over the
     // ≤8 live window. Only main mutates PENDING slots, so no fence needed (single-

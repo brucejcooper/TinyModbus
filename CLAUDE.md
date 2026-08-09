@@ -9,8 +9,8 @@ The Makefile already sets `PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)` so `
 ## RAM budget
 
 ATtiny1604 has 1 KB SRAM. Static data (BSS + data + COMMON) must stay well under
-that to leave room for the stack (~150 bytes minimum). Currently **152 B**
-(task 08), leaving 872 B — the gateway caches nothing about the bus, which is
+that to leave room for the stack (~150 bytes minimum). Currently **153 B**
+(task 08), leaving 871 B — the gateway caches nothing about the bus, which is
 what keeps it small. Key consumers:
 
 - `buf` (modbus.c): 40 bytes (`MAX_PKT_SZ = 16*2+8`), which limits a single
@@ -22,7 +22,7 @@ what keeps it small. Key consumers:
 
 Deepest measured stack frame is `modbus_process` at 48 B (`-fstack-usage`), and
 the worst nested-ISR chain adds ~35 B, so real worst-case use is ~110 B against
-the 872 B available.
+the 871 B available.
 
 Packed enums (`__attribute__((packed))`) on `dali_kind_t`, `dali_step_t`,
 `tm_err_t` and `tm_fault_site_t` force 1-byte storage instead of the AVR's

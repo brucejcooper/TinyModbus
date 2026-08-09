@@ -3,7 +3,6 @@
 #include <util/atomic.h>
 #include "registers.h"
 #include "dali_sync.h"
-#include "mbq_slots.h"
 
 // ---- USERROW layout -------------------------------------------------------
 // byte 0:    slave address (encoded as addr - 2; 0xFF -> address 1)
@@ -92,28 +91,16 @@ void regs_init(void) {
 // ---- FC03 holding read -------------------------------------------------
 
 tm_err_t regs_read_holding(uint16_t addr, uint16_t *val) {
-    // Holding space serves exactly three things: the slot status block, the
-    // slave address and the baud index. Anything else falls through to ILLEGAL
-    // DATA ADDRESS — the gateway caches nothing about the bus, so there is no
-    // ballast, presence or group state to read here, and a client asking for it
-    // should fail loudly rather than receive plausible zeros.
+    // Holding space serves exactly two things now: the slave address and the
+    // baud index. Anything else falls through to ILLEGAL DATA ADDRESS — the
+    // gateway caches nothing about the bus, so there is no ballast, presence or
+    // group state to read here, and a client asking for it should fail loudly
+    // rather than receive plausible zeros.
     //
-    // Slot status block at 0x1010-0x1017 (served identically under FC03 and FC04;
-    // FC23's read range is holding-only, so it targets this).  Served one register
-    // (one slot's [status|response8]) at a time from the generic queue module; each
-    // slot register is independently fenced and self-describing, so a tear across
-    // slots is benign (slots reconcile independently).  0x1018-0x1019 fall through
+    // The v2 slot status block (0x1010-0x1011) went with the slot model: under
+    // v4 the master learns results from the FC 0x41 reply's head field, so there
+    // is no queue state to expose as registers at all, and the range is retired
     // to ILLEGAL DATA ADDRESS.
-    if (addr >= MBREG_SLOT_STATUS_BASE && addr <= MBREG_SLOT_STATUS_END) {
-        uint8_t out[2];
-        // The address is bounds-checked above, so this cannot overrun; hand the
-        // status back anyway rather than assuming.
-        tm_err_t e = mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE), 1u, out);
-        if (e != TM_OK) return e;
-        *val = ((uint16_t)out[0] << 8) | out[1];
-        return TM_OK;
-    }
-
     switch (addr) {
         // Action registers read as 0 (write-only by convention).
         case MBREG_SLAVE_ADDR:      *val = userrow_get_slave_addr();      return TM_OK;

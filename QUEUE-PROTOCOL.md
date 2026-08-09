@@ -45,7 +45,7 @@ Both queues are small and bounded:
 
 | | depth | RAM | notes |
 |---|---|---|---|
-| command queue | `CMDQ_DEPTH` = **2** | 2 × 6 B | 1 executing + 1 pending; build-time constant, may become 3 — nothing on the wire changes |
+| command queue | `CMDQ_DEPTH` = **2** | 2 × 6 B | 1 executing + 1 pending; build-time constant. Raising it is **not** the one-liner §10 claims — see the depth note below |
 | response queue | `RESPQ_DEPTH` = **4** | 4 × 2 B | results held until acked; steady-state occupancy is 2 |
 
 **Backpressure rule (load-bearing):** the arbiter may not start a command
@@ -53,6 +53,24 @@ unless the response queue has a free entry. A full response queue stalls DALI
 execution rather than ever dropping a result. Because the ack in a request is
 processed *before* the enqueue, a single transaction can free an entry and
 refill the pipeline.
+
+> **Measured note on the two depths.** A well-behaved client cannot fill the
+> response queue: its in-flight cap bounds unacked results at `CMDQ_DEPTH + 1`
+> = 3, against `RESPQ_DEPTH` 4. That is why the hardware backpressure drill
+> comes back with the gateway's `stalls` counter at zero — the rule is real and
+> correct, but it is a safety net for a misbehaving master, not a working part
+> of the steady state. It is covered by `cq_test`'s `test_backpressure`.
+>
+> **Consequently `CMDQ_DEPTH` = 3 is not a one-line change.** It raises the
+> bound to 4 and consumes the entire margin, so `RESPQ_DEPTH` must go to 6 in
+> the same commit. Note also that **nothing on the wire carries the depth** —
+> §1 is deliberately depth-agnostic — so a depth bump applied to one side only
+> ships silently and presents as the `a_full` canary firing. Recommended before
+> anyone touches it: publish `CMDQ_DEPTH` in the queue-counter block's spare
+> register (`0x0327`, currently documented as "reads 0") and have the
+> controller latch incompatible on a mismatch at discovery, exactly as §8 does
+> for the version. Two bytes of gateway flash, no wire change, and zero
+> degrades cleanly as "older gateway, depth unknown".
 
 ---
 
@@ -249,6 +267,18 @@ and resolves every anomaly with these rules, applied to any reply:
 | **R3** | the head holds a seq the master is not tracking, or the head is empty while the master holds a consumed-but-unacked result **and has no ack unresolved** | **gateway rebooted** — an unacked result cannot disappear, and an unknown seq has no other source; dispose as below |
 | **R4** | result deadline expires; a poll still shows no result for that seq | command lost to a reboot or a gateway wedge; read sysinfo `boot_count` (FC04, cold path) to classify and count it; dispose |
 
+> **A deadline expiry has a THIRD cause, and R4 must not mistake it for a
+> wedge: the backpressure rule doing its job.** If the master has stopped
+> acking, the gateway deliberately stalls its arbiter (§0) — nothing is
+> executing, every outstanding deadline expires, and R4 would resend a command
+> the gateway is still holding. That is a **double execution of a real DALI
+> frame, reported to nobody**, and it was reproduced. The master cannot see the
+> stall in the reply (the gateway's `stalls` counter is cold-path), but it does
+> not need to: it knows whether the head it is looking at is one it has
+> consumed and failed to ack. **While the head is known-blocked, push the
+> deadlines out.** The 150 ms figure above assumes a gateway that is executing;
+> a stalled one is not late, it is waiting for you.
+
 ### The lost-reply procedure, in evaluation order
 
 R1/R1′ and R3 can look at the *same* observation and disagree, so the order is
@@ -274,15 +304,37 @@ a silent mis-binding is precisely the result-misattribution class that took
 task 04 three fix cycles.
 
 > **Why R1 may assume the enqueue was *accepted* rather than `A_FULL`.** The
-> two are indistinguishable once the reply is lost — but `A_FULL` is
-> **unreachable** while the client honours its in-flight cap (§5). The client
-> decrements in-flight only on *seeing* a result, while the gateway frees a
-> command slot the moment the command completes; so the client's count is
-> always an over-estimate of gateway occupancy, and "the client believes there
-> is room" implies there *is* room. **`A_FULL` is therefore a canary, not
-> back-pressure: if one is ever observed, the client's accounting is wrong.**
-> Count it, log it loudly, and treat it as an anomaly — do not just pace and
-> resend as though it were routine.
+> two are indistinguishable once the reply is lost. `A_FULL` is rare — but an
+> earlier draft of this box claimed it was **unreachable**, and R1's safety was
+> rested on that. **The claim was false, and this correction is the important
+> part**: a safety argument that is wrong while the thing it justifies happens
+> to survive for unrelated reasons is exactly how a later refactor quietly
+> removes the real protection.
+>
+> What is actually true:
+>
+> - On the **queue-full path**, `A_FULL` is unreachable *if* the client's
+>   in-flight cap is a strict accepts-minus-results count. It isn't: §5's cap is
+>   measured against *estimated* gateway occupancy, because a strict count makes
+>   the combined collect-and-enqueue transaction impossible (the oldest result
+>   is uncollected at the instant the request is built, so the cap is always
+>   reached and you are back to two transactions per frame). **An early estimate
+>   therefore reaches `A_FULL` legitimately.**
+> - There is a **second path entirely**: the gateway's `cq_accept()` reports
+>   `A_FULL` if its ring cursor and slot state disagree — an invariant break the
+>   client's cap cannot see or prevent. The gateway now raises `tm_fault()` for
+>   that case and keeps it out of the `a_full` counter, so the counter means one
+>   thing again.
+>
+> **R1's real protection is not this argument.** It is R2 (a phantom seq is
+> still tracked, so the accept byte trips the reboot rule) plus the prediction
+> check (§4's "the predicted seq is verified"). Both were confirmed on the
+> bench to catch a command bound to a seq the gateway never assigned.
+>
+> `A_FULL` remains an **anomaly worth shouting about** — count it, log it — but
+> read it as "the estimate ran early", not "the bookkeeping is broken". Zero
+> were observed across the throughput and backpressure runs; two appeared
+> across a reboot drill.
 
 **Disposition on reboot/loss** (unchanged policy from v2/v3, drilled in task
 07): commands the *client* marked idempotent (queries, absolute SETs) are

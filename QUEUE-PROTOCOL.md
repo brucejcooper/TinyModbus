@@ -356,11 +356,37 @@ Transport (`mbq_client`) and scheduler (`dali_queue`) split as today.
 - **Round-robin across slaves with work pending** (fairness is the
   scheduler's, not the protocol's). With per-slave single-outstanding this
   bounds any slave's wait to one transaction time per competing slave.
-- **Pace, don't spin.** On `A_FULL`, or when awaiting results with an empty
-  backlog, the next transaction for that slave is scheduled at the estimated
-  completion of its oldest in-flight command (~25 ms SET / ~40 ms query /
-  ~50 ms DTR0-pair), not immediately. Spinning wastes shared bus (measured
-  ~2.4 polls/frame in the FC23 soak) even when it starves nobody.
+- **Pace, don't spin — and the case that matters is the in-flight cap.**
+  Whenever the client has **no enqueue it is allowed to send**, the next
+  transaction for that slave is scheduled at the estimated completion of its
+  oldest in-flight command (~25 ms SET / ~40 ms query / ~50 ms DTR0-pair), not
+  immediately. "Not allowed to send" covers **all three** reasons, and the
+  first is the one that dominates:
+
+  1. **the in-flight cap is reached and the backlog is NOT empty** — the
+     ordinary saturated steady state, and the case an earlier draft of this
+     section omitted;
+  2. the backlog *is* empty but results are outstanding;
+  3. `A_FULL` (which should never happen — see §4).
+
+  > **This is not a micro-optimisation; it is the design.** At depth 2 the
+  > client is at its cap essentially always, and a DALI frame (~35 ms) is about
+  > three transactions long (~12 ms). A client that polls the moment it cannot
+  > enqueue therefore burns two wasted transactions per frame — **measured
+  > 2.04 transactions per command on the first v4 bench run, worse than FC23's
+  > 1.73**, with the throughput and the verdict both perfectly fine. The whole
+  > point of v4 is that ONE transaction collects the oldest result and submits
+  > the next command; that only happens if the client *waits* for the result to
+  > exist instead of asking whether it exists yet.
+  >
+  > In steady state a correct client issues **no polls at all**. A poll is for
+  > recovery (§4) and for a result that is genuinely overdue — not for finding
+  > out whether the gateway is done.
+
+  Getting the estimate slightly **late** is much cheaper than early: late costs
+  a little latency, early costs a whole wasted transaction and lands you back
+  at 2 txns/frame. On a poll that finds nothing, back off further rather than
+  re-polling at the same cadence.
 - **In-flight cap = `CMDQ_DEPTH`.** The client tracks accepts minus results
   and stops submitting at the cap — `A_FULL` is the backstop, not the flow
   control (task-07 lesson).

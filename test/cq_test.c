@@ -6,9 +6,22 @@
  * frames are discarded, counted, no reply, no state change"). The bench has no
  * independent RS-485 master to inject bad frames with, so the length/flag table
  * is enumerated here instead — the whole input space rather than a sample of it.
- * The one part of V5 that CANNOT live here is the discard counter, which is in
- * modbus.c and does not compile on the host; that increment stays a code-review
- * item.
+ *
+ * WHAT THIS SUITE DOES NOT COVER, so nobody over-reads a green run:
+ *
+ *   - The discard COUNTER. diag_q_discard lives in modbus.c, which needs AVR
+ *     headers. Its increment is a code-review item.
+ *   - HANDLER-LEVEL ORDERING. feed() below is a hand-written mirror of
+ *     process_fc_queue's control flow, not the handler itself. It uses the real
+ *     predicate and the real queue calls, which is the part worth testing, but
+ *     it cannot catch the two drifting: if process_fc_queue ever swapped ack and
+ *     enqueue, these tests would still pass. That ordering is code-review only.
+ *   - REPLY SHAPE AND LENGTH. The 6/7-byte reply shapes and the accept-byte
+ *     packing are built in modbus.c and have no automated coverage anywhere, and
+ *     cannot get any while it needs AVR headers. That makes them the most likely
+ *     way this fails on hardware, so the FIRST bench transaction should be
+ *     captured and its bytes counted — one 5 B poll, one 7 B enqueue — rather
+ *     than inferred from a clean soak.
  *
  * Not part of the firmware build: cq.c is pure C whose only dependency is
  * errors.h (a type and three prototypes it never calls), so it compiles and
@@ -20,9 +33,11 @@
  * below is a sequential stand-in for that ISR, which is legitimate because the
  * AVR is single-core: every real interleaving is one of these orderings.
  *
- * Build & run (from this directory):
- *   cc -Wall -Wextra -I ../src -o /tmp/cq_test cq_test.c ../src/cq.c \
- *       && /tmp/cq_test
+ * Build & run: `make test` from the repo root. That target IS this suite's
+ * canonical invocation — it is gate V5's only evidence, so it must be
+ * reproducible rather than a command line pasted from a comment. (Directly, from
+ * this directory: cc -Wall -Wextra -I ../src -o /tmp/cq_test cq_test.c
+ * ../src/cq.c && /tmp/cq_test.)
  *
  * Exits non-zero on any failure. Clang emits one expected warning building
  * cq.c — "unknown pragma ignored" for its #pragma GCC optimize("Os"), which is

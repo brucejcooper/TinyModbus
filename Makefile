@@ -38,6 +38,12 @@ OBJECTS    	= $(subst src/,build/,$(subst .c,.o,$(CSOURCES))) # $(subst src/,bui
 # OBJECTS = build/main.o build/timers.o
 export PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)
 
+# None of these name a real file, and two of them — `build` and `test` — share a
+# name with a DIRECTORY, so without this make treats those directories as the
+# targets and does nothing while exiting 0.  `build` only escaped that today by
+# accident, because its `prepare` prerequisite always reruns.
+.PHONY: all download_gcc prepare build test erase flash get_config configure reset clean
+
 all: clean build erase flash
 
 download_gcc:
@@ -53,7 +59,27 @@ build/%.o: src/%.S
 
 prepare:
 	mkdir -p build
-	
+
+# Host unit tests.  NOT part of `build` or `all`: these are host binaries, built
+# with the SYSTEM compiler, not the AVR toolchain.  `cc` is safe despite the PATH
+# override above — avr/bin ships only avr-* prefixed binaries, nothing that
+# shadows it.
+#
+# This target is gate V5's evidence, not a convenience.  Task 08 deliberately
+# moved malformed-frame validation off the bench and into cq_test.c, because the
+# rig has no independent RS-485 master to inject bad frames with, so "the host
+# test passes" is the only proof that gate has.  It therefore has to be
+# reproducible and it has to fail loudly: cc failure or a non-zero exit from the
+# binary both fail the make.
+#
+# Note .PHONY below — without it this target is shadowed by the test/ DIRECTORY
+# and `make test` reports "Nothing to be done" while exiting 0, which is a
+# clean-looking pass having run nothing at all.
+HOSTCC ?= cc
+test: prepare
+	$(HOSTCC) -Wall -Wextra -I src -o build/cq_test test/cq_test.c src/cq.c
+	./build/cq_test
+
 build: prepare $(OBJECTS)
 	$(COMPILE) $(LDFLAGS) -o build/$(FILENAME).elf $(OBJECTS)
 	avr-objcopy -R .eeprom -R .lock -R .signature -R .user_signatures -O ihex build/$(FILENAME).elf build/$(FILENAME).hex

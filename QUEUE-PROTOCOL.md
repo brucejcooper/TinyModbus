@@ -541,8 +541,17 @@ every previous retirement). Add the §6 counter block in the diag space.
 `cq_complete(seq, H_OK/H_FAILED, resp8)`. Mechanical.
 
 **G4. Budget gate** — `avr-size` before/after for flash and BSS; recompute
-stack margin. Expected: flash down, RAM down ~40 B. A regression here is a
-finding, not a footnote.
+stack margin. Expect **flash down, RAM up ~10 B**: 12 B command queue + 8 B
+response queue + ~14 B counters against only 24 B of retired `s_slot[3]`.
+(An earlier draft of this line said "RAM down ~40 B" — that was arithmetic
+against v2's *original* `s_slot[8]`, which had already been narrowed to 3
+slots. §9's table was right and this line was wrong.)
+
+**Measured on completion:** flash **11 028 → 10 420 B (−608)**, RAM
+**137 → 152 B (+15)**. Both accepted: the flash saving is the FC23 handler and
+the slot machinery leaving, and 152 / 1024 B leaves the stack margin
+comfortable. A *larger* RAM regression, or any flash growth, would have been a
+finding.
 
 ### Stage C — controller
 

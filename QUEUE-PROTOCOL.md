@@ -96,16 +96,21 @@ adapter in `dali_sync.c`.
 CRC-16 (Modbus polynomial) over all preceding bytes, **low byte transmitted
 first**, as standard.
 
-### FC65 — enqueue one command, return status · request, 8 bytes
+### FC65 — enqueue one command, return status · request, 9 bytes
 
 ```
-┌─────┬──────┬──────┬──────┬───────┬──────┬────────┬────────┐
-│ 00  │  01  │  02  │  03  │  04   │  05  │   06   │   07   │
-├─────┼──────┼──────┼──────┼───────┼──────┼────────┼────────┤
-│slave│ 0x41 │ addr │ data │ flags │ dtr0 │ CRC lo │ CRC hi │
-└─────┴──────┴──────┴──────┴───────┴──────┴────────┴────────┘
-              └──────── command, 4 bytes ────────┘
+┌─────┬──────┬─────┬──────┬──────┬───────┬──────┬────────┬────────┐
+│ 00  │  01  │ 02  │  03  │  04  │  05   │  06  │   07   │   08   │
+├─────┼──────┼─────┼──────┼──────┼───────┼──────┼────────┼────────┤
+│slave│ 0x41 │ tag │ addr │ data │ flags │ dtr0 │ CRC lo │ CRC hi │
+└─────┴──────┴─────┴──────┴──────┴───────┴──────┴────────┴────────┘
+                    └──────── command, 4 bytes ────────┘
 ```
+
+`tag` is an 8-bit value the **master** chooses, incrementing per enqueue
+attempt. It is the command's identity on the wire. See
+[Identity and lost replies](#25-identity-and-lost-replies) — without it, a lost
+reply leaves the master unable to tell whether its command landed.
 
 ### FC66 — status only · request, 4 bytes
 
@@ -117,26 +122,32 @@ first**, as standard.
 └─────┴──────┴────────┴────────┘
 ```
 
-### Response to FC65 **and** FC66 · 5 + 2×`MBQ_SLOTS` bytes (11 at 3 slots)
+### Response to FC65 **and** FC66 · 6 + 2×`MBQ_SLOTS` bytes (12 at 3 slots)
 
 ```
-┌─────┬──────┬──────────┬────────┬─────────┬────────┬─────────┬────────┬─────────┬────────┬────────┐
-│ 00  │  01  │    02    │   03   │   04    │   05   │   06    │   07   │   08    │   09   │   10   │
-├─────┼──────┼──────────┼────────┼─────────┼────────┼─────────┼────────┼─────────┼────────┼────────┤
-│slave│ echo │ accepted │ slot0  │ slot0   │ slot1  │ slot1   │ slot2  │ slot2   │ CRC lo │ CRC hi │
-│     │  FC  │  _slot   │ status │ resp8   │ status │ resp8   │ status │ resp8   │        │        │
-└─────┴──────┴──────────┴────────┴─────────┴────────┴─────────┴────────┴─────────┴────────┴────────┘
-                                  └──────────── status block, 2 bytes/slot ─────────────┘
+┌─────┬──────┬──────────┬─────────┬────────┬───────┬────────┬───────┬────────┬───────┬────────┬────────┐
+│ 00  │  01  │    02    │   03    │   04   │  05   │   06   │  07   │   08   │  09   │   10   │   11   │
+├─────┼──────┼──────────┼─────────┼────────┼───────┼────────┼───────┼────────┼───────┼────────┼────────┤
+│slave│ echo │ last_acc │ last_acc│ slot0  │ slot0 │ slot1  │ slot1 │ slot2  │ slot2 │ CRC lo │ CRC hi │
+│     │  FC  │  _slot   │  _tag   │ status │ resp8 │ status │ resp8 │ status │ resp8 │        │        │
+└─────┴──────┴──────────┴─────────┴────────┴───────┴────────┴───────┴────────┴───────┴────────┴────────┘
+                                   └────────────── status block, 2 bytes/slot ─────────┘
 ```
 
-`accepted_slot`:
+`last_accepted_slot` / `last_accepted_tag` are **sticky**: they report the most
+recent *successful* enqueue and are updated by nothing else. A failed enqueue
+(queue full) leaves them untouched, and FC66 never changes them. Both are `0xFF`
+before the first enqueue since boot.
 
-| value | meaning |
-|---|---|
-| `0` … `MBQ_SLOTS-1` | the command was placed in this slot |
-| `0xFF` (`MBQ_NONE`) | **not taken** — every slot was active. Not an error; resend |
+There is no separate "accepted / not accepted" flag. The master tests one thing:
 
-FC66 always replies `accepted_slot = 0xFF` (it enqueues nothing).
+```
+last_accepted_tag == the tag I just sent  →  accepted, it is in last_accepted_slot
+                                    else  →  not accepted, resend it
+```
+
+That single test covers both the ordinary full-queue case and recovery from a
+lost reply, which is why it replaced the earlier `accepted_slot = 0xFF` design.
 
 ### Exception response · 5 bytes
 
@@ -152,16 +163,63 @@ predates FC65. See [Capability negotiation](#5-capability-negotiation).
 **A full queue is deliberately NOT an exception.** Replying
 `SLAVE_DEVICE_BUSY (0x06)` would discard the status block in the same breath —
 and the status block is precisely what the master needs in order to learn that a
-slot has freed. Back-pressure is signalled in-band by `accepted_slot = 0xFF`
-*alongside* a complete status block.
+slot has freed. Back-pressure is signalled in-band by `last_accepted_tag` simply
+not matching the tag just sent, *alongside* a complete status block.
+
+### 2.5 Identity and lost replies
+
+**Under FC23, the slot index *is* the identity.** The master names the register
+it writes, so it knows what it put where; the status block is indexed by slot and
+correlation is free. The gateway's internal `seq` field is *not* identity — it is
+an accept-sequence used only by `mbq_next_pending()` to run commands in
+submission order regardless of slot index, and it is dead once a slot leaves
+`PENDING`. It has never appeared on the wire.
+
+**FC65 gives that away.** The gateway chooses the slot, so identity has to come
+back in the reply — and a reply can be lost. Without a tag the master faces:
+
+> I sent an enqueue and got nothing back. Did it land? If it did, which slot?
+
+It cannot answer either question, and the two possible actions are both wrong:
+resend and the command may execute **twice**; don't resend and it may never
+execute at all. For a `QF_TWICE` SET-class command, executing twice is a real
+fault, not just waste. FC23 never had this problem — the master could look at
+the slot it had chosen and see whether its write had landed, which is exactly
+what `SLOT_SENT` vs `SLOT_LIVE` and `resolve_ambiguous()` are for.
+
+**The tag closes it.** After a timeout the master sends FC66 (4 bytes) and reads
+`last_accepted_tag`:
+
+| observation | conclusion | action |
+|---|---|---|
+| `== my tag` | it landed, and it is in `last_accepted_slot` | bind it, do not resend |
+| `!= my tag` | it never landed | resend, safely |
+
+Deterministic, and it needs no idempotency reasoning at all — which is the
+ambiguity FC23 pays for with `resolve_ambiguous()` and the per-command
+`idempotent` flag.
+
+**One byte of tag is enough**, because at most one command can ever be
+un-bound. The bus is single-master and half-duplex, so exactly one transaction
+is outstanding at a time; the master will not send the next enqueue until it has
+resolved the last. Per-slot tags in the status block would be more general but
+cost 3 bytes per slot instead of 2, and buy nothing.
+
+Tag values wrap at 256 and carry no meaning beyond "different from the previous
+one". `0xFF` is reserved as the boot value of `last_accepted_tag`, so the master
+should skip it when allocating.
 
 ### Framing rules
 
-- **Fixed request lengths.** 8 bytes for FC65, 4 for FC66. A frame of any other
+- **Fixed request lengths.** 9 bytes for FC65, 4 for FC66. A frame of any other
   length fails validation and is **discarded without a reply**, exactly as a
   corrupt frame would be. (Contrast: an *unrecognised* function code is accepted
   on CRC alone so it can be answered `ILLEGAL FUNCTION` rather than left to time
   out — the master cannot know the length of a code the gateway doesn't have.)
+- **A discarded FC65 is indistinguishable from a lost reply**, and needs no
+  special handling: the master times out and runs the §2.5 tag check, which
+  reports "never landed" and it resends. One recovery path covers corruption in
+  either direction.
 - **Broadcast (address 0) is rejected.** Only write function codes are legal on
   broadcast; FC65/FC66 are not among them, so a broadcast enqueue is silently
   ignored. Enqueue is inherently addressed — the reply carries the slot.
@@ -202,17 +260,19 @@ Three slots, controller streaming commands C1, C2, … at a gateway whose DALI b
 takes ~33 ms per frame. `▸` marks the DALI engine's own progress between
 transactions.
 
-| # | request | gateway does | `accepted` | status block returned | master concludes |
+| # | request | gateway does | `last_acc` slot/tag | status block returned | master concludes |
 |---|---|---|---|---|---|
-| 1 | `FC65 C1` | snapshot `[IDLE,IDLE,IDLE]`, place C1 → slot 0 | `0` | `IDLE, IDLE, IDLE` | C1 is live in slot 0 |
+| 1 | `FC65 tag=1 C1` | snapshot `[IDLE,IDLE,IDLE]`, place C1 → slot 0 | `0` / `1` | `IDLE, IDLE, IDLE` | tag matches → C1 is live in slot 0 |
 | | | ▸ slot 0 `PENDING`→`EXECUTING`, DALI frame starts | | | |
-| 2 | `FC65 C2` | snapshot `[EXEC,IDLE,IDLE]`, place C2 → slot 1 | `1` | `EXEC, IDLE, IDLE` | C2 live in slot 1; C1 still running |
-| 3 | `FC65 C3` | snapshot `[EXEC,PEND,IDLE]`, place C3 → slot 2 | `2` | `EXEC, PEND, IDLE` | C3 live in slot 2; queue now full |
+| 2 | `FC65 tag=2 C2` | snapshot `[EXEC,IDLE,IDLE]`, place C2 → slot 1 | `1` / `2` | `EXEC, IDLE, IDLE` | C2 live in slot 1; C1 still running |
+| 3 | `FC65 tag=3 C3` | snapshot `[EXEC,PEND,IDLE]`, place C3 → slot 2 | `2` / `3` | `EXEC, PEND, IDLE` | C3 live in slot 2; queue now full |
 | | | ▸ C1 finishes → slot 0 `COMPLETE`, resp8 = value; C2 starts | | | |
-| 4 | `FC65 C4` | snapshot `[COMPLETE,EXEC,PEND]`, no IDLE → reuse slot 0, place C4 | `0` | **`COMPLETE(v)`**, `EXEC`, `PEND` | **C1's result delivered** *and* C4 enqueued — one transaction |
-| 5 | `FC65 C5` | snapshot `[PEND,EXEC,PEND]` — all active | `0xFF` | `PEND, EXEC, PEND` | C5 **not taken**; resend it next time |
+| 4 | `FC65 tag=4 C4` | snapshot `[COMPLETE,EXEC,PEND]`, no IDLE → reuse slot 0, place C4 | `0` / `4` | **`COMPLETE(v)`**, `EXEC`, `PEND` | **C1's result delivered** *and* C4 enqueued — one transaction |
+| 5 | `FC65 tag=5 C5` | snapshot `[PEND,EXEC,PEND]` — all active, nothing placed | `0` / `4` *(unchanged)* | `PEND, EXEC, PEND` | tag 5 ≠ 4 → C5 **not taken**; resend it |
 | | | ▸ C2 finishes → slot 1 `COMPLETE` | | | |
-| 6 | `FC65 C5` | snapshot `[PEND,COMPLETE,PEND]`, reuse slot 1 | `1` | `PEND`, **`COMPLETE(v)`**, `PEND` | C2's result delivered; C5 now live |
+| 6 | `FC65 tag=5 C5` | snapshot `[PEND,COMPLETE,PEND]`, reuse slot 1 | `1` / `5` | `PEND`, **`COMPLETE(v)`**, `PEND` | C2's result delivered; C5 now live in slot 1 |
+| 7 | `FC65 tag=6 C6` | placed → slot 2, **reply lost on the wire** | `2` / `6` | *(never seen)* | timeout — did C6 land? |
+| 8 | `FC66` | nothing; just reports | `2` / `6` | `PEND, PEND, PEND` | tag 6 matches → C6 **did** land, in slot 2. Bind it, do not resend |
 
 Steady state is transaction 4/6 repeating: **each transaction simultaneously
 reports one completion and enqueues one command.** That is the whole point —
@@ -257,10 +317,15 @@ At 19200 baud, 8N1 (10 bits/byte ≈ 521 µs/byte):
 
 | | FC23 | FC65 | saving |
 |---|---|---|---|
-| request | 17 B — 8.85 ms | **8 B — 4.17 ms** | 4.68 ms |
-| response (3 slots) | 11 B — 5.73 ms | 11 B — 5.73 ms | — |
-| **wire per transaction** | **14.58 ms** | **9.90 ms** | **4.68 ms** |
+| request | 17 B — 8.85 ms | **9 B — 4.69 ms** | 4.16 ms |
+| response (3 slots) | 11 B — 5.73 ms | 12 B — 6.25 ms | −0.52 ms |
+| **wire per transaction** | **14.58 ms** | **10.94 ms** | **3.64 ms** |
 | transactions per DALI frame | 2.04 (measured) | 1.0 (design) | |
+
+The tag and the sticky `last_accepted_*` pair cost 2 bytes (1.04 ms) against the
+tagless design. That is the price of being able to answer "did my command land?"
+after a lost reply, and it is worth paying — the alternative is either executing
+a `QF_TWICE` command twice or dropping it.
 
 FC23's request restates a read address, read count, write address, write count
 and byte count on **every** transaction — nine bytes of framing for a four-byte
@@ -282,10 +347,12 @@ document's projections have been wrong twice already.
    other bus. Should the client back off to a completion estimate when
    `accepted_slot == 0xFF`, or keep spinning and let the scheduler arbitrate?
 
-2. **`resend` semantics on `0xFF`.** The command was definitively not taken, so
-   resending is safe and needs no idempotency reasoning. Worth confirming this
-   holds for `QF_TWICE` (SET-class) commands, which are not idempotent if they
-   *were* to land twice.
+2. ~~**`resend` semantics.**~~ **Resolved by the tag** (§2.5). A resend is safe
+   precisely when `last_accepted_tag != my tag`, which is a fact the gateway
+   reports rather than something the master has to infer. This removes the
+   idempotency reasoning FC23 needs — but note the master must still allocate a
+   *fresh* tag for a genuinely new command, and **reuse the same tag** when
+   resending one that was not accepted.
 
 3. **Reuse of a `FAILED` slot** currently ranks equal with `COMPLETE` in step 2
    of slot selection. Should a `FAILED` result be preferred for reuse (it is

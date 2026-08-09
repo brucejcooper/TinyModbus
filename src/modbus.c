@@ -65,8 +65,15 @@ static uint16_t baud_reg_for(uint8_t bidx) {
 // (N-1 ticks) meets Modbus §2.5.1.1's 3.5-char minimum.
 //   3.5 char @ 9600  = 3.65 ms = 8.74 ticks -> N = 10 -> 9-10 ticks (3.75-4.17 ms)
 //   3.5 char @ 19200 = 1.82 ms = 4.37 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
-//   3.5 char @ 38400 = 0.91 ms = 2.19 ticks -> N = 4  -> 3-4  ticks (1.25-1.67 ms)
-static const uint8_t  s_silence_threshold[] = { 10, 6, 4 };
+//   3.5 char @ 38400 = 0.91 ms = 2.19 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
+// EXPERIMENT (2026-08-09): 38400 was N = 4 (1.25-1.67 ms observed). MODBUS over
+// Serial Line V1.02 stops deriving the timers above 19200 and prescribes a FIXED
+// t3.5 of 1.750 ms, which 1.25 ms undershoots — a master-side inter-character
+// gap longer than our window is read as end-of-frame, splitting one frame into
+// two bad ones (which is why frame_error and crc_error accrue in near-equal
+// numbers). Testing whether that, rather than the RC oscillator, is what makes
+// 38400 dirty. Costs ~0.8 ms of extra silence per transaction.
+static const uint8_t  s_silence_threshold[] = { 10, 6, 6 };
 // Per-baud reload value for the live silence_ticks countdown (set from
 // s_silence_threshold[] on init / baud change; copied into silence_ticks each
 // time a byte arrives).  Named _reload to disambiguate from the countdown.

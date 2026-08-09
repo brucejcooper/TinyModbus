@@ -18,16 +18,25 @@
 #include "errors.h"
 #include <stdbool.h>
 
-// Two slots is the whole queue: one EXECUTING, one staged as NEXT. Depth beyond
-// that buys nothing — the DALI bus runs one frame at a time, so extra slots only
-// sit idle — while it costs real bus time on EVERY transaction, because the
-// master reads the whole status block on each submit and each poll. At 19200 a
-// 2-slot status reply is 9 bytes (4.7 ms) against 21 bytes (10.9 ms) for 8, and
-// that reply is paid whether or not anything changed. The only requirement is
-// that the master refill the freed slot within one DALI frame time (~33 ms),
-// which one FC23 (submit + status read-back in a single transaction) does with
-// room to spare.
-#define MBQ_SLOTS      2u   // number of self-describing slots: EXECUTING + NEXT
+// THREE slots: EXECUTING, NEXT, and one kept FREE as the write target.
+//
+// Two is not enough, and the reason is subtle. A submit and its status read-back
+// share one transaction, so at the instant the master issues it, it must ALREADY
+// know a slot is free — and that knowledge is one round trip old. With two slots
+// both are occupied in steady state, so the master must spend a read-only poll to
+// discover a slot freed before it can write. Measured: 2.06 Modbus transactions
+// per DALI frame at 2 slots against 1.38 at 8, which made 2 slots ~9% SLOWER
+// despite each transaction being 28% cheaper.
+//
+// Three restores one transaction per frame while keeping the status reply small
+// (6 bytes of payload, not 16). Depth beyond three buys nothing: the DALI bus
+// runs one frame at a time, so further slots only sit idle, and every extra slot
+// costs 2 bytes on EVERY transaction forever because the whole status block is
+// read each time.
+//
+// The master must cap its in-flight count at MBQ_SLOTS-1 to preserve the free
+// write target — see DQ_DEPTH_* in the controller's dali_queue.c.
+#define MBQ_SLOTS      3u   // EXECUTING + NEXT + one free write target
 #define MBQ_CMD_BYTES  4u   // opaque command size (32-bit)
 #define MBQ_CMD_REGS   2u   // ...expressed in Modbus REGISTERS
 

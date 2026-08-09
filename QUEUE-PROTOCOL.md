@@ -376,22 +376,25 @@ gateways (wall switches dead during the window — schedule accordingly).
 
 ## 9. What v4 removes
 
-All of it deliberate, most of it funding the change on a part with ~800 B of
-flash headroom:
+All of it deliberate:
 
 | removed | why |
 |---|---|
-| FC23 queue path (submit window `0x1000`, slot status block `0x1010`, `submit_window()`, FC23 handler) | two queue stacks cannot coexist in 16 KB; matched-set deploys make a live fallback worthless |
+| FC23 queue path (submit window `0x1000`, slot status block `0x1010`, `submit_window()`, FC23 handler) | matched-set deploys make a live fallback worthless, and a second queue stack is a second set of semantics to test and keep correct — the v1/v2 bug history is entirely in reconcile paths that were rarely exercised |
 | draft-1 FC65/FC66 handlers (`accepted_slot`, snapshot-before) | superseded by this design on the same function code |
 | v2 slot model (`mbq_slots` slot lifecycle, `MBQ_S_*` on the wire, per-slot status registers) | replaced by command FIFO + response queue |
 | v3 draft's displaced register, reported bit, boot byte, FC66 | subsumed: retention-until-ack is strictly stronger than the displaced register; reboot detection moved to rules R2–R4 |
 | capability negotiation | no fallback to negotiate; version register instead |
 
 FC03/FC04 remain for sysinfo, diag, version, and config registers — untouched.
-Net gateway flash should go **down** (FC23 handler + slot machinery out;
-FIFO + smaller parser in) and RAM is comfortable: 12 B command slots + 8 B
-response queue + counters, versus 64 B of v2 slots (`s_slot[8]`). Both budgets
-are gated in the plan below.
+
+**Budget (measured baseline, `88f455a`): flash 11 028 / 16 384 B, RAM 137 /
+1024 B.** Task 05's strip left far more headroom than the task-04-era "~800 B"
+figure suggests, so nothing here is flash-forced. Expect flash roughly flat to
+slightly down (FC23 handler + slot machinery out, FIFO + counters in) and RAM
+about level: 12 B command queue + 8 B response queue + ~14 B counters against
+the 24 B of `s_slot[3]` retired. Both are gated in the plan below — a
+*regression* is a finding, but there is room to absorb one if it is justified.
 
 ---
 

@@ -413,25 +413,55 @@ are enough to localise any discrepancy after the fact.
 | enqueue with DTR0 (+ack) | 8 B | 7 B | 15 B | 7.8 ms |
 | poll / ack-only | 5 B | 6 B | 11 B | 5.7 ms |
 
-Steady state is one enqueue transaction per DALI frame. Against measured DALI
-frame times (task-07 soak: 25 ms SET, ~38 ms query, 71 ms per DTR0+query
-pair), and ~2 ms per transaction of t3.5 + turnaround overhead (measured
-24.6 ms bus occupancy on a 22.9 ms wire in the soak):
+### Wire time is not the whole transaction
 
-| traffic profile | FC23 (measured) | v3 draft | **v4** |
+A pure byte count overstates the win, and this document has been burned by
+exactly that kind of optimism before. **Measured on this rig, 2026-08-09,
+FC23 baseline** (`soak 3 0 n=300 depth=3`, busload read at the finish):
+
+```
+RS-485 bus 99% busy   1039 txns   19.46 ms avg   turnaround avg 10.27 ms
+1.73 transactions per command    14.71 pairs/s   0 failures
+```
+
+FC23's 28 bytes are only 14.58 ms of that 19.46 ms. The remaining **~4.9 ms is
+fixed per-transaction cost** — gateway turnaround (~1.4 ms of thinking once the
+request is on the wire), t3.5 silence, and the master's SM overhead. It does
+not shrink when the frame does.
+
+So a v4 enqueue transaction costs **~12.2 ms** charged, not 7.3:
+`7.3 ms wire + ~4.9 ms fixed`. Per DALI frame, against 1.73 → 1.0 transactions:
+
+| | FC23 (**measured**) | **v4 (projected)** | ratio |
 |---|---|---|---|
-| wire per transaction | 14.6 ms | 10.9 ms | **7.3–7.8 ms** |
-| transactions per frame | 2.04 | 1.0 | **1.0** |
-| all-SET stream (25 ms frames) | >100 % (Modbus-bound) | ~52 % | **~37 %** |
-| soak mix (71 ms pairs) | ~84 % | ~36 % | **~27 %** |
-| **two saturated gateways, all-SET worst case** | impossible | marginal | **~74 % — workable; ~50–55 % on realistic mixes** |
+| charged per transaction | 19.46 ms | ~12.2 ms | 1.6× |
+| transactions per command | 1.73 | 1.0 | 1.7× |
+| **bus time per DALI frame** | **33.7 ms** | **~12.2 ms** | **2.8×** |
+| soak mix (~35.5 ms/frame) | **99 %** | **~34 %** | |
+| all-SET stream (25 ms frames) | >100 %, Modbus-bound | ~49 % | |
+| two saturated gateways, soak mix | impossible | ~68 % — workable | |
+| two saturated gateways, all-SET | impossible | ~98 % — **marginal** | |
+
+**Set expectations by the 34 %, not the 27 % a byte count suggests.** The honest
+conclusion for the second DALI bus: v4 makes two gateways comfortable on
+realistic traffic and still marginal if both stream pure SET-class commands at
+maximum rate. That is a large improvement on "impossible" and it is not
+unlimited headroom.
 
 Idle duty is ~0: with no backlog and no results outstanding there is nothing
 to poll (the dirty-poll/sweep layers above have their own cadence).
 
-**Projections, not measurements — this document's projections have been wrong
-twice.** The soak gate in §11 is the truth test, and the two-gateway row is
-the one to re-check on hardware once the second bus exists.
+**A note on where the remaining time goes.** At ~10.3 ms turnaround measured
+from request start, the gateway spends ~1.4 ms between the last request byte
+and the first reply byte — plausibly one main-loop pass rather than parse cost.
+If a future task wants more headroom, that fixed overhead is now the largest
+single term in a v4 transaction (~40 % of it), and it is a gateway-side
+scheduling question, not a protocol one. **Out of scope here; do not chase it
+in this task.**
+
+**Everything in the v4 column is a projection. The gate in §11 is the truth
+test** — and the FC23 column beside it is real, measured on the rig this
+change will be judged against.
 
 ---
 
@@ -541,9 +571,10 @@ accounting, before resolution), forcing the §4 paths deterministically.
 Reusing task-07 instrumentation:
 
 1. **Soak**, DTR0 stride-97 probe, depth sweep {1, 2, 3}: 0 bad / 0 lost /
-   0 lag-1 over ≥ 5000 pairs, **transactions-per-frame ≈ 1.0 at depth 2**
-   (the number this design exists to hit), pair rate ≥ 14/s (FC23 baseline;
-   DALI ceiling ~15.9). Depth 3 run decides whether `CMDQ_DEPTH` moves.
+   0 lag-1 over ≥ 5000 pairs, **transactions-per-command ≈ 1.0 at depth 2**
+   (the number this design exists to hit — FC23 measured **1.73**), pair rate
+   **≥ 14.71/s**, the measured FC23 baseline on this rig; the DALI ceiling is
+   ~15.9. Depth 3 run decides whether `CMDQ_DEPTH` moves.
 2. **Reboot drill**: `gw_reboot` mid-soak at full rate — clean verdict; the
    reboot noticed by R2/R3/R4 (stats show which); non-idempotent disposition
    logged; verify against sysinfo `boot_count` that no reboot went uncounted.
@@ -558,9 +589,13 @@ Reusing task-07 instrumentation:
 5. **Malformed-frame test**: bench sender emits the 6-byte and
    flag-inconsistent lengths → discarded + counted, no reply, no state
    change.
-6. **Duty measurement**: `busload` occupancy at saturation vs the §7
-   projection (~37 % all-SET, ~27 % soak mix); re-run the two-gateway row
-   when the second bus exists.
+6. **Duty measurement**: `busload` occupancy at saturation, read **at the
+   finish** (a late read dilutes the window — a 75 s gap reported 25 % for a
+   run that was really 99 %). Target **~34 % on the soak mix against the
+   measured 99 % FC23 baseline**; anything under ~45 % is a pass, anything
+   near 99 % means the transaction count did not actually drop and the run
+   should be treated as a failure however clean its verdict. Re-run the
+   two-gateway row when the second bus exists.
 
 ### Post-validation
 

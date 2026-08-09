@@ -49,6 +49,7 @@ typedef enum __attribute__((packed)) {
     TM_SITE_CQ_COMPLETE,   // cq_complete found no EXECUTING command with that seq
     TM_SITE_CQ_RESPQ,      // response queue full at completion — backpressure broke
     TM_SITE_DALI_ISSUE,    // the DALI adapter could not launch a selected command
+    TM_SITE_CQ_ACCEPT,     // cq_accept: ring cursor and slot state disagree
 } tm_fault_site_t;
 
 // Record a fault that cannot be returned to a caller. Safe from ISR context: a

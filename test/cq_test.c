@@ -24,8 +24,11 @@
  *     than inferred from a clean soak.
  *
  * Not part of the firmware build: cq.c is pure C whose only dependency is
- * errors.h (a type and three prototypes it never calls), so it compiles and
- * runs on the host exactly as it does on the ATtiny. What CANNOT be reproduced
+ * errors.{c,h}, itself allocation-free and host-clean, so both compile and run
+ * on the host exactly as they do on the ATtiny. (cq.c gained the errors.c LINK
+ * dependency when its invariant-break branch started recording a fault instead
+ * of silently reporting A_FULL — before that it only used the header's types.)
+ * What CANNOT be reproduced
  * here is the concurrency — cq_complete really runs in the DALI completion ISR
  * — so this file tests the STATE MACHINE and the protocol invariants, and the
  * single-writer/publication-order rules that make it safe against that ISR are
@@ -37,12 +40,12 @@
  * canonical invocation — it is gate V5's only evidence, so it must be
  * reproducible rather than a command line pasted from a comment. (Directly, from
  * this directory: cc -Wall -Wextra -I ../src -o /tmp/cq_test cq_test.c
- * ../src/cq.c && /tmp/cq_test.)
+ * ../src/cq.c ../src/errors.c && /tmp/cq_test.)
  *
- * Exits non-zero on any failure. Clang emits one expected warning building
- * cq.c — "unknown pragma ignored" for its #pragma GCC optimize("Os"), which is
- * an avr-gcc flash-budget directive with no host meaning. Do not remove the
- * pragma to silence it; it is doing real work in the firmware build.
+ * Exits non-zero on any failure. Clang emits one expected warning per source
+ * file — "unknown pragma ignored" for #pragma GCC optimize("Os"), an avr-gcc
+ * flash-budget directive with no host meaning. Do not remove those pragmas to
+ * silence it; they are doing real work in the firmware build.
  */
 #include "../src/cq.h"
 #include "../src/fc41.h"
@@ -559,6 +562,16 @@ int main(void) {
     test_reserved_invariants();
     test_fc41_validation();
     test_discard_changes_nothing();
+
+    // Nothing above may record an internal fault. Every operation in this file
+    // is legitimate use of the public API — including the deliberately refused
+    // ones, which are caller errors reported by return value, not invariant
+    // breaks — so a non-zero count here means cq_accept's ring-cursor/state
+    // disagreement branch fired when the two actually agreed. That branch also
+    // suppresses the a_full counter, so a spurious hit would silently under-
+    // report queue pressure as well as raising a phantom fault.
+    CHECK(tm_fault_count() == 0);
+    CHECK(tm_fault_last_site() == TM_SITE_NONE);
 
     if (!fail) printf("PASS: all cq checks passed\n");
     return fail;

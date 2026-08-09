@@ -77,7 +77,7 @@ prepare:
 # clean-looking pass having run nothing at all.
 HOSTCC ?= cc
 test: prepare
-	$(HOSTCC) -Wall -Wextra -I src -o build/cq_test test/cq_test.c src/cq.c
+	$(HOSTCC) -Wall -Wextra -I src -o build/cq_test test/cq_test.c src/cq.c src/errors.c
 	./build/cq_test
 
 build: prepare $(OBJECTS)

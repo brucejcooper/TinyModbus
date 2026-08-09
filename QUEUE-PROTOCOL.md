@@ -7,15 +7,14 @@ TinyModbus gateway's DALI command queue.
 >
 > | | FC23 | FC65 / FC66 |
 > |---|---|---|
-> | gateway (`TinyModbus/src/modbus.c`) | shipping | **untagged draft only** |
-> | controller transport (`src/modbus.c`) | shipping | **untagged draft only** |
+> | gateway (`TinyModbus/src/modbus.c`) | shipping | **early draft only** |
+> | controller transport (`src/modbus.c`) | shipping | **early draft only** |
 > | controller client (`mbq_client.c`) | shipping | **not started** |
 >
-> **This document describes the TAGGED design (§2.5), which no code implements
-> yet.** The committed FC65 draft predates the tag: its request is 8 bytes with
-> no `tag`, and its reply is `3 + 2N` with an `accepted_slot` that is `0xFF` when
-> the queue is full. Treat the source as the earlier proposal and this document
-> as the intended one; they are reconciled when the client is built.
+> **No code implements this document yet.** Two things differ from the committed
+> draft: the slot status byte is packed `[state:3 | seq:5]` (today `state` is a
+> plain enum in a whole byte and `seq` is a separate internal field, never
+> transmitted), and the reply has no `accepted_slot` (the draft has one).
 >
 > Nothing on a device is affected — `mbq_client` still drives the queue purely
 > over FC23, so FC65 is unreachable in the running firmware.
@@ -61,13 +60,18 @@ learns the result by reading status, and the slot is freed by being overwritten.
 One 16-bit register per slot, big-endian on the wire:
 
 ```
- bit  15                     8 7                      0
-     ┌─────────────────────────┬─────────────────────────┐
-     │        status           │       response8         │
-     └─────────────────────────┴─────────────────────────┘
+ bit  15     13 12          8 7                      0
+     ┌─────────┬──────────────┬─────────────────────────┐
+     │  state  │     seq      │       response8         │
+     │ (3 bits)│   (5 bits)   │        (8 bits)         │
+     └─────────┴──────────────┴─────────────────────────┘
 ```
 
-| `status` | value | meaning |
+`state` needs 5 values, so 3 bits; the remaining 5 carry the slot's **accept
+sequence**, which is what gives every command an identity on the wire at no
+byte cost. See [Identity](#25-identity-and-lost-replies).
+
+| `state` | value | meaning |
 |---|---|---|
 | `MBQ_S_IDLE` | `0` | free, writable |
 | `MBQ_S_PENDING` | `1` | accepted, waiting for the DALI engine |
@@ -75,7 +79,13 @@ One 16-bit register per slot, big-endian on the wire:
 | `MBQ_S_COMPLETE` | `3` | terminal — `response8` is the answer byte |
 | `MBQ_S_FAILED` | `4` | terminal — `response8` is a failure code |
 
-`response8` is `0` unless the status is terminal.
+`response8` is `0` unless the state is terminal.
+
+`seq` is stamped by the **gateway** from a monotonic counter when a slot goes
+idle→pending, and stays with the command until the slot is reused. It is the
+same field the arbiter already uses to run commands in submission order
+(`mbq_next_pending()` picks the lowest seq, wrap-aware) — this exposes it rather
+than inventing anything. 5 bits wrap at 32.
 
 | failure code | value | meaning |
 |---|---|---|
@@ -113,21 +123,19 @@ adapter in `dali_sync.c`.
 CRC-16 (Modbus polynomial) over all preceding bytes, **low byte transmitted
 first**, as standard.
 
-### FC65 — enqueue one command, return status · request, 9 bytes
+### FC65 — enqueue one command, return status · request, 8 bytes
 
 ```
-┌─────┬──────┬─────┬──────┬──────┬───────┬──────┬────────┬────────┐
-│ 00  │  01  │ 02  │  03  │  04  │  05   │  06  │   07   │   08   │
-├─────┼──────┼─────┼──────┼──────┼───────┼──────┼────────┼────────┤
-│slave│ 0x41 │ tag │ addr │ data │ flags │ dtr0 │ CRC lo │ CRC hi │
-└─────┴──────┴─────┴──────┴──────┴───────┴──────┴────────┴────────┘
-                    └──────── command, 4 bytes ────────┘
+┌─────┬──────┬──────┬──────┬───────┬──────┬────────┬────────┐
+│ 00  │  01  │  02  │  03  │  04   │  05  │   06   │   07   │
+├─────┼──────┼──────┼──────┼───────┼──────┼────────┼────────┤
+│slave│ 0x41 │ addr │ data │ flags │ dtr0 │ CRC lo │ CRC hi │
+└─────┴──────┴──────┴──────┴───────┴──────┴────────┴────────┘
+              └──────── command, 4 bytes ────────┘
 ```
 
-`tag` is an 8-bit value the **master** chooses, incrementing per enqueue
-attempt. It is the command's identity on the wire. See
-[Identity and lost replies](#25-identity-and-lost-replies) — without it, a lost
-reply leaves the master unable to tell whether its command landed.
+The master supplies **no** identifier. Identity is the gateway's `seq`, returned
+in the status block — see [Identity](#25-identity-and-lost-replies).
 
 ### FC66 — status only · request, 4 bytes
 
@@ -139,32 +147,22 @@ reply leaves the master unable to tell whether its command landed.
 └─────┴──────┴────────┴────────┘
 ```
 
-### Response to FC65 **and** FC66 · 6 + 2×`MBQ_SLOTS` bytes (12 at 3 slots)
+### Response to FC65 **and** FC66 · 4 + 2×`MBQ_SLOTS` bytes (10 at 3 slots)
 
 ```
-┌─────┬──────┬──────────┬─────────┬────────┬───────┬────────┬───────┬────────┬───────┬────────┬────────┐
-│ 00  │  01  │    02    │   03    │   04   │  05   │   06   │  07   │   08   │  09   │   10   │   11   │
-├─────┼──────┼──────────┼─────────┼────────┼───────┼────────┼───────┼────────┼───────┼────────┼────────┤
-│slave│ echo │ last_acc │ last_acc│ slot0  │ slot0 │ slot1  │ slot1 │ slot2  │ slot2 │ CRC lo │ CRC hi │
-│     │  FC  │  _slot   │  _tag   │ status │ resp8 │ status │ resp8 │ status │ resp8 │        │        │
-└─────┴──────┴──────────┴─────────┴────────┴───────┴────────┴───────┴────────┴───────┴────────┴────────┘
-                                   └────────────── status block, 2 bytes/slot ─────────┘
+┌─────┬──────┬────────┬───────┬────────┬───────┬────────┬───────┬────────┬────────┐
+│ 00  │  01  │   02   │  03   │   04   │  05   │   06   │  07   │   08   │   09   │
+├─────┼──────┼────────┼───────┼────────┼───────┼────────┼───────┼────────┼────────┤
+│slave│ echo │ slot0  │ slot0 │ slot1  │ slot1 │ slot2  │ slot2 │ CRC lo │ CRC hi │
+│     │  FC  │ st|seq │ resp8 │ st|seq │ resp8 │ st|seq │ resp8 │        │        │
+└─────┴──────┴────────┴───────┴────────┴───────┴────────┴───────┴────────┴────────┘
+              └──────────── status block, 2 bytes/slot ──────────┘
 ```
 
-`last_accepted_slot` / `last_accepted_tag` are **sticky**: they report the most
-recent *successful* enqueue and are updated by nothing else. A failed enqueue
-(queue full) leaves them untouched, and FC66 never changes them. Both are `0xFF`
-before the first enqueue since boot.
-
-There is no separate "accepted / not accepted" flag. The master tests one thing:
-
-```
-last_accepted_tag == the tag I just sent  →  accepted, it is in last_accepted_slot
-                                    else  →  not accepted, resend it
-```
-
-That single test covers both the ordinary full-queue case and recovery from a
-lost reply, which is why it replaced the earlier `accepted_slot = 0xFF` design.
+**That is the whole reply.** No `accepted_slot`, no acknowledgement field: the
+status block already says which slot holds which `seq`, which is strictly more
+information. Both function codes return the identical shape, so there is one
+parser.
 
 ### Exception response · 5 bytes
 
@@ -180,61 +178,68 @@ predates FC65. See [Capability negotiation](#5-capability-negotiation).
 **A full queue is deliberately NOT an exception.** Replying
 `SLAVE_DEVICE_BUSY (0x06)` would discard the status block in the same breath —
 and the status block is precisely what the master needs in order to learn that a
-slot has freed. Back-pressure is signalled in-band by `last_accepted_tag` simply
-not matching the tag just sent, *alongside* a complete status block.
+slot has freed. Back-pressure is signalled by the absence of a new `seq`,
+*alongside* a complete status block.
 
 ### 2.5 Identity and lost replies
 
 **Under FC23, the slot index *is* the identity.** The master names the register
-it writes, so it knows what it put where; the status block is indexed by slot and
-correlation is free. The gateway's internal `seq` field is *not* identity — it is
-an accept-sequence used only by `mbq_next_pending()` to run commands in
-submission order regardless of slot index, and it is dead once a slot leaves
-`PENDING`. It has never appeared on the wire.
+it writes, so it knows what it put where, and the status block is indexed by
+slot. Correlation is free.
 
-**FC65 gives that away.** The gateway chooses the slot, so identity has to come
-back in the reply — and a reply can be lost. Without a tag the master faces:
+**FC65 gives that away** — the gateway chooses the slot. So identity has to come
+back in the reply, and a reply can be lost. The master would otherwise face:
 
-> I sent an enqueue and got nothing back. Did it land? If it did, which slot?
+> I sent an enqueue and got nothing back. Did it land? If so, where?
 
-It cannot answer either question, and the two possible actions are both wrong:
-resend and the command may execute **twice**; don't resend and it may never
-execute at all. For a `QF_TWICE` SET-class command, executing twice is a real
-fault, not just waste. FC23 never had this problem — the master could look at
-the slot it had chosen and see whether its write had landed, which is exactly
-what `SLOT_SENT` vs `SLOT_LIVE` and `resolve_ambiguous()` are for.
+Neither answer is safe to assume: resend and a `QF_TWICE` SET-class command may
+execute **twice**; don't resend and it may never execute at all.
 
-**The tag closes it.** After a timeout the master sends FC66 (4 bytes) and reads
-`last_accepted_tag`:
+**The `seq` in each slot's status byte answers both questions, for free.** The
+master keeps the `(slot, seq)` pairs it has seen. On every reply:
 
-| observation | conclusion | action |
-|---|---|---|
-| `== my tag` | it landed, and it is in `last_accepted_slot` | bind it, do not resend |
-| `!= my tag` | it never landed | resend, safely |
+| observation | meaning |
+|---|---|
+| slot *k* holds a `seq` the master already knows | same command, possibly advanced state |
+| slot *k* holds a **new** `seq` | this is the master's most recent enqueue — bind it to slot *k* |
+| no slot holds a new `seq` | the enqueue was **not** accepted — resend |
 
-Deterministic, and it needs no idempotency reasoning at all — which is the
-ambiguity FC23 pays for with `resolve_ambiguous()` and the per-command
-`idempotent` flag.
+After a lost reply the master simply issues FC66 (4 bytes) and applies the same
+three rules. There is no separate recovery path, no acknowledgement field, and
+no idempotency reasoning — which is exactly what FC23 needs `resolve_ambiguous()`
+and the per-command `idempotent` flag for.
 
-**One byte of tag is enough**, because at most one command can ever be
-un-bound. The bus is single-master and half-duplex, so exactly one transaction
-is outstanding at a time; the master will not send the next enqueue until it has
-resolved the last. Per-slot tags in the status block would be more general but
-cost 3 bytes per slot instead of 2, and buy nothing.
+**Why a new `seq` is unambiguous:** the bus is single-master and half-duplex, so
+exactly one transaction is outstanding at a time and the master will not issue
+the next enqueue until it has resolved the last. At most **one** command can be
+un-bound, so at most one unrecognised `seq` can appear.
 
-Tag values wrap at 256 and carry no meaning beyond "different from the previous
-one". `0xFF` is reserved as the boot value of `last_accepted_tag`, so the master
-should skip it when allocating.
+**Why 5 bits suffice:** wrap is at 32, and the master observes the full status
+block on every single transaction. Mistaking a wrapped `seq` for a live one would
+require 32 enqueues between two observations, which cannot happen when there is
+one transaction in flight and the master sees every reply. `MBQ_SLOTS` is 3, so
+only three sequences are live at once.
+
+**Ordering is unaffected.** `seq` is the same field `mbq_next_pending()` already
+uses to run commands in submission order, wrap-aware — this exposes it rather
+than adding anything. Narrowing it 8 → 5 bits does require the arbiter's
+comparison to sign-extend from bit 4 instead of bit 7.
+
+**Gateway reboot** resets the counter, so sequences restart at 0 and could
+coincide with live ones. That is already detected independently: a reboot clears
+every slot to `IDLE`, and a slot the master believes is live reading `IDLE` is
+the existing "idle means gone" rule. Reboot handling runs first and discards all
+bindings, so no stale `seq` survives to be matched.
 
 ### Framing rules
 
-- **Fixed request lengths.** 9 bytes for FC65, 4 for FC66. A frame of any other
+- **Fixed request lengths.** 8 bytes for FC65, 4 for FC66. A frame of any other
   length fails validation and is **discarded without a reply**, exactly as a
   corrupt frame would be. (Contrast: an *unrecognised* function code is accepted
   on CRC alone so it can be answered `ILLEGAL FUNCTION` rather than left to time
   out — the master cannot know the length of a code the gateway doesn't have.)
 - **A discarded FC65 is indistinguishable from a lost reply**, and needs no
-  special handling: the master times out and runs the §2.5 tag check, which
+  special handling: the master times out and runs the §2.5 sequence check, which
   reports "never landed" and it resends. One recovery path covers corruption in
   either direction.
 - **Broadcast (address 0) is rejected.** Only write function codes are legal on
@@ -277,23 +282,23 @@ Three slots, controller streaming commands C1, C2, … at a gateway whose DALI b
 takes ~33 ms per frame. `▸` marks the DALI engine's own progress between
 transactions.
 
-| # | request | gateway does | `last_acc` slot/tag | status block returned | master concludes |
-|---|---|---|---|---|---|
-| 1 | `FC65 tag=1 C1` | snapshot `[IDLE,IDLE,IDLE]`, place C1 → slot 0 | `0` / `1` | `IDLE, IDLE, IDLE` | tag matches → C1 is live in slot 0 |
-| | | ▸ slot 0 `PENDING`→`EXECUTING`, DALI frame starts | | | |
-| 2 | `FC65 tag=2 C2` | snapshot `[EXEC,IDLE,IDLE]`, place C2 → slot 1 | `1` / `2` | `EXEC, IDLE, IDLE` | C2 live in slot 1; C1 still running |
-| 3 | `FC65 tag=3 C3` | snapshot `[EXEC,PEND,IDLE]`, place C3 → slot 2 | `2` / `3` | `EXEC, PEND, IDLE` | C3 live in slot 2; queue now full |
-| | | ▸ C1 finishes → slot 0 `COMPLETE`, resp8 = value; C2 starts | | | |
-| 4 | `FC65 tag=4 C4` | snapshot `[COMPLETE,EXEC,PEND]`, no IDLE → reuse slot 0, place C4 | `0` / `4` | **`COMPLETE(v)`**, `EXEC`, `PEND` | **C1's result delivered** *and* C4 enqueued — one transaction |
-| 5 | `FC65 tag=5 C5` | snapshot `[PEND,EXEC,PEND]` — all active, nothing placed | `0` / `4` *(unchanged)* | `PEND, EXEC, PEND` | tag 5 ≠ 4 → C5 **not taken**; resend it |
-| | | ▸ C2 finishes → slot 1 `COMPLETE` | | | |
-| 6 | `FC65 tag=5 C5` | snapshot `[PEND,COMPLETE,PEND]`, reuse slot 1 | `1` / `5` | `PEND`, **`COMPLETE(v)`**, `PEND` | C2's result delivered; C5 now live in slot 1 |
-| 7 | `FC65 tag=6 C6` | placed → slot 2, **reply lost on the wire** | `2` / `6` | *(never seen)* | timeout — did C6 land? |
-| 8 | `FC66` | nothing; just reports | `2` / `6` | `PEND, PEND, PEND` | tag 6 matches → C6 **did** land, in slot 2. Bind it, do not resend |
+| # | request | gateway does | status block returned | master concludes |
+|---|---|---|---|---|
+| 1 | `FC65 C1` | snapshot `[IDLE,IDLE,IDLE]`, place C1 → slot 0 as seq 1 | `IDLE, IDLE, IDLE` | no new seq yet — the snapshot predates the enqueue |
+| | | ▸ slot 0 `PENDING`→`EXECUTING` | | |
+| 2 | `FC65 C2` | snapshot `[PEND/1,IDLE,IDLE]`, place C2 → slot 1 as seq 2 | **`PEND seq1`**, `IDLE`, `IDLE` | new seq 1 in slot 0 → that is C1. Bind it |
+| 3 | `FC65 C3` | snapshot `[EXEC/1,PEND/2,IDLE]`, place C3 → slot 2 as seq 3 | `EXEC 1`, **`PEND 2`**, `IDLE` | new seq 2 in slot 1 → C2. Queue now full |
+| | | ▸ C1 finishes → slot 0 `COMPLETE`, resp8 = value | | |
+| 4 | `FC65 C4` | snapshot `[COMPLETE/1,EXEC/2,PEND/3]`, no IDLE → reuse slot 0, place C4 as seq 4 | **`COMPLETE 1(v)`**, `EXEC 2`, **`PEND 3`** | **C1's result delivered** (seq 1 matches its binding) *and* C4 enqueued — one transaction |
+| 5 | `FC65 C5` | snapshot `[PEND/4,EXEC/2,PEND/3]` — all active, nothing placed | `PEND 4`, `EXEC 2`, `PEND 3` | seq 4 is new → that was C4. No *further* new seq → C5 **not taken**, resend |
+| | | ▸ C2 finishes → slot 1 `COMPLETE` | | |
+| 6 | `FC65 C5` | snapshot `[PEND/4,COMPLETE/2,PEND/3]`, reuse slot 1 as seq 5 | `PEND 4`, **`COMPLETE 2(v)`**, `PEND 3` | C2's result delivered |
+| 7 | `FC65 C6` | placed → slot 1 as seq 6, **reply lost on the wire** | *(never seen)* | timeout — did C6 land? |
+| 8 | `FC66` | nothing; just reports | `PEND 4`, **`PEND 6`**, `PEND 3` | seq 6 is new and unrecognised → C6 **did** land, in slot 1. Bind it, do not resend |
 
-Steady state is transaction 4/6 repeating: **each transaction simultaneously
-reports one completion and enqueues one command.** That is the whole point —
-one Modbus transaction per DALI frame, where FC23 needs two.
+Note transaction 1: because the snapshot predates the enqueue, a command's
+binding is always learned on the **following** transaction. That costs nothing
+during a burst, and it is what keeps a reused terminal from being lost.
 
 ### The same cycle over FC23, for comparison
 
@@ -334,15 +339,14 @@ At 19200 baud, 8N1 (10 bits/byte ≈ 521 µs/byte):
 
 | | FC23 | FC65 | saving |
 |---|---|---|---|
-| request | 17 B — 8.85 ms | **9 B — 4.69 ms** | 4.16 ms |
-| response (3 slots) | 11 B — 5.73 ms | 12 B — 6.25 ms | −0.52 ms |
-| **wire per transaction** | **14.58 ms** | **10.94 ms** | **3.64 ms** |
+| request | 17 B — 8.85 ms | **8 B — 4.17 ms** | 4.68 ms |
+| response (3 slots) | 11 B — 5.73 ms | **10 B — 5.21 ms** | 0.52 ms |
+| **wire per transaction** | **14.58 ms** | **9.38 ms** | **5.20 ms** |
 | transactions per DALI frame | 2.04 (measured) | 1.0 (design) | |
 
-The tag and the sticky `last_accepted_*` pair cost 2 bytes (1.04 ms) against the
-tagless design. That is the price of being able to answer "did my command land?"
-after a lost reply, and it is worth paying — the alternative is either executing
-a `QF_TWICE` command twice or dropping it.
+Identity costs **zero bytes** — `seq` rides in the 5 bits the state enum was
+already wasting. The reply is a byte *shorter* than the first FC65 draft, which
+carried an `accepted_slot` that the per-slot sequences make redundant.
 
 FC23's request restates a read address, read count, write address, write count
 and byte count on **every** transaction — nine bytes of framing for a four-byte
@@ -364,12 +368,10 @@ document's projections have been wrong twice already.
    other bus. Should the client back off to a completion estimate when
    `accepted_slot == 0xFF`, or keep spinning and let the scheduler arbitrate?
 
-2. ~~**`resend` semantics.**~~ **Resolved by the tag** (§2.5). A resend is safe
-   precisely when `last_accepted_tag != my tag`, which is a fact the gateway
-   reports rather than something the master has to infer. This removes the
-   idempotency reasoning FC23 needs — but note the master must still allocate a
-   *fresh* tag for a genuinely new command, and **reuse the same tag** when
-   resending one that was not accepted.
+2. ~~**`resend` semantics.**~~ **Resolved by the sequence** (§2.5). A resend is
+   safe precisely when no new `seq` appeared, which the gateway reports rather
+   than the master inferring. The master needs no tag allocation discipline at
+   all — it holds the command and retries the identical bytes.
 
 3. **Reuse of a `FAILED` slot** currently ranks equal with `COMPLETE` in step 2
    of slot selection. Should a `FAILED` result be preferred for reuse (it is

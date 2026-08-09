@@ -11,7 +11,8 @@
 #include "registers.h"
 #include "errors.h"
 #include "sysinfo.h"
-#include "mbq_slots.h"
+#include "cq.h"
+#include "fc41.h"
 #include "dali.h"
 #include "dali_sync.h"
 
@@ -97,31 +98,23 @@ static volatile bool initial_silence_observed = false;
 #define FC_WRITE_SINGLE_REG  0x06
 #define FC_WRITE_COILS       0x0F
 #define FC_WRITE_MULTI_REG   0x10
-#define FC_READ_WRITE_MULTI  0x17   // FC23: write submit window, then read status/holding
 
-// User-defined function codes. MODBUS Application Protocol V1.1b reserves
-// 65-72 and 100-110 for exactly this, so these are conformant, not an
-// extension of the standard set. Framing, CRC, silence and exception replies
-// are all ordinary RTU — the only thing custom is the payload shape.
+// The queue function code, its request lengths, its wire flag bits and its
+// accept-status codes all live in fc41.h — one transcription of the spec's §1,
+// shared with the host test that enumerates the validation table.
 //
-// They exist because FC23 makes the master NAME the slot it writes to, so it can
-// only submit into one it already knows is free, which it learns from a previous
-// read. That forces a wasted read-only poll per DALI frame (measured: 2.04
-// transactions per frame). FC_MBQ_ENQUEUE lets the GATEWAY choose the slot, so
-// every transaction can carry a command and a status read-back together.
+// In steady state FC 0x41 is one ~14-byte transaction per DALI frame, against
+// the 1.73 transactions per command FC23 measured on this rig: FC23 made the
+// master NAME the slot it wrote to, so it could only submit into one a PREVIOUS
+// read had shown free, and that dependency cost a poll per frame. (The draft-1
+// FC65/FC66 pair used 0x41/0x42 for a different, never deployed, shape — v4 is
+// a clean break on the same code, and 0x42 is retired.)
 //
-// Second-order win: 8 request bytes against FC23's 17, because FC23 must restate
-// a read address, read count, write address, write count and byte count that are
-// the same on every single transaction.
-#define FC_MBQ_ENQUEUE       0x41   // enqueue 1 command in any free slot + read status
-#define FC_MBQ_STATUS        0x42   // read status only (nothing to enqueue)
-
-// addr(1) fc(1) cmd(4) crc(2)
-#define FC41_REQ_LEN         8u
-// addr(1) fc(1) crc(2)
-#define FC42_REQ_LEN         4u
-// addr(1) fc(1) accepted_slot(1) status(2*MBQ_SLOTS) — start_tx appends the CRC
-#define FCQ_RSP_PAYLOAD      (3u + 2u * MBQ_SLOTS)
+// A_FULL is reported IN BAND rather than as a Modbus exception: an exception
+// would discard the head report in the same breath, and the head is exactly what
+// the master needs in order to learn that a slot has freed. It also leaves
+// nothing for a transport auto-retry to latch onto, which is what makes the
+// task-07 DEVICE_BUSY double-execution hazard unconstructible here.
 
 typedef enum {
     MB_ERR_ILLEGAL_FUNCTION    = 0x01,
@@ -186,10 +179,19 @@ static volatile bool     no_response   = false;
 //                 slave's valid-CRC frame, which is NOT counted).
 //   frames_ok   : valid frames addressed to us that we processed (denominator).
 // last_fail[]   : the bytes of the most recent CRC-failed frame, for forensics.
+//
+// diag_q_discard is the queue protocol's own discard counter (FC04 0x0326, not
+// this block): FC 0x41 frames addressed to us with a GOOD CRC that were dropped
+// without a reply for a bad length or a length/flag inconsistency. It is
+// separate from crc_error because the two say different things — a CRC error is
+// the line, a queue discard is the master's frame builder — and it exists at all
+// because the spec makes those frames indistinguishable from a lost frame to the
+// master, which would otherwise leave them completely unobservable.
 static volatile uint16_t diag_rx_overflow   = 0;
 static volatile uint16_t diag_frame_error   = 0;
 static volatile uint16_t diag_crc_error     = 0;
 static volatile uint16_t diag_frames_ok     = 0;
+static volatile uint16_t diag_q_discard     = 0;
 static volatile uint8_t  diag_last_fail_len = 0;
 static volatile uint8_t  diag_last_fail[16];
 volatile bool            modbus_idle   = true;
@@ -282,10 +284,10 @@ static void send_error(mb_err_t err) {
     start_tx(3);
 }
 
-// The generic slot command queue lives in mbq_slots.c; its DALI adapter (unpack +
-// issue + terminal mapping) is the OP_RAW arms of dali_sync.c.  There is no cache
-// to invalidate and no fade tracking here — the controller owns both, and decides
-// for itself what to re-read after a command (see controller/src/dali_state.c).
+// The command and response queues live in cq.c; their DALI adapter (unpack +
+// issue + outcome mapping) is dali_sync.c.  There is no cache to invalidate and
+// no fade tracking here — the controller owns both, and decides for itself what
+// to re-read after a command (see controller/src/dali_state.c).
 
 // ---- FC04 - read input registers ----------------------------------------
 
@@ -294,9 +296,11 @@ static void send_error(mb_err_t err) {
 //   0x0200-0x020F  version block (count must be 16)
 //   0x0300-0x030F  RX diagnostics (count must be 16)
 //   0x0310-0x0313  sysinfo: uptime, boot count, reset reason (count must be 4)
-//   0x1010-0x1017  queue status block (also served under FC03)
+//   0x0320-0x0327  queue counters (count must be 8)
 //
-// Anything else returns ILLEGAL_ADDRESS.
+// Anything else returns ILLEGAL_ADDRESS. Block reads are EXACT-LENGTH: asking
+// for a different count is ILLEGAL_ADDRESS, not a short read, so a client built
+// against a different register map fails loudly instead of parsing a prefix.
 //
 // Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
 // at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.
@@ -360,26 +364,33 @@ static void process_fc04(void) {
         return;
     }
 
-    // Slot status block at MBREG_SLOT_STATUS_BASE (0x1010), 1..8 registers, served
-    // identically under FC04 and FC03.  Not backed by register_map_t — served
-    // from the generic queue module (mbq_slots.c), which fences each slot's
-    // [status|response8] read against the LVL1 completion writer.
-    if (addr >= MBREG_SLOT_STATUS_BASE
-        && (uint32_t)addr + count <= (uint32_t)MBREG_SLOT_STATUS_BASE + MBQ_SLOTS
-        && count >= 1u) {
-        buf[2] = (uint8_t)(count * 2u);
-        // The range test above bounds this read, but consume the result rather
-        // than trusting that: a response built from an overrun must not go out.
-        tm_err_t se = mbq_read_status((uint8_t)(addr - MBREG_SLOT_STATUS_BASE),
-                                      (uint8_t)count, buf + 3);
-        if (se != TM_OK) { send_error(tm_err_to_modbus(se)); return; }
-        start_tx(3 + buf[2]);
+    // Queue counter block at FC04_QDIAG_BLOCK (8-register read, 16 bytes), the
+    // spec §6 cold-path diagnostics.  Big-endian, 16-bit WRAPPING counters — see
+    // registers.h for the register-by-register layout, which the controller's
+    // `mbq` stats parse against and must match exactly.
+    //
+    // Read straight out of live storage rather than a snapshot: only `results`
+    // is written from ISR context, and a torn 16-bit read of one diagnostic
+    // sample is not worth a fence on this path (cq.h says why the queue carries
+    // no fences at all).
+    if (addr == FC04_QDIAG_BLOCK && count == 0x08u) {
+        buf[2] = 16u;
+        uint8_t *p = buf + 3;
+        const volatile cq_counters_t *c = cq_counters();
+        const uint16_t v[8] = { c->accepts, c->full, c->executes, c->results,
+                                c->acks, c->stalls, diag_q_discard, 0u };
+        for (uint8_t i = 0; i < 8u; i++) {
+            p[i * 2u]      = (uint8_t)(v[i] >> 8);
+            p[i * 2u + 1u] = (uint8_t)v[i];
+        }
+        start_tx(19u);
         return;
     }
 
     // Every FC04 block is a special case handled above; anything else is an
-    // was a generic tail that set buf[2] = count*2 and transmitted WITHOUT filling
-    // the payload — harmless only because fc04_range_allowed() returns false
+    // ILLEGAL_ADDRESS. Where this now falls through, there used to be a generic
+    // tail that set buf[2] = count*2 and transmitted WITHOUT filling the payload
+    // — harmless only because fc04_range_allowed() returned false
     // unconditionally, and a stale-buffer leak the moment anyone allow-listed a
     // range. The allow-list hook is gone with it; a new block adds its own case
     // above, next to the code that fills the buffer it promises.
@@ -392,8 +403,7 @@ static void process_fc04(void) {
 // the requested range is not in the holding register map.
 // Build a holding-register read response body into buf: buf[2] = count*2, then
 // `count` big-endian registers from `addr`.  Returns false (buf half-filled) if
-// any register in the range is unmapped — caller sends ILLEGAL_ADDRESS.  Shared
-// by FC03 and the read half of FC23.
+// any register in the range is unmapped — caller sends ILLEGAL_ADDRESS.
 //
 // Iterate by index, not `reg < addr + count`: with addr=0xFFFF, count=2 the
 // upper bound wraps to 0x0001 and the loop would never run while buf[2] already
@@ -410,28 +420,6 @@ static mb_err_t read_holding_block(uint16_t addr, uint16_t count) {
         *rp++ = (uint8_t)v;
     }
     return 0;
-}
-
-// Validate + execute a write to the v2 slot command block (0x1000-0x100F),
-// shared by FC10 and the write half of FC23.  A write covers 1..8 CONTIGUOUS
-// slots: wr_addr = MBREG_SLOT_CMD_BASE + 2*first_slot, wr_count = 2*n_slots.  `regs`
-// points at wr_count*2 bytes of opaque command data in wire order.  Returns a
-// Modbus error (0 on success): out-of-range / mis-aligned base → ILLEGAL_ADDRESS;
-// odd/zero register count → ILLEGAL_VALUE; any targeted slot active → DEVICE_BUSY
-// (all-or-nothing — mbq_submit changes nothing on a reject).
-static mb_err_t submit_window(uint16_t wr_addr, uint16_t wr_count, const uint8_t *regs) {
-    if (wr_addr < MBREG_SLOT_CMD_BASE || wr_addr > MBREG_SLOT_CMD_END)  return MB_ERR_ILLEGAL_ADDRESS;
-    uint16_t off = (uint16_t)(wr_addr - MBREG_SLOT_CMD_BASE);
-    if (off % MBQ_CMD_REGS)                                    return MB_ERR_ILLEGAL_ADDRESS;  // slot boundary
-    if ((wr_count % MBQ_CMD_REGS) || wr_count == 0u)           return MB_ERR_ILLEGAL_VALUE;
-    if ((uint32_t)wr_addr + wr_count > (uint32_t)MBREG_SLOT_CMD_END + 1u) return MB_ERR_ILLEGAL_ADDRESS;
-    // Registers per slot, not bytes — mixing those two units is what once made a
-    // submit declare twice its length and arm the following slot.
-    uint8_t first_slot = (uint8_t)(off / MBQ_CMD_REGS);
-    uint8_t n_slots    = (uint8_t)(wr_count / MBQ_CMD_REGS);
-    // BUSY (retry later) and BAD_RANGE (never valid) are now distinguishable, so
-    // so the master is not invited to retry a malformed submit forever.
-    return tm_err_to_modbus(mbq_submit(first_slot, regs, n_slots));
 }
 
 static void process_fc03(void) {
@@ -507,21 +495,10 @@ static void process_fc10(void) {
         return;
     }
 
-    // Raw command queue submit window (0x1000-0x1007): the WHOLE FC10 write is
-    // one all-or-nothing submit of count/2 command records.  Handled here,
-    // before the per-register loop, because it is a block operation (the record
-    // count and all-or-nothing free-slot check need the whole write at once).
-    // Any address inside the command block routes to the submit window, not just
-    // the base: submit_window validates slot alignment itself, and FC23 already
-    // accepted a mid-block write. Requiring the exact base here meant an FC10
-    // submit to slot 1+ fell through to the per-register loop and came back
-    // ILLEGAL_ADDRESS — a gratuitous difference between two paths into one queue.
-    if (addr >= MBREG_SLOT_CMD_BASE && addr <= MBREG_SLOT_CMD_END) {
-        mb_err_t e = submit_window(addr, count, buf + 7);
-        if (e) { send_error(e); return; }
-        start_tx(6);   // standard FC10 echo (addr, fc, start, count)
-        return;
-    }
+    // No queue submit window here any more: FC 0x41 is the only way into the
+    // command queue, so an FC10 write to the retired 0x1000 range falls through
+    // to the per-register loop and comes back ILLEGAL_ADDRESS like any other
+    // unmapped address.
 
     // Group register write rules: only one DALI-actionable group write
     // per FC10 (matches the spec's "restrict FC10 group writes to a
@@ -556,78 +533,66 @@ static void process_fc10(void) {
     start_tx(6);
 }
 
-// ---- FC23 - read/write multiple registers ------------------------------
+// ---- FC 0x41 - the queue -----------------------------------------------
 
-// Handle FC23 (0x17).  Per the queue design the WRITE executes before the READ:
-// the write range is the command-queue submit window (0x1000), the read range
-// is holding space (typically the 0x1010 status block) — so one transaction
-// both submits new commands and collects the status/results of earlier ones
-// (the submit-N / collect-N-1 pipeline).  The response carries the post-write
-// read block, exactly like an FC03 read.
-// FC65 / FC66 — the queue's own function codes. See FC_MBQ_ENQUEUE above.
+// Wire flags (bits 7-5) -> the internal QF_* command flags.
 //
-// ORDER IS LOAD-BEARING: the status block is snapshotted BEFORE the enqueue.
-// mbq_enqueue_any may reuse a COMPLETE/FAILED slot when no IDLE one is left, and
-// a result overwritten before it was serialised would never reach the master —
-// the command would look lost. Snapshot first and the master always sees the
-// completion in the same transaction that replaces it.
-static void build_queue_reply(uint8_t accepted_slot, const uint8_t *snap) {
-    buf[2] = accepted_slot;
-    for (uint8_t i = 0; i < 2u * MBQ_SLOTS; i++) buf[3 + i] = snap[i];
-    start_tx(FCQ_RSP_PAYLOAD);
+// THE FLAG BOUNDARY IS HERE, deliberately. The v4 wire packs the flags into the
+// top 3 bits of a byte it shares with the ack sequence; the internal 4-byte
+// command has carried them as 0x01/0x02/0x04 in a byte of their own since v2,
+// and dali_sync.c tests them there. Normalising at the parser keeps the DALI
+// adapter unchanged and keeps the wire layout from leaking into the issuance
+// code — the alternative (carry the wire packing all the way down) would mean
+// every flag test in dali_sync.c changing meaning silently if this one function
+// were ever skipped.
+static uint8_t queue_flags_to_qf(uint8_t wire) {
+    uint8_t f = 0;
+    if (wire & QW_TWICE)  f |= QF_TWICE;
+    if (wire & QW_DTR0)   f |= QF_DTR0;
+    if (wire & QW_ANSWER) f |= QF_ANSWER;
+    return f;
 }
 
-static void process_fc_enqueue(void) {
-    uint8_t snap[2u * MBQ_SLOTS];
-    (void)mbq_read_status(0u, MBQ_SLOTS, snap);   // snapshot BEFORE the enqueue
-    // Copy the command out of buf before build_queue_reply overwrites buf[2..].
-    uint8_t cmd[MBQ_CMD_BYTES];
-    for (uint8_t i = 0; i < MBQ_CMD_BYTES; i++) cmd[i] = buf[2 + i];
-    uint8_t slot = mbq_enqueue_any(cmd);
-    // A full queue is NOT an exception: it is the normal back-pressure signal and
-    // the master retries the same command next transaction. Returning
-    // SLAVE_DEVICE_BUSY instead would throw away the status block in the same
-    // breath, which is the very thing the master needs to learn a slot freed.
-    build_queue_reply(slot, snap);
-}
+// Handle FC 0x41.  Length and flag consistency were settled in frame_is_valid,
+// so reaching here means the frame is one of the three legal shapes.
+//
+// THE ORDER OF THESE THREE STEPS IS THE PROTOCOL (spec §2), not an
+// implementation detail:
+//
+//   1. ack     — first, so the response-queue entry it frees is available to the
+//                backpressure rule in THIS transaction. Doing it last costs a
+//                whole transaction per DALI frame at saturation, which is the
+//                entire reason this design exists.
+//   2. enqueue — into the entry step 1 may just have made room for.
+//   3. reply   — built from the state as it now stands, so the head reported is
+//                the head AFTER the ack, which is what lets the master tell a
+//                landed frame from a lost one (rules R1/R1') after a timeout.
+static void process_fc_queue(void) {
+    const bool has_cmd  = (rx_sz != FCQ_REQ_POLL);
+    const uint8_t ack   = (uint8_t)(buf[2] & CQ_SEQ_MAX);
+    const uint8_t wflag = (uint8_t)(buf[2] & QW_FLAGS_bm);
 
-static void process_fc_status(void) {
-    uint8_t snap[2u * MBQ_SLOTS];
-    (void)mbq_read_status(0u, MBQ_SLOTS, snap);
-    build_queue_reply(MBQ_NONE, snap);
-}
-
-static void process_fc23(void) {
-    uint16_t rd_addr  = ((uint16_t)buf[2] << 8) | buf[3];
-    uint16_t rd_count = ((uint16_t)buf[4] << 8) | buf[5];
-    uint16_t wr_addr  = ((uint16_t)buf[6] << 8) | buf[7];
-    uint16_t wr_count = ((uint16_t)buf[8] << 8) | buf[9];
-    uint8_t  wr_bytes = buf[10];
-
-    if (rd_count == 0 || rd_count > MAX_REG_RD)   { send_error(MB_ERR_ILLEGAL_VALUE); return; }
-    // Compare in 16-bit: (uint8_t)(wr_count * 2) truncates, so wr_count = 128 with
-    // wr_bytes = 0 would otherwise pass. submit_window's range test catches it
-    // downstream, but a length check that a crafted length can walk through should
-    // not be relying on a later check to save it.
-    if ((uint16_t)wr_bytes != (uint16_t)(wr_count * 2u)) { send_error(MB_ERR_ILLEGAL_VALUE); return; }
-
-    // --- WRITE FIRST ---
-    // The only writable FC23 target is the queue submit window.  wr_count == 0
-    // is allowed: a read-only FC23 (pure status/collect poll, no new submit).
-    // wr_data starts at buf[11]; submit_window (via mbq_submit) copies it out
-    // before we build the response into buf, so the later overwrite is safe.
-    // An exception here replaces the whole response, so nothing is read.
-    if (wr_count > 0u) {
-        mb_err_t e = submit_window(wr_addr, wr_count, buf + 11);
-        if (e) { send_error(e); return; }
+    // Copy the command out of the RX buffer BEFORE anything writes the reply
+    // over it: the reply's accept byte lands on buf[2] and its head bytes on
+    // buf[3..4], which are the request's addr and data.
+    uint8_t cmd[CQ_CMD_BYTES];
+    if (has_cmd) {
+        cmd[0] = buf[3];                                        // DALI address byte
+        cmd[1] = buf[4];                                        // DALI data byte
+        cmd[2] = queue_flags_to_qf(wflag);
+        cmd[3] = (rx_sz == FCQ_REQ_ENQ_DTR0) ? buf[5] : 0u;     // DTR0 preload
     }
 
-    // --- THEN READ (holding space, incl. the 0x1010 status block) ---
-    // The write (if any) already executed; a bad read range is a malformed
-    // request (the controller always pairs its submit with a valid status read).
-    mb_err_t rd_err = read_holding_block(rd_addr, rd_count);
-    if (rd_err) { send_error(rd_err); return; }
-    start_tx(3 + buf[2]);
+    (void)cq_ack(ack);   // mismatch is a silent no-op; the head report re-converges the master
+
+    uint8_t n = 2u;
+    if (has_cmd) {
+        uint8_t seq = cq_accept(cmd);
+        buf[n++] = (seq != CQ_SEQ_NONE) ? (uint8_t)((A_ACCEPTED << 5) | seq)
+                                        : (uint8_t)(A_FULL << 5);
+    }
+    cq_head(buf + n);
+    start_tx((uint8_t)(n + 2u));
 }
 
 // ---- Frame validation --------------------------------------------------
@@ -670,17 +635,18 @@ static bool frame_is_valid(void) {
             expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
             break;
         }
-        case FC_MBQ_ENQUEUE: expected_size = FC41_REQ_LEN; break;
-        case FC_MBQ_STATUS:  expected_size = FC42_REQ_LEN; break;
-        case FC_READ_WRITE_MULTI: {
-            // addr,fc,rd_start(2),rd_cnt(2),wr_start(2),wr_cnt(2),wr_bytecount,
-            // wr_data[wr_bytecount],crc(2) = 13 + wr_bytecount.  buf[10] is the
-            // write byte count (valid here: a passing CRC means the frame is
-            // complete, same reasoning as the FC16 9+buf[6] case above).
-            uint16_t es = 13u + buf[10];
-            expected_size = (es <= MAX_PKT_SZ) ? (uint8_t)es : 255u;
+        case FC_QUEUE:
+            // The one place the length/flag table is not a single constant: the
+            // three request shapes are distinguished by length AND flags
+            // together, so the decision lives in fc41.h as a pure function that
+            // the host test enumerates exhaustively.  buf[2] is safe to read —
+            // the rx_sz >= 5 gate above has already passed.
+            //
+            // A false here leaves expected_size at 255, which no frame can match
+            // (MAX_PKT_SZ is 40), so the frame is discarded WITHOUT A REPLY,
+            // exactly as a corrupt one would be.
+            if (fc41_len_ok(rx_sz, buf[2])) expected_size = rx_sz;
             break;
-        }
         default:
             // Unknown function code. Accept it on CRC alone — we cannot know its
             // expected length — so it reaches the dispatcher and gets a proper
@@ -808,6 +774,16 @@ void modbus_process(void) {
                                                         : (uint8_t)sizeof diag_last_fail;
             for (uint8_t i = 0; i < n; i++) diag_last_fail[i] = buf[i];
         }
+        // A queue frame addressed to US whose CRC was fine but whose length or
+        // flags did not agree.  Counted here rather than inside frame_is_valid
+        // so validation stays a predicate with no side effects, and counted
+        // separately from crc_error because they accuse different things: the
+        // line, versus the master's frame builder.  Without this the discard is
+        // wholly unobservable — the protocol requires it to look exactly like a
+        // dropped frame from the far end.
+        else if (rx_sz >= 4u && buf[0] == slave_addr && buf[1] == FC_QUEUE) {
+            diag_q_discard++;
+        }
         return_to_rx();   // discard + re-arm RX (clears frame_ready)
         return;
     }
@@ -816,17 +792,17 @@ void modbus_process(void) {
     no_response = (buf[0] == 0);
 
     // Anything not handled below gets ILLEGAL_FUNCTION, the standard Modbus
-    // reply: coils (FC01/FC05/FC0F), which are deliberately unsupported, and any
-    // unrecognised code, which frame_is_valid lets through on CRC alone so it can
-    // be answered rather than left to time out.
+    // reply: coils (FC01/FC05/FC0F), which are deliberately unsupported; the
+    // retired FC23 and draft FC66 queue paths, which a pre-v4 controller would
+    // still try (and which the version register at FC04 0x0200 is what it should
+    // be checking instead); and any unrecognised code, which frame_is_valid lets
+    // through on CRC alone so it can be answered rather than left to time out.
     switch (buf[1]) {
         case FC_READ_INPUT:        process_fc04(); break;
         case FC_READ_HOLDING:      process_fc03(); break;
         case FC_WRITE_SINGLE_REG:  process_fc06(); break;
         case FC_WRITE_MULTI_REG:   process_fc10(); break;
-        case FC_READ_WRITE_MULTI:  process_fc23(); break;
-        case FC_MBQ_ENQUEUE:       process_fc_enqueue(); break;
-        case FC_MBQ_STATUS:        process_fc_status(); break;
+        case FC_QUEUE:             process_fc_queue(); break;
         default:                   send_error(MB_ERR_ILLEGAL_FUNCTION); break;
     }
 

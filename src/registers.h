@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "errors.h"
-#include "mbq_slots.h"   // MBQ_SLOTS — the queue block sizes derive from it
 
 // ─────────────────────────────────────────────────────────────────────────────
 //                            MODBUS REGISTER MAP
@@ -14,28 +13,26 @@
 // FUNCTION (0x01). A client reading an unimplemented address is a version
 // mismatch and should fail loudly rather than receive plausible zeros.
 //
+// THE COMMAND QUEUE IS NOT IN THIS MAP. Under v4 it is reached only through
+// FC 0x41 (see QUEUE-PROTOCOL.md and modbus.c), which carries the command and
+// the ack as a payload rather than as register writes. The v2 submit window
+// (0x1000-0x1003) and slot status block (0x1010-0x1011) are RETIRED and now
+// return ILLEGAL DATA ADDRESS, in line with every previous retirement — see
+// DESIGN-HISTORY.md.
+//
 //  ADDRESS        FC              W  ACCESS  CONTENT
 //  ─────────────  ──────────────  ─  ──────  ──────────────────────────────────
-//  0x1000-0x1003  10, 23(write)   2  W       COMMAND block, MBQ_SLOTS(2) x 2 regs.
-//                                            0x1000+2*slot = one 32-bit opaque
-//                                            command. Writes cover 1..MBQ_SLOTS
-//                                            CONTIGUOUS slots, all-or-nothing:
-//                                            any targeted slot ACTIVE rejects
-//                                            the whole write DEVICE_BUSY (0x06).
-//                                            Write length is in REGISTERS —
-//                                            n_slots = wr_count / 2.
-//  0x1010-0x1011  03, 04, 23(rd)  1  R       STATUS block, one reg per slot:
-//                                            [status:8 | response8:8]. Served at
-//                                            the same numbers under holding and
-//                                            input, because FC23's read range is
-//                                            holding-only. Any 1..MBQ_SLOTS
-//                                            contiguous slots may be read.
 //  0x0200-0x020F  04             16  R       Version string. Read exactly 16.
 //  0x0300-0x030F  04             16  R       RX diagnostics. Read exactly 16.
 //  0x0310-0x0313  04              4  R       Sysinfo. Read exactly 4.
+//  0x0320-0x0327  04              8  R       Queue counters. Read exactly 8.
 //  0x1F02         03, 06          1  R/W     Modbus slave address, 1-247.
 //  0x1F03         03, 06          1  R/W     Baud index: 0=9600 1=19200 2=38400.
 //  0x1F05         06              1  W       System reset; write 0xA5A5.
+//
+// Every FC04 block read is EXACT-LENGTH: the counts above are the only ones
+// accepted, and any other count is ILLEGAL DATA ADDRESS rather than a short
+// read, so a client built against a different map fails loudly.
 //
 // Coils (FC01/FC05/FC0F) are not supported and return ILLEGAL FUNCTION.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,17 +66,47 @@
 // The uptime / boot-count / reset-reason values behind this block live in
 // sysinfo.{c,h} — they are properties of the chip having booted, not of the
 // register map.
-// dali_sync.{c,h} for the third.
 
-// ---- Command queue (see the map above; protocol in mbq_slots.h) -----------
-
-#define MBREG_SLOT_CMD_BASE         0x1000u  // slot 0 command
-// Derived, not hardcoded: the two ends must move together with MBQ_SLOTS, and a
-// stale literal here would silently accept writes into unbacked slots.
-#define MBREG_SLOT_CMD_END          (MBREG_SLOT_CMD_BASE + 2u * MBQ_SLOTS - 1u)
-
-#define MBREG_SLOT_STATUS_BASE        0x1010u  // slot 0 status
-#define MBREG_SLOT_STATUS_END         (MBREG_SLOT_STATUS_BASE + MBQ_SLOTS - 1u)
+// Queue counters (QUEUE-PROTOCOL.md §6).  Read EXACTLY 8 registers, big-endian,
+// 16-bit WRAPPING counters.  These are the whole cold-path observability story
+// for the queue: nothing rides the FC 0x41 reply beyond the protocol's own
+// bytes, because hot-path bytes are the scarce resource.  Read on demand from
+// the CLI or the bench, never polled hot.
+//
+//   reg0  0x0320  accepts        commands enqueued (A_ACCEPTED replies)
+//   reg1  0x0321  a_full         enqueues refused, queue full (A_FULL replies).
+//                                *** NON-ZERO IS A CANARY, NOT TRAFFIC. ***
+//                                A_FULL is UNREACHABLE in correct operation: the
+//                                master decrements its in-flight count only when
+//                                it SEES a result, while this gateway frees a
+//                                command slot the moment the command completes,
+//                                so the master's count always over-estimates our
+//                                occupancy — if it believes there is room, there
+//                                is.  A non-zero reading therefore means the
+//                                master's accounting has gone wrong, not that
+//                                the queue got busy.  Investigate it; do not
+//                                read it as back-pressure working
+//   reg2  0x0322  executes       commands handed to the DALI adapter
+//   reg3  0x0323  results        results pushed onto the response queue
+//   reg4  0x0324  acks           response entries popped by a matching ack
+//   reg5  0x0325  stalls         arbiter refusals caused by a FULL response
+//                                queue.  Unlike a_full, this one IS reachable in
+//                                normal operation — it is the backpressure rule
+//                                doing its job whenever the master stops acking,
+//                                so a non-zero value is not alarming by itself.
+//                                It is the counter the backpressure validation
+//                                gate reads to prove the rule engaged
+//   reg6  0x0326  q_discard      FC 0x41 frames dropped with no reply for a bad
+//                                length or a length/flag inconsistency.  Held
+//                                here rather than in the RX diagnostic block
+//                                because it is a protocol fact, not a line fact
+//   reg7  0x0327  spare          reads 0
+//
+// Steady-state sanity: accepts == executes == results == acks, each lagging the
+// one before it by at most the queue depths.  This layout is duplicated in the
+// controller's `mbq` stats parser and in CLAUDE.md — all three must move
+// together.
+#define FC04_QDIAG_BLOCK    0x0320u
 
 // ---- Config / action registers --------------------------------------------
 

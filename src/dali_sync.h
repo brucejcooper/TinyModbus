@@ -26,13 +26,16 @@
 #include <avr/io.h>
 
 #include "dali.h"
-#include "mbq_slots.h"
+#include "cq.h"
 
 // ---- DALI payload mapping (the ONLY DALI-specific part of the queue) -------
 //
-// How the queue's opaque 32-bit command is interpreted. This mapping is the
-// contract with the controller's DALI adapter (controller/src/dali_queue.c) and
-// MUST match it byte for byte.
+// How the queue's opaque 32-bit command is interpreted. This is the INTERNAL
+// command form, not the wire form: the FC 0x41 request packs its flags into the
+// top 3 bits of a byte shared with the ack sequence, and modbus.c normalises
+// them into the QF_* bits below before the command ever reaches the queue. That
+// boundary is deliberate — see queue_flags_to_qf() — and it is why nothing in
+// this file changed when the wire packing did.
 //
 //   byte 0  addr   DALI address byte — short address, group, broadcast (0xFE),
 //                  or a special command opcode (e.g. 0xA3 SET DTR0, or the
@@ -51,20 +54,20 @@ typedef struct {
 #define QF_DTR0    0x02u   // emit 0xA3<dtr0> back-to-back BEFORE the frame
 #define QF_ANSWER  0x04u   // expects a backward frame; capture the answer byte
 
-// Unpack a queue slot's opaque bytes into the DALI frame they describe.
-static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
+// Unpack a queued command's opaque bytes into the DALI frame they describe.
+static inline dali_frame_t dali_frame_of(const cq_cmd_t *c) {
     return (dali_frame_t){ .addr  = c->b[0], .data = c->b[1],
                            .flags = c->b[2], .dtr0 = c->b[3] };
 }
 
-// ---- DALI failure codes carried in a FAILED slot's response8 ---------------
-// (a COMPLETE slot's response8 is the backward-frame answer instead)
+// ---- DALI failure codes carried in an H_FAILED result's resp8 --------------
+// (an H_OK result's resp8 is the backward-frame answer instead)
 #define DALI_RESP_NAK        0x01u  // no/short backward frame where one was expected
 #define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
 #define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse, stuck bus)
 
-// True while this gateway is running a queued command — i.e. one slot is
-// MBQ_S_EXECUTING and we hold the wire for it, across the whole multi-frame
+// True while this gateway is running a queued command — i.e. one entry is
+// CQ_EXECUTING and we hold the wire for it, across the whole multi-frame
 // sequence including the quiet inter-frame gaps.
 //
 // Derived from the slot handle we need anyway, not a separate flag, so it cannot
@@ -73,9 +76,10 @@ static inline dali_frame_t dali_frame_of(const mbq_cmd_t *c) {
 // cannot answer, since the bus is quiet between frames of a send-twice.
 bool dali_sync_owns_channel(void);
 
-// Where the issuance state lives: the executing slot's 4-byte command, plus a
-// step counter inside dali_sync.c. Whether a command is in flight is answered by
-// dali_sync_owns_channel() rather than by a flag that could disagree with it.
+// Where the issuance state lives: the executing command's 4 bytes and its seq,
+// plus a step counter inside dali_sync.c. Whether a command is in flight is
+// answered by dali_sync_owns_channel() rather than by a flag that could disagree
+// with it.
 
 // Reset issuance state. Call once at boot.
 void dali_sync_init(void);

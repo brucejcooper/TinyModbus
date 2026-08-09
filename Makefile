@@ -16,7 +16,20 @@ endif
 PORT	   	= /dev/tty.usbserial-B0010TZE
 FILENAME   	= main
 export FW_VERSION=$(shell git describe --long --dirty --tags)
-COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=0 -DFW_VER_MINOR=2 -fstack-usage -ffunction-sections -fdata-sections
+# FW_VER_MAJOR/MINOR are the numbers in the FC04 0x0200 version string
+# ("DALI v<maj>.<min> <serial>"), and under queue v4 they are the QUEUE
+# GENERATION MARKER the controller latches on (QUEUE-PROTOCOL.md §8).
+#
+#   0.x  pre-v4: FC23 slot queue, or the never-deployed draft FC65/66
+#   1.0  queue v4: FC 0x41, response queue, ack-by-seq
+#
+# Bumped 0.2 -> 1.0 by task 08. v4 removes the fallback path, so controller and
+# gateway are a matched set and the controller must be able to refuse a
+# mismatched gateway loudly rather than limp; that needs an unambiguous,
+# monotone boundary, and MAJOR >= 1 is it. Do not bump MAJOR again for anything
+# short of another wire-breaking queue generation — the controller's
+# MBQ_GW_MIN_VER_MAJOR is keyed to it.
+COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=1 -DFW_VER_MINOR=0 -fstack-usage -ffunction-sections -fdata-sections
 LDFLAGS    	= -Wl,--gc-sections
 AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )
@@ -24,6 +37,12 @@ ASMSOURCES  = $(wildcard src/*.S )
 OBJECTS    	= $(subst src/,build/,$(subst .c,.o,$(CSOURCES))) # $(subst src/,build/,$(subst .S,.o,$(ASMSOURCES)))
 # OBJECTS = build/main.o build/timers.o
 export PATH := $(shell pwd)/$(AVR_GCC_DIR)/bin:$(PATH)
+
+# None of these name a real file, and two of them — `build` and `test` — share a
+# name with a DIRECTORY, so without this make treats those directories as the
+# targets and does nothing while exiting 0.  `build` only escaped that today by
+# accident, because its `prepare` prerequisite always reruns.
+.PHONY: all download_gcc prepare build test erase flash get_config configure reset clean
 
 all: clean build erase flash
 
@@ -40,7 +59,27 @@ build/%.o: src/%.S
 
 prepare:
 	mkdir -p build
-	
+
+# Host unit tests.  NOT part of `build` or `all`: these are host binaries, built
+# with the SYSTEM compiler, not the AVR toolchain.  `cc` is safe despite the PATH
+# override above — avr/bin ships only avr-* prefixed binaries, nothing that
+# shadows it.
+#
+# This target is gate V5's evidence, not a convenience.  Task 08 deliberately
+# moved malformed-frame validation off the bench and into cq_test.c, because the
+# rig has no independent RS-485 master to inject bad frames with, so "the host
+# test passes" is the only proof that gate has.  It therefore has to be
+# reproducible and it has to fail loudly: cc failure or a non-zero exit from the
+# binary both fail the make.
+#
+# Note .PHONY below — without it this target is shadowed by the test/ DIRECTORY
+# and `make test` reports "Nothing to be done" while exiting 0, which is a
+# clean-looking pass having run nothing at all.
+HOSTCC ?= cc
+test: prepare
+	$(HOSTCC) -Wall -Wextra -I src -o build/cq_test test/cq_test.c src/cq.c src/errors.c
+	./build/cq_test
+
 build: prepare $(OBJECTS)
 	$(COMPILE) $(LDFLAGS) -o build/$(FILENAME).elf $(OBJECTS)
 	avr-objcopy -R .eeprom -R .lock -R .signature -R .user_signatures -O ihex build/$(FILENAME).elf build/$(FILENAME).hex

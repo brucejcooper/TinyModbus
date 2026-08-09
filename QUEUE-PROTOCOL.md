@@ -297,9 +297,37 @@ result died with the reboot" cannot be excluded. Idempotent commands just
 resend. This is the entire residual cost of dropping the hot-path boot byte:
 one cold-path register read, on a double-fault, for one command class.
 
-**Controller reboot:** drain the slave — poll, ack whatever head appears,
-repeat until empty — then start fresh. Stale acks from the dead controller
-epoch are harmless by the mismatch-is-a-no-op rule.
+**Controller reboot: drain, wait, drain again.** Poll and ack whatever head
+appears until the queue reads empty; then **wait one `RESULT_DEADLINE_MS` and
+drain again** before submitting anything. The second pass is not belt-and-
+braces. A command accepted by the gateway before the controller died is still
+executing, and its result will land in the response queue *after* the first
+drain — where the fresh controller, tracking nothing, would read it as "a seq I
+am not tracking" and fire R3, declaring a gateway reboot that did not happen
+(and disposing of whatever it had just submitted). The wait bounds this: the
+gateway holds at most `CMDQ_DEPTH` commands and each completes within a frame
+time, so nothing from the dead epoch can survive `RESULT_DEADLINE_MS` of
+draining. A response queue that was *full* when the controller died stalls the
+arbiter, but the first drain unstalls it, which is why the wait comes after.
+
+Stale acks from the dead epoch are harmless by the mismatch-is-a-no-op rule.
+
+**The predicted seq is derived from the last *observed* accept, never from a
+locally maintained counter.** The two differ after a reboot the master did not
+notice: the gateway's counter restarts at 1 while a local mirror would run on.
+Taking the prediction from the last accept byte actually seen makes an
+unnoticed reboot self-correcting — the first normal reply re-baselines it — and
+is why an unnoticed reboot with an empty queue is harmless rather than a latent
+mis-binding.
+
+**Not every gateway reboot is detected by these rules, and that is correct.** A
+reboot with nothing in flight and nothing unacked destroys nothing, so no rule
+fires and none needs to. Reboot *counting* for diagnostics is a separate,
+already-existing mechanism: `dirty_poll` reads sysinfo `boot_count` every
+`gw_diag_interval_ms` (30 s default) and publishes it to HA. The §4 rules are
+the safety *detector* for in-flight work; the diag poll is the *counter*. Do
+not conflate them, and do not add a hot-path reboot field to serve the counter
+— that was v3's `boot8`, and this is why v4 does without it.
 
 ---
 

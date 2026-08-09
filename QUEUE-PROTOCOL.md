@@ -312,6 +312,21 @@ arbiter, but the first drain unstalls it, which is why the wait comes after.
 
 Stale acks from the dead epoch are harmless by the mismatch-is-a-no-op rule.
 
+**Before the first accept byte is observed there is no baseline, and the master
+must not pretend otherwise.** The gateway's counter is wherever its uptime left
+it; a freshly started controller cannot know it. So until a slave's first
+accept byte arrives, that slave is in a **no-baseline** state where:
+
+- prediction is unavailable, so a lost reply to that first enqueue resolves
+  conservatively — idempotent commands resend, non-idempotent ones are disposed
+  `LOST`. (Once per controller start, and only if that one reply is lost.)
+- a head bearing an untracked seq is **consumed and discarded**, not read as
+  R3. It is a leftover from the previous controller epoch, which is the norm
+  here, not evidence of a gateway reboot.
+
+The state ends at the first accept byte. In practice the drain-wait-drain above
+usually ends it sooner, and it costs nothing when it doesn't.
+
 **The predicted seq is derived from the last *observed* accept, never from a
 locally maintained counter.** The two differ after a reboot the master did not
 notice: the gateway's counter restarts at 1 while a local mirror would run on.

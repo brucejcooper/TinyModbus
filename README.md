@@ -452,7 +452,7 @@ accepted, and any other count is ILLEGAL DATA ADDRESS rather than a short read.
 | `0x0320–0x0327` | 04 | 8 regs | **Queue counters** (new in v4). Read exactly 8 — see "Queue diagnostics" below. |
 | `0x1F02` | 03, 06 | 1 reg | Modbus slave address (1–247). USERROW-persisted, applied on reboot. |
 | `0x1F03` | 03, 06 | 1 reg | Baud index: 0 = 9600, 1 = 19200, 2 = 38400. USERROW-persisted, applied after the ACK. |
-| `0x1F05` | 06 | 1 reg | System reset. Write `0xA5A5` to force a software reset once the ACK has left the wire. Any other value → ILLEGAL DATA ADDRESS. |
+| `0x1F05` | 06 | 1 reg | System reset. Write `0xA5A5` to force a software reset once the ACK has left the wire. Any other value → ILLEGAL DATA **VALUE** (0x03) — the register exists, the value was wrong (`registers.c` returns `TM_ERR_BAD_VALUE`). |
 
 **Retired — all return ILLEGAL DATA ADDRESS:**
 

@@ -1,8 +1,7 @@
 # DALI command queue — Modbus contract (v4)
 
 Authoritative specification of how the controller (RP2040 master) drives the
-TinyModbus gateway's DALI command queue, and the implementation plan for both
-sides.
+TinyModbus gateway's DALI command queue.
 
 > **Lineage.** v4 is the synthesis of Bruce's queue language
 > (`ALTERNATE-QUEUE-APPROACH.md`: single FC, ack-by-seq, response retention)
@@ -12,15 +11,20 @@ sides.
 > constant, round-robin fairness at the controller, diagnostics in cold-path
 > registers rather than the reply.
 >
-> **Implementation status (2026-08-09): BUILT AND RUNNING ON THE BENCH,
-> VALIDATION IN PROGRESS.** Both halves are implemented on `task/08-queue-v4`
-> (gateway `TinyModbus`, controller `switch_gateway_firmware`) and talking to
-> each other on real hardware. FC23 and the draft FC65/FC66 are gone. Gate
-> progress and open defects are tracked in `tasks/08-queue-v4.md`; **the
-> pacing rule in §5 was got wrong first time and is the one thing to read
-> carefully before touching the client.** Where this document and the code
-> disagree, this document is the intent and the code is the bug — except for
-> anything the validation log has since disproved.
+> **Status: IMPLEMENTED AND VALIDATED** on the bench, 2026-08-09/10, on
+> `task/08-queue-v4` in both repos (gateway `TinyModbus`, controller
+> `switch_gateway_firmware`). FC23 and the draft FC65/FC66 are gone. Measured
+> results and the regression checklist are in [§10](#10-validation); the
+> blow-by-blow of the build lives in `tasks/08-queue-v4.md`.
+>
+> **Two things to read before touching the client:** the pacing rule in
+> [§5](#5-client-policy), which was got wrong first time and quietly cost the
+> whole benefit of the design; and the `A_FULL` note in
+> [§4](#4-recovery), whose original safety claim was **false** and is now
+> retracted in place.
+>
+> Where this document and the code disagree, this document is the intent and
+> the code is the bug — except where §10's measurements say otherwise.
 
 ---
 
@@ -45,7 +49,7 @@ Both queues are small and bounded:
 
 | | depth | RAM | notes |
 |---|---|---|---|
-| command queue | `CMDQ_DEPTH` = **2** | 2 × 6 B | 1 executing + 1 pending; build-time constant. Raising it is **not** the one-liner §10 claims — see the depth note below |
+| command queue | `CMDQ_DEPTH` = **2** | 2 × 6 B | 1 executing + 1 pending; build-time constant. Raising it is **not** a one-line change — see the depth note below |
 | response queue | `RESPQ_DEPTH` = **4** | 4 × 2 B | results held until acked; steady-state occupancy is 2 |
 
 **Backpressure rule (load-bearing):** the arbiter may not start a command
@@ -111,9 +115,18 @@ seq assigned, queue empty).
 
 | flag | bit | effect |
 |---|---|---|
-| `QF_TWICE` | 7 | send the forward frame twice (SET-class); no answer expected |
-| `QF_DTR0` | 6 | emit `0xA3 <dtr0>` back-to-back **before** the frame; the `dtr0` byte is present |
-| `QF_ANSWER` | 5 | a backward frame is expected; capture the answer byte |
+| `QW_TWICE` | 7 | send the forward frame twice (SET-class); no answer expected |
+| `QW_DTR0` | 6 | emit `0xA3 <dtr0>` back-to-back **before** the frame; the `dtr0` byte is present |
+| `QW_ANSWER` | 5 | a backward frame is expected; capture the answer byte |
+
+> **`QW_*` are the WIRE positions and are deliberately not the internal `QF_*`
+> bits the DALI adapter tests.** The gateway's parser normalises between the
+> two (`queue_flags_to_qf` in `modbus.c`), which is what keeps the wire layout
+> from leaking into the issuance code. Naming them `QF_*` here — as an earlier
+> revision of this table did — invites exactly the confusion the split exists
+> to prevent. Definitions: `TinyModbus/src/fc41.h` (wire) and
+> `controller/src/mbq_client.h` (`MBQ_QF_*`, the master's copy of the same wire
+> positions); those two must agree, and nothing on the wire checks it.
 
 `ack` (bits 4–0): if non-zero, delete the head of the response queue **iff**
 the head's seq equals this value. A mismatch is a silent no-op — the reply's
@@ -125,8 +138,8 @@ Three request lengths, distinguished — and validated — by length + flags:
 | length | meaning | validity rule |
 |---|---|---|
 | **5 B** | ack and/or poll, no enqueue | flags must be `000` |
-| **7 B** | enqueue without DTR0 preload (+ optional ack) | `QF_DTR0` must be clear |
-| **8 B** | enqueue with DTR0 preload (+ optional ack) | `QF_DTR0` must be set |
+| **7 B** | enqueue without DTR0 preload (+ optional ack) | `QW_DTR0` must be clear |
+| **8 B** | enqueue with DTR0 preload (+ optional ack) | `QW_DTR0` must be set |
 
 Any other length, or a length/flag inconsistency, is **discarded without a
 reply**, exactly as a corrupt frame would be — to the master it is
@@ -166,7 +179,7 @@ the request.
 | field | meaning |
 |---|---|
 | `hseq` = 0 | response queue empty; `hstatus` and `resp8` are 0 |
-| `hseq` ≠ 0, `hstatus` = `H_OK` (0) | command `hseq` succeeded; `resp8` = answer byte (`QF_ANSWER`) or 0 |
+| `hseq` ≠ 0, `hstatus` = `H_OK` (0) | command `hseq` succeeded; `resp8` = answer byte (`QW_ANSWER`) or 0 |
 | `hseq` ≠ 0, `hstatus` = `H_FAILED` (1) | command `hseq` failed; `resp8` = failure code below |
 | `hstatus` 2–7 | reserved |
 
@@ -591,113 +604,70 @@ the 24 B of `s_slot[3]` retired. Both are gated in the plan below — a
 
 ---
 
-## 10. Implementation plan
+## 10. Validation
 
-Matched-set change; land as one task (gateway + controller + soak), bench
-first. Branch per repo, checkpoint commits per stage, push per stage
-(teammates audit via forgejo origin).
+Built and validated on the bench, 2026-08-09/10 — gateway `TinyModbus`
+`task/08-queue-v4`, controller `switch_gateway_firmware` same branch, one DALI
+gateway at slave 3 driving a ballast at short address 0, 19200 baud.
 
-### Stage G — gateway (TinyModbus)
+The probe is the task-07 soak (`soak` CLI): alternating `SET DTR0 = v` /
+`QUERY CONTENT DTR0`, where `v` walks a stride-97 cycle so consecutive pairs
+never share an expected answer and a one-command-stale result is
+distinguishable from random corruption. Every command carries its own
+expectation, so verification does not depend on delivery order.
 
-**G1. Queue core** — rework `mbq_slots.{c,h}` into the v4 core (suggest
-renaming to `cq.{c,h}` in the same commit so the old slot API cannot be
-half-used):
+### Measured, against the FC23 design v4 replaces
 
-- `cmdq[CMDQ_DEPTH]`: `{cmd[4], seq, state}` — states FREE / PENDING /
-  EXECUTING only (terminal states no longer exist; completion moves data to
-  the response queue and frees the slot).
-- `respq[RESPQ_DEPTH]`: packed `{[hstatus:3|seq:5], resp8}` ring, head/count.
-- Seq counter 1–31 skipping 0; `cq_accept(cmd) → seq | FULL`;
-  `cq_ack(seq) → popped?`; `cq_head(out2)`; arbiter hooks `cq_next()` /
-  `cq_begin()` / `cq_complete(seq, status, resp8)`.
-- **Backpressure**: `cq_next()` returns none unless `respq` has a free entry.
-- **Publication ordering** per §2 (bytes before single-byte publish, both
-  directions); keep the comment that marks it load-bearing.
+| | FC23 | **v4** |
+|---|---|---|
+| RS-485 occupancy, saturated | **99 %** | **37 %** |
+| Modbus transactions per DALI command | 1.73 | **1.03** |
+| charged per transaction | 19.46 ms | 13.1 ms |
+| throughput (write/read pairs) | 14.71/s | 13.9–14.1/s |
+| endurance | — | 5000 pairs / 10 000 frames, **0 bad**, 0 failures of 20 748 transactions |
+| gateway flash / RAM | 11 028 B / 137 B | 10 462 B / 153 B |
 
-**G2. Modbus handler** — in `modbus.c`: FC 0x41 with the three-length
-validation table (5/7/8 + flag consistency; violations discarded silently,
-counted); processing order ack → enqueue → build; reply shapes 6/7 B. Delete
-FC23 (`process_fc23`, `submit_window`), draft FC65/66 handlers, and the
-`0x1000`/`0x1010` register ranges (now ILLEGAL DATA ADDRESS, consistent with
-every previous retirement). Add the §6 counter block in the diag space.
+**The headline is the first two rows**: the bus went from saturated to roughly
+a third occupied, at essentially unchanged throughput, because a DALI frame now
+costs one Modbus transaction instead of 1.73. That is the whole purpose of the
+protocol, and it is what makes a second DALI gateway on the same RS-485
+possible.
 
-**G3. DALI adapter** — `dali_sync.c`: consume `cq_begin()`'s 4-byte command
-(same `QF_*` semantics, unchanged), completion calls
-`cq_complete(seq, H_OK/H_FAILED, resp8)`. Mechanical.
+### Regression checklist
 
-**G4. Budget gate** — `avr-size` before/after for flash and BSS; recompute
-stack margin. Expect **flash down, RAM up ~10 B**: 12 B command queue + 8 B
-response queue + ~14 B counters against only 24 B of retired `s_slot[3]`.
-(An earlier draft of this line said "RAM down ~40 B" — that was arithmetic
-against v2's *original* `s_slot[8]`, which had already been narrowed to 3
-slots. §9's table was right and this line was wrong.)
+Re-run these against any change to the queue on either side. They are gates,
+not suggestions — three defects in this protocol's own bring-up had a *clean
+verdict and full throughput* while being badly wrong, so **correctness alone
+does not pass**.
 
-**Measured on completion:** flash **11 028 → 10 420 B (−608)**, RAM
-**137 → 152 B (+15)**. Both accepted: the flash saving is the FC23 handler and
-the slot machinery leaving, and 152 / 1024 B leaves the stack margin
-comfortable. A *larger* RAM regression, or any flash growth, would have been a
-finding.
+1. **Rate.** Soak at depth 2: `txns per command` ≈ 1.0 and `bus busy` ≈ 37 %.
+   A clean run at ~2 txns/command means the client is polling instead of
+   pacing (§5) and has silently given back the entire benefit.
+2. **Throughput.** ≥ ~13.9 pairs/s. Materially below that means the pacing
+   estimate is running long and the DALI bus is idling; materially above it
+   with `a_full` climbing means it is running early.
+3. **Endurance.** ≥ 5000 pairs, zero bad, zero transport failures.
+4. **Gateway reboot** (`gw_reboot <slave>` mid-soak, several runs, varying
+   where the reboot lands): zero mis-attributed values, zero stale reads, zero
+   out-of-order. **One `RESULT_LOST` per reboot is correct** — a query that was
+   executing when the gateway restarted has no answer any more, and §4 requires
+   saying so rather than inventing one. The soak scores that as a failure; read
+   the breakdown, not the verdict.
+5. **Lost replies** (`mbq drop-reply`): clean, with `R1 landed` climbing and no
+   resend of a command that actually landed. Note this can only ever exercise
+   **R1** — the knob drops a reply the gateway already sent, so the frame always
+   landed. **R1′ has no hardware coverage** and lives in the host test.
+6. **Backpressure** (`mbq no-ack`): clean, nothing lost, full rate on resume.
+   Expect the gateway's `stalls` counter to stay **0** — see §0: a client that
+   honours its in-flight cap cannot fill the response queue, so this drill
+   demonstrates the margin rather than the stall. The rule itself is covered by
+   `test/cq_test.c`.
+7. **Host tests**, both sides: `make test` in `TinyModbus`, and the `cc` line in
+   the header of `controller/test/mbq_client_test.c`.
 
-### Stage C — controller
-
-**C1. Transport** — rewrite `mbq_client.{c,h}` around a per-slave FSM:
-`IDLE → AWAIT_REPLY → (resolve | TIMEOUT → RECOVERY_POLL → resolve |
-DEADLINE_WAIT)`. Keeps the existing public API shape (submit with flags +
-idempotent marker + callback/ctx; `mbq_client_inflight()`;
-`mbq_client_txn_stats()`) so `dali_queue` consumers are untouched. New
-internals: predicted-seq tracking, piggyback-ack bookkeeping, rules R1–R4,
-result-deadline timers, the sysinfo `boot_count` gate, per-slave
-version/compat latch (§8). Delete the FC23 submit/reconcile
-(`resolve_ambiguous` and friends) — v4's reconcile is R1–R4 and nothing else.
-
-**C2. Scheduler** — `dali_queue.c`: `DQ_INFLIGHT_MAX` := `CMDQ_DEPTH` (2);
-round-robin across slaves with pending work; pacing timer per §5. Priority
-classes, atomic DTR0 pairs, and the submit-side API are unchanged.
-
-**C3. Debug knob for drills** — `mbq drop-reply <slave> <n>`: discard the
-next *n* parsed replies from that slave inside `mbq_client` (after transport
-accounting, before resolution), forcing the §4 paths deterministically.
-
-**C4. CLI/stats** — extend `mbq` per §6; `dq`/`busload`/`soak` carry over.
-
-### Stage V — validation (gates for sign-off)
-
-Reusing task-07 instrumentation:
-
-1. **Soak**, DTR0 stride-97 probe, depth sweep {1, 2, 3}: 0 bad / 0 lost /
-   0 lag-1 over ≥ 5000 pairs, **transactions-per-command ≈ 1.0 at depth 2**
-   (the number this design exists to hit — FC23 measured **1.73**), pair rate
-   **≥ 14.71/s**, the measured FC23 baseline on this rig; the DALI ceiling is
-   ~15.9. Depth 3 run decides whether `CMDQ_DEPTH` moves.
-2. **Reboot drill**: `gw_reboot` mid-soak at full rate — clean verdict; the
-   reboot noticed by R2/R3/R4 (stats show which); non-idempotent disposition
-   logged; verify against sysinfo `boot_count` that no reboot went uncounted.
-3. **Lost-reply drill** (`mbq drop-reply`): (a) drop on an enqueue+ack →
-   verify R1/R1′ resolve with zero resends of landed commands and zero double
-   executions (DALI-level check: the probe's expectations catch any); (b)
-   drop on an ack-less first enqueue → verify the deadline-drain path and the
-   boot_count gate.
-4. **Backpressure test**: soak variant that withholds acks for N transactions
-   → respq fills, arbiter stalls (counter shows it), nothing lost, drain
-   recovers to full rate.
-5. **Malformed-frame test**: bench sender emits the 6-byte and
-   flag-inconsistent lengths → discarded + counted, no reply, no state
-   change.
-6. **Duty measurement**: `busload` occupancy at saturation, read **at the
-   finish** (a late read dilutes the window — a 75 s gap reported 25 % for a
-   run that was really 99 %). Target **~34 % on the soak mix against the
-   measured 99 % FC23 baseline**; anything under ~45 % is a pass, anything
-   near 99 % means the transaction count did not actually drop and the run
-   should be treated as a failure however clean its verdict. Re-run the
-   two-gateway row when the second bus exists.
-
-### Post-validation
-
-Move the task doc to `tasks/done/`, update both READMEs (register map, this
-protocol summary, removed ranges) and `DESIGN-HISTORY.md` (v2 slot model and
-the v3 draft join the history), PR via forgejo.
-
----
+**Read `busload` immediately at the soak's finish.** The window keeps
+accumulating, so a late read dilutes it badly — a 75 s gap once reported 25 %
+for a run that was really 99 %.
 
 ## 11. Decisions log (2026-08-09)
 

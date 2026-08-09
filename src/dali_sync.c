@@ -7,11 +7,11 @@
  * group membership, commissioning — so the gateway holds nothing a reboot could
  * lose.
  *
- * Concurrency: the queue's terminal write (mbq_complete —
- * response8 BEFORE status) runs in the LVL1 DALI completion handler, and
- * mbq_read_status fences each slot's read. start_next_dali_work commits its
- * launch under a brief ATOMIC re-check against the LVL0 idle-timer / PIT / edge
- * callbacks.
+ * Concurrency: the queue's completion write (cq_complete — the result's bytes
+ * BEFORE the counter that publishes them) runs in the LVL1 DALI completion
+ * handler; everything else here runs in main context. start_next_dali_work
+ * commits its launch under a brief ATOMIC re-check against the LVL0 idle-timer /
+ * PIT / edge callbacks.
  */
 
 #include <avr/io.h>
@@ -22,16 +22,21 @@
 #include "errors.h"
 #include "dali.h"
 #include "registers.h"
-#include "mbq_slots.h"
+#include "cq.h"
 #include "tick.h"
 
 
-// The slot we are running and its unpacked command [addr, data, flags, dtr0].
-// MBQ_NONE means we own nothing — so this handle, which we need anyway to call
-// mbq_complete, IS the "is a command in flight" flag. No separate bool can
-// disagree with it, and the queue's own MBQ_S_EXECUTING remains the truth.
-static uint8_t s_raw_slot = MBQ_NONE;
-static mbq_cmd_t s_raw_cmd;
+// The command we are running: its queue index, its seq, and its unpacked bytes
+// [addr, data, flags, dtr0]. CQ_NONE means we own nothing — so this handle, which
+// we need anyway, IS the "is a command in flight" flag. No separate bool can
+// disagree with it, and the queue's own CQ_EXECUTING remains the truth.
+//
+// The SEQ, not the index, is what completion is reported against: a seq names
+// one command for its whole life, where an index names a reusable slot, so a
+// completion can never be attributed to whatever was enqueued after it.
+static uint8_t s_cq_idx = CQ_NONE;
+static uint8_t s_cq_seq = CQ_SEQ_NONE;
+static cq_cmd_t s_raw_cmd;
 
 // Where we are in the executing command. Meaningless unless we own the channel.
 // Together
@@ -39,12 +44,13 @@ static mbq_cmd_t s_raw_cmd;
 static volatile dali_step_t s_step;
 
 void dali_sync_init(void) {
-    s_raw_slot = MBQ_NONE;
-    mbq_init();
+    s_cq_idx = CQ_NONE;
+    s_cq_seq = CQ_SEQ_NONE;
+    cq_init();
 }
 
 bool dali_sync_owns_channel(void) {
-    return s_raw_slot != MBQ_NONE;
+    return s_cq_idx != CQ_NONE;
 }
 
 // ---- Dispatch ---------------------------------------------------------
@@ -112,18 +118,24 @@ bool start_next_dali_work(void) {
     uint8_t old_tcb = TCB0.INTCTRL;
     TCB0.INTCTRL = 0;   // fence the LVL1 completion handler across the selection
 
-    uint8_t slot = mbq_next_pending();
-    if (slot != MBQ_NONE) {
+    // cq_next() also enforces the protocol's backpressure rule: it returns
+    // CQ_NONE when the response queue is full even though a command is pending,
+    // so a master that stops acking stalls DALI here rather than causing a result
+    // to be dropped. From this function's point of view that is simply "no work
+    // available", and the stall is counted in the queue's own diagnostics.
+    uint8_t idx = cq_next();
+    if (idx != CQ_NONE) {
         // THE ONLY INTERRUPT FENCE LEFT IN THE QUEUE PATH, and it guards
-        // dali_bus_busy, not the slots. mbq_slots.c needs none — its write
-        // ordering carries the invariant (see that file's header) — but this is a
-        // genuine test-and-set: between reading "bus free" and committing the
-        // launch, an LVL0 callback (idle timer, PIT, or the rising-edge monitor
-        // firing because someone else took the line) can set dali_bus_busy. Losing
-        // that race means transmitting on top of another sender.
+        // dali_bus_busy, not the queue. cq.c needs none — its single-writer rule
+        // and write ordering carry the invariant (see that file's header) — but
+        // this is a genuine test-and-set: between reading "bus free" and
+        // committing the launch, an LVL0 callback (idle timer, PIT, or the
+        // rising-edge monitor firing because someone else took the line) can set
+        // dali_bus_busy. Losing that race means transmitting on top of another
+        // sender.
         //
-        // Kept deliberately short for the reason mbq_slots.c has none at all: a
-        // long cli here starves the USART RX FIFO. TCB0.INTCTRL above fences LVL1
+        // Kept deliberately short for the reason cq.c has none at all: a long cli
+        // here starves the USART RX FIFO. TCB0.INTCTRL above fences LVL1
         // separately, so this block only has to exclude LVL0.
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             if (!dali_bus_busy && !dali_sync_owns_channel()) {
@@ -131,11 +143,11 @@ bool start_next_dali_work(void) {
                 // committed launch with no command would put the previous frame
                 // back on the bus. Record it — nothing above can act on it — and
                 // leave the line parked for the next selection.
-                if (mbq_begin(slot, &s_raw_cmd) != TM_OK) {
-                    tm_fault(TM_SITE_MBQ_BEGIN, TM_ERR_BAD_SLOT);
+                if (cq_begin(idx, &s_raw_cmd, &s_cq_seq) != TM_OK) {
+                    tm_fault(TM_SITE_CQ_BEGIN, TM_ERR_BAD_SLOT);
                     goto no_launch;
                 }
-                s_raw_slot = slot;          // we now own the channel
+                s_cq_idx = idx;             // we now own the channel
                 // A command without QF_DTR0 has no preload step to run.
                 s_step = (dali_frame_of(&s_raw_cmd).flags & QF_DTR0)
                              ? DALI_STEP_DTR0 : DALI_STEP_FRAME;
@@ -155,10 +167,10 @@ no_launch: ;
         if (dali_is_bus_active()) dali_wait_for_idle_state_enter();
         else                      dali_sync_dispatch_current();
     }
-    // Work existed if a slot was pending, whether or not we managed to launch it
-    // (the ATOMIC re-check can lose the bus, and mbq_begin can refuse). Either
+    // Work existed if the queue offered one, whether or not we managed to launch
+    // it (the ATOMIC re-check can lose the bus, and cq_begin can refuse). Either
     // way it is still queued, so the caller must not sleep on it.
-    return slot != MBQ_NONE;
+    return idx != CQ_NONE;
 }
 
 // ---- Completion handler (ISR context) ---------------------------------
@@ -175,26 +187,28 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             s_step = DALI_STEP_FRAME;
             more = true;
         } else {
-            // Terminal. Map the DALI outcome to the slot's (status, response8):
-            //   OK        -> COMPLETE, response8 = backward-frame answer (0 if none)
-            //   NAK       -> FAILED,   DALI_RESP_NAK
-            //   MALFORMED -> FAILED,   DALI_RESP_COLLISION
-            //   other     -> FAILED,   DALI_RESP_BUSFAULT
-            // mbq_complete writes response8 BEFORE status under the read fence,
-            // so a fenced reader never sees a terminal status with a stale value.
+            // Done. Map the DALI outcome onto the result (hstatus, resp8):
+            //   OK        -> H_OK,     resp8 = backward-frame answer (0 if none)
+            //   NAK       -> H_FAILED, DALI_RESP_NAK
+            //   MALFORMED -> H_FAILED, DALI_RESP_COLLISION
+            //   other     -> H_FAILED, DALI_RESP_BUSFAULT
             uint8_t st, r8;
-            if      (type == DALI_RESPONSE_OK)        { st = MBQ_S_COMPLETE; r8 = value; }
-            else if (type == DALI_RESPONSE_NAK)       { st = MBQ_S_FAILED;   r8 = DALI_RESP_NAK; }
-            else if (type == DALI_RESPONSE_MALFORMED) { st = MBQ_S_FAILED;   r8 = DALI_RESP_COLLISION; }
-            else                                      { st = MBQ_S_FAILED;   r8 = DALI_RESP_BUSFAULT; }
+            if      (type == DALI_RESPONSE_OK)        { st = H_OK;     r8 = value; }
+            else if (type == DALI_RESPONSE_NAK)       { st = H_FAILED; r8 = DALI_RESP_NAK; }
+            else if (type == DALI_RESPONSE_MALFORMED) { st = H_FAILED; r8 = DALI_RESP_COLLISION; }
+            else                                      { st = H_FAILED; r8 = DALI_RESP_BUSFAULT; }
             // ISR context: no caller to return to, and a dropped completion
-            // strands the slot EXECUTING until reboot. Record it so a stuck slot
-            // is diagnosable over Modbus instead of a mystery.
-            tm_fault(TM_SITE_MBQ_COMPLETE, mbq_complete(s_raw_slot, st, r8));
+            // strands the command EXECUTING until reboot. Record it so a stuck
+            // queue is diagnosable over Modbus instead of a mystery. The two
+            // failures get different sites because they accuse different things:
+            // BAD_SLOT is a lost completion, BUSY means the backpressure rule
+            // did not hold and a result was thrown away.
+            tm_err_t ce = cq_complete(s_cq_seq, st, r8);
+            tm_fault(ce == TM_ERR_BUSY ? TM_SITE_CQ_RESPQ : TM_SITE_CQ_COMPLETE, ce);
         }
     }
 
-    if (!more) s_raw_slot = MBQ_NONE;   // released; wait-for-idle re-parks us
+    if (!more) s_cq_idx = CQ_NONE;   // released; wait-for-idle re-parks us
 
     // Always go through the wait-for-idle gap. When we stay EXECUTING,
     // dali_idle_state_enter dispatches the next step via
@@ -203,17 +217,20 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
 }
 
 // Abort the in-flight command because the bus is unusable (stuck/shorted past
-// the escape timeout). The slot MUST be completed, not just abandoned: an
-// EXECUTING slot that never reaches a terminal leaves the controller waiting on
-// a command that will never finish. Reports a bus fault so the controller can
-// tell "the bus is broken" from "the ballast said no".
+// the escape timeout). The command MUST be completed, not just abandoned: an
+// EXECUTING entry that never produces a result leaves the controller waiting on
+// a command that will never finish — and under v4 it also pins the response
+// queue's backpressure reservation, so it would stall every command behind it.
+// Reports a bus fault so the controller can tell "the bus is broken" from "the
+// ballast said no".
 //
 // Deliberately does NOT re-enter the wait-for-idle path — the caller is already
 // in it and drives the transition itself.
 void dali_sync_abort_busfault(void) {
-    if (dali_sync_owns_channel())
-        tm_fault(TM_SITE_MBQ_COMPLETE,
-                 mbq_complete(s_raw_slot, MBQ_S_FAILED, DALI_RESP_BUSFAULT));
-    s_raw_slot = MBQ_NONE;
+    if (dali_sync_owns_channel()) {
+        tm_err_t ce = cq_complete(s_cq_seq, H_FAILED, DALI_RESP_BUSFAULT);
+        tm_fault(ce == TM_ERR_BUSY ? TM_SITE_CQ_RESPQ : TM_SITE_CQ_COMPLETE, ce);
+    }
+    s_cq_idx = CQ_NONE;
 }
 

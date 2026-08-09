@@ -84,7 +84,7 @@ typedef enum {
 // the whole 22 TE to every round trip the master sees.
 //
 // It says nothing about whether a command is in flight; the queue owns that, as
-// MBQ_S_EXECUTING, via dali_sync_owns_channel(). Between the frames of a
+// CQ_EXECUTING, via dali_sync_owns_channel(). Between the frames of a
 // send-twice the bus IS busy and a command IS in flight; while another master
 // sends, the bus is busy and no command is. Both facts are needed and neither
 // implies the other.

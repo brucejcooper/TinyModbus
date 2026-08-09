@@ -18,7 +18,16 @@
 #include "errors.h"
 #include <stdbool.h>
 
-#define MBQ_SLOTS      8u   // number of self-describing slots
+// Two slots is the whole queue: one EXECUTING, one staged as NEXT. Depth beyond
+// that buys nothing — the DALI bus runs one frame at a time, so extra slots only
+// sit idle — while it costs real bus time on EVERY transaction, because the
+// master reads the whole status block on each submit and each poll. At 19200 a
+// 2-slot status reply is 9 bytes (4.7 ms) against 21 bytes (10.9 ms) for 8, and
+// that reply is paid whether or not anything changed. The only requirement is
+// that the master refill the freed slot within one DALI frame time (~33 ms),
+// which one FC23 (submit + status read-back in a single transaction) does with
+// room to spare.
+#define MBQ_SLOTS      2u   // number of self-describing slots: EXECUTING + NEXT
 #define MBQ_CMD_BYTES  4u   // opaque command size (32-bit)
 #define MBQ_CMD_REGS   2u   // ...expressed in Modbus REGISTERS
 

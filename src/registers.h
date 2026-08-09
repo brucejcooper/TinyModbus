@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "errors.h"
+#include "mbq_slots.h"   // MBQ_SLOTS — the queue block sizes derive from it
 
 // ─────────────────────────────────────────────────────────────────────────────
 //                            MODBUS REGISTER MAP
@@ -15,20 +16,20 @@
 //
 //  ADDRESS        FC              W  ACCESS  CONTENT
 //  ─────────────  ──────────────  ─  ──────  ──────────────────────────────────
-//  0x1000-0x100F  10, 23(write)   2  W       COMMAND block, 8 slots x 2 regs.
+//  0x1000-0x1003  10, 23(write)   2  W       COMMAND block, MBQ_SLOTS(2) x 2 regs.
 //                                            0x1000+2*slot = one 32-bit opaque
-//                                            command. Writes cover 1..8
+//                                            command. Writes cover 1..MBQ_SLOTS
 //                                            CONTIGUOUS slots, all-or-nothing:
 //                                            any targeted slot ACTIVE rejects
 //                                            the whole write DEVICE_BUSY (0x06).
 //                                            Write length is in REGISTERS —
 //                                            n_slots = wr_count / 2.
-//  0x1010-0x1017  03, 04, 23(rd)  1  R       STATUS block, one reg per slot:
+//  0x1010-0x1011  03, 04, 23(rd)  1  R       STATUS block, one reg per slot:
 //                                            [status:8 | response8:8]. Served at
 //                                            the same numbers under holding and
 //                                            input, because FC23's read range is
-//                                            holding-only. Any 1..8 contiguous
-//                                            slots may be read.
+//                                            holding-only. Any 1..MBQ_SLOTS
+//                                            contiguous slots may be read.
 //  0x0200-0x020F  04             16  R       Version string. Read exactly 16.
 //  0x0300-0x030F  04             16  R       RX diagnostics. Read exactly 16.
 //  0x0310-0x0313  04              4  R       Sysinfo. Read exactly 4.
@@ -72,11 +73,13 @@
 
 // ---- Command queue (see the map above; protocol in mbq_slots.h) -----------
 
-#define MBREG_SLOT_CMD_BASE         0x1000u  // slot 0 command; block spans 0x1000-0x100F
-#define MBREG_SLOT_CMD_END          0x100Fu  // 8 slots × 2 registers, inclusive
+#define MBREG_SLOT_CMD_BASE         0x1000u  // slot 0 command
+// Derived, not hardcoded: the two ends must move together with MBQ_SLOTS, and a
+// stale literal here would silently accept writes into unbacked slots.
+#define MBREG_SLOT_CMD_END          (MBREG_SLOT_CMD_BASE + 2u * MBQ_SLOTS - 1u)
 
-#define MBREG_SLOT_STATUS_BASE        0x1010u  // slot 0 status; block spans 0x1010-0x1017
-#define MBREG_SLOT_STATUS_END         0x1017u  // 8 slots × 1 register, inclusive
+#define MBREG_SLOT_STATUS_BASE        0x1010u  // slot 0 status
+#define MBREG_SLOT_STATUS_END         (MBREG_SLOT_STATUS_BASE + MBQ_SLOTS - 1u)
 
 // ---- Config / action registers --------------------------------------------
 

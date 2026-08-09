@@ -236,11 +236,46 @@ and resolves every anomaly with these rules, applied to any reply:
 
 | # | observation | conclusion / action |
 |---|---|---|
-| **R1** | reply to an enqueue+ack lost → poll: head advanced past the acked seq | the lost frame **landed**; bind the command to the predicted seq (last accepted + 1, skipping 0) |
-| **R1′** | same, but head unchanged (still the seq the master tried to ack) | the lost frame **never arrived**; resend it verbatim — ack included — with no idempotency concern |
+| **R1** | reply to an enqueue+ack lost → recovery poll shows the head **no longer holding the acked seq** (and the reboot tests below do not fire) | the ack applied, therefore the whole frame **landed**; bind the command to the predicted seq, do **not** resend |
+| **R1′** | same, but the head **still holds** the seq the master tried to ack | the ack did not apply, therefore the frame **never arrived**; resend it verbatim — ack included — with no idempotency concern |
 | **R2** | an accept byte returns a seq the master still tracks | **gateway rebooted** (§2 proof); dispose all tracked commands (below), keep only the just-accepted one |
-| **R3** | head is empty when the master holds an unacked result, or holds a seq the master isn't tracking | **gateway rebooted** — an unacked head cannot disappear, and an unknown seq has no other source; dispose as below |
+| **R3** | the head holds a seq the master is not tracking, or the head is empty while the master holds a consumed-but-unacked result **and has no ack unresolved** | **gateway rebooted** — an unacked result cannot disappear, and an unknown seq has no other source; dispose as below |
 | **R4** | result deadline expires; a poll still shows no result for that seq | command lost to a reboot or a gateway wedge; read sysinfo `boot_count` (FC04, cold path) to classify and count it; dispose |
+
+### The lost-reply procedure, in evaluation order
+
+R1/R1′ and R3 can look at the *same* observation and disagree, so the order is
+part of the contract. On a timed-out request that carried an ack, poll once and
+take the **first** matching branch:
+
+1. head **still shows the acked seq** → **R1′**: never arrived, resend verbatim.
+2. head shows a seq the master is **not tracking** → **R3**: rebooted.
+3. head is **empty** → *ambiguous*: "the ack applied and the queue happened to
+   drain" and "a reboot wiped the queue" are indistinguishable from the head
+   alone. **Read sysinfo `boot_count`** (cold path, one extra transaction on a
+   path that is already exceptional): changed ⇒ **R3** reboot; unchanged ⇒
+   **R1** landed.
+4. head shows a **different seq the master is tracking** → **R1**: landed
+   (a reboot would have emptied the queue, so a tracked seq proves the epoch
+   survived). Deliver that result as usual.
+
+**The predicted seq is a prediction, and it is verified.** R1 binds the command
+to `last_accepted + 1` (skipping 0). When that result surfaces, its seq must
+equal the prediction; a mismatch is a **detected fault** — count it, log it, and
+dispose of the command per policy. It must never be silently accepted, because
+a silent mis-binding is precisely the result-misattribution class that took
+task 04 three fix cycles.
+
+> **Why R1 may assume the enqueue was *accepted* rather than `A_FULL`.** The
+> two are indistinguishable once the reply is lost — but `A_FULL` is
+> **unreachable** while the client honours its in-flight cap (§5). The client
+> decrements in-flight only on *seeing* a result, while the gateway frees a
+> command slot the moment the command completes; so the client's count is
+> always an over-estimate of gateway occupancy, and "the client believes there
+> is room" implies there *is* room. **`A_FULL` is therefore a canary, not
+> back-pressure: if one is ever observed, the client's accounting is wrong.**
+> Count it, log it loudly, and treat it as an anomaly — do not just pace and
+> resend as though it were routine.
 
 **Disposition on reboot/loss** (unchanged policy from v2/v3, drilled in task
 07): commands the *client* marked idempotent (queries, absolute SETs) are

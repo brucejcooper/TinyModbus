@@ -108,11 +108,26 @@
 #define CQ_SEQ_NONE  0u    // reserved seq: no ack requested, none assigned, empty
 #define CQ_SEQ_MAX   31u   // seq field is 5 bits; 0 is reserved, so 1..31
 
-// Response-queue entry status, the top 3 bits of a head byte. Generic, not DALI:
-// "the command finished" versus "it did not", with the payload byte carrying the
-// answer or the failure code respectively.
+// Response-queue entry status, the top 3 bits of a head byte. Generic, not DALI.
+// THREE outcomes, because "it answered" and "it did not" do not partition the
+// space — silence is sometimes the answer:
+//
+//   H_OK      the command did what it was asked. The payload byte carries the
+//             answer for a query, or 0 for a command that expects no reply.
+//   H_NAK     a command that EXPECTED a reply got none. A neutral FACT, not a
+//             verdict: this layer cannot know whether that means "the device is
+//             absent" or "the device said no", because only the issuer knows
+//             which kind of question it asked. Payload 0.
+//   H_FAILED  something broke — a garbled reply, a bus fault. The payload byte
+//             carries the failure code.
+//
+// H_NAK exists so H_FAILED means only breakage. Folding it into H_FAILED (as
+// this protocol did until 2026-08-13) makes the failure counters count normal
+// negative answers, and leaves "absent" and "said no" distinguishable only by
+// the issuer remembering which flags it set.
 #define H_OK         0u
 #define H_FAILED     1u
+#define H_NAK        2u
 
 // An opaque command. Deliberately a byte blob that this layer carries and never
 // interprets. The wrapper exists for TYPE SAFETY, not meaning — it stops a bare

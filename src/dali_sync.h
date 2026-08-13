@@ -61,8 +61,14 @@ static inline dali_frame_t dali_frame_of(const cq_cmd_t *c) {
 }
 
 // ---- DALI failure codes carried in an H_FAILED result's resp8 --------------
-// (an H_OK result's resp8 is the backward-frame answer instead)
-#define DALI_RESP_NAK        0x01u  // no/short backward frame where one was expected
+// (an H_OK result's resp8 is the backward-frame answer instead; H_NAK's is 0)
+//
+// 0x01 was DALI_RESP_NAK, retired 2026-08-13. "A query got silence" is now the
+// STATUS H_NAK, not a failure code, so keeping a failure code that says the
+// same thing would reintroduce exactly the ambiguity H_NAK removes — two
+// encodings for one outcome, differing only in whether the reader checks the
+// status or the payload. The value stays reserved rather than reused so a
+// mismatched old master decodes an unknown code instead of a wrong one.
 #define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
 #define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse, stuck bus)
 

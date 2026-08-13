@@ -190,13 +190,36 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             more = true;
         } else {
             // Done. Map the DALI outcome onto the result (hstatus, resp8):
-            //   OK        -> H_OK,     resp8 = backward-frame answer (0 if none)
-            //   NAK       -> H_FAILED, DALI_RESP_NAK
-            //   MALFORMED -> H_FAILED, DALI_RESP_COLLISION
-            //   other     -> H_FAILED, DALI_RESP_BUSFAULT
+            //   OK             -> H_OK,     resp8 = backward-frame answer
+            //   NAK + QF_ANSWER-> H_NAK,    resp8 = 0
+            //   NAK, no ANSWER -> H_OK,     resp8 = 0
+            //   MALFORMED      -> H_FAILED, DALI_RESP_COLLISION
+            //   other          -> H_FAILED, DALI_RESP_BUSFAULT
+            //
+            // The NAK split is the whole point. finished_transmission() reports
+            // DALI_RESPONSE_NAK for a command that never opened a response
+            // window at all, so "NAK" here covers two unrelated events:
+            //
+            //   a SET-class frame that completed normally, where no backward
+            //   frame was ever EXPECTED — that is a success, not a NAK, and
+            //   dali_sync.h's own definition of NAK says "where one was
+            //   expected"; and
+            //
+            //   a query that asked for an answer and heard silence — a real
+            //   NAK, reported as the neutral fact H_NAK.
+            //
+            // We deliberately do NOT decide what that silence MEANS. For a
+            // yes/no query (COMPARE, QUERY LAMP FAILURE) silence is the answer
+            // "no"; for a value query (QUERY ACTUAL LEVEL) it is evidence the
+            // gear is absent. Only the issuer knows which it sent, so the
+            // verdict belongs to the master and the fact belongs here.
             uint8_t st, r8;
             if      (type == DALI_RESPONSE_OK)        { st = H_OK;     r8 = value; }
-            else if (type == DALI_RESPONSE_NAK)       { st = H_FAILED; r8 = DALI_RESP_NAK; }
+            else if (type == DALI_RESPONSE_NAK)       {
+                bool expected = (dali_frame_of(&s_raw_cmd).flags & QF_ANSWER) != 0u;
+                st = expected ? H_NAK : H_OK;
+                r8 = 0;
+            }
             else if (type == DALI_RESPONSE_MALFORMED) { st = H_FAILED; r8 = DALI_RESP_COLLISION; }
             else                                      { st = H_FAILED; r8 = DALI_RESP_BUSFAULT; }
             // ISR context: no caller to return to, and a dropped completion

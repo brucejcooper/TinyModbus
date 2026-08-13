@@ -179,15 +179,42 @@ the request.
 | field | meaning |
 |---|---|
 | `hseq` = 0 | response queue empty; `hstatus` and `resp8` are 0 |
-| `hseq` ≠ 0, `hstatus` = `H_OK` (0) | command `hseq` succeeded; `resp8` = answer byte (`QW_ANSWER`) or 0 |
-| `hseq` ≠ 0, `hstatus` = `H_FAILED` (1) | command `hseq` failed; `resp8` = failure code below |
-| `hstatus` 2–7 | reserved |
+| `hseq` ≠ 0, `hstatus` = `H_OK` (0) | command `hseq` did what it was asked; `resp8` = answer byte (`QW_ANSWER`), or 0 when no answer was expected |
+| `hseq` ≠ 0, `hstatus` = `H_FAILED` (1) | command `hseq` broke; `resp8` = failure code below |
+| `hseq` ≠ 0, `hstatus` = `H_NAK` (2) | command `hseq` **expected** a backward frame and got silence; `resp8` = 0 |
+| `hstatus` 3–7 | reserved |
 
 | failure code | value | meaning |
 |---|---|---|
-| `DALI_RESP_NAK` | `0x01` | no (or too short) backward frame where one was expected |
+| *(`0x01` reserved)* | `0x01` | was `DALI_RESP_NAK`; retired 2026-08-13, see below |
 | `DALI_RESP_COLLISION` | `0x02` | garbled backward frame — two or more gear answered |
 | `DALI_RESP_BUSFAULT` | `0x03` | transport fault: short pulse, stuck bus |
+
+**`H_NAK` is a fact, not a verdict, and that is the whole point.** Silence on the
+DALI bus means different things depending on what was asked, and the gateway
+cannot know which:
+
+- a **yes/no query** (COMPARE, QUERY LAMP FAILURE) answers *yes* with a backward
+  frame and *no* by staying silent — so silence **is** the answer;
+- a **value query** (QUERY ACTUAL LEVEL) that hears silence got no answer at
+  all, which is evidence the gear is absent;
+- a command with **no `QW_ANSWER`** never expected a reply, so silence means
+  nothing happened that should not have. That is `H_OK`, not a NAK — this is
+  the case the old encoding got wrong.
+
+Only the master knows which question it asked, so the gateway reports the event
+and the master renders the verdict (`dq_yes_no()` on the controller side). Note
+that for a yes/no query a `DALI_RESP_COLLISION` is also *yes*: two or more gear
+answering at once is the normal case in the commissioning bisect, and a caller
+that treats it as an error breaks the binary search. A `DALI_RESP_BUSFAULT` is
+neither yes nor no — nothing was learned.
+
+Before 2026-08-13 there was no `H_NAK`: both cases above arrived as `H_FAILED`
+carrying `DALI_RESP_NAK`, so every fire-and-forget SET was reported as a
+failure, the failure counters counted normal outcomes, and "absent" and "said
+no" were distinguishable only by the submitter remembering which flags it had
+set. `0x01` stays reserved rather than reused so a mismatched old master decodes
+an unknown code instead of a wrong one.
 
 **No Modbus exceptions on this path.** Queue-full is in-band (`A_FULL`), which
 is what keeps the status delivery alive under back-pressure, and there is
@@ -469,10 +496,13 @@ Transport (`mbq_client`) and scheduler (`dali_queue`) split as today.
 - **No transport auto-retry of enqueue frames.** Timeout → §4. Poll/ack-only
   frames may retry freely (idempotent by construction — re-acking a popped
   seq is a no-op).
-- **Failure delivery verbatim.** `H_FAILED` + code goes to the submitter's
-  callback; retry policy belongs to the scheduler's priority classes (e.g.
-  one retry for an idempotent query on `BUSFAULT`, never for UP/DOWN), not to
-  the transport.
+- **Outcome delivery verbatim.** `H_OK`, `H_NAK` and `H_FAILED` + code each
+  reach the submitter's callback distinctly (`MBQ_R_COMPLETE`, `MBQ_R_NAK`,
+  `MBQ_R_FAILED`). The transport interprets none of them — collapsing `H_NAK`
+  into a failure would destroy information the producer cannot reconstruct,
+  since only it knows whether silence meant *no* or *absent*. Retry policy
+  belongs to the scheduler's priority classes (e.g. one retry for an idempotent
+  query on `BUSFAULT`, never for UP/DOWN), not to the transport.
 - **Dead-slave backoff** (task-07 finding): consecutive transaction timeouts
   put the slave on exponential poll backoff — the dead relay board was
   costing ~8 % of the bus in retry timeouts.

@@ -114,7 +114,28 @@ int main(void) {
         // moment a command completes its slot goes terminal (nothing queued)
         // while the 22 TE settle is still counting on TCA0. Sleeping there would
         // strand that countdown until the 1 Hz PIT happened to wake us.
-        if (!dali_work && modbus_idle)
+        if (!dali_work && modbus_idle) {
+            // SFDEN is armed ONLY across the sleep, per the tinyAVR silicon
+            // erratum "Start-of-Frame Detector Can Be Unintentionally
+            // Triggered": with SFDEN set in ACTIVE mode, reading RXDATA while
+            // the next byte is already arriving clears RXCIF, which falsely
+            // re-triggers the start detector and RESTARTS frame reception —
+            // corrupting the byte. That is a framing error on a signal that is
+            // electrically perfect, which is exactly what the bench capture
+            // showed.
+            //
+            // It needs DALI running to bite because DALI ISR latency is what
+            // delays our RXC ISR until the RXDATA read lands inside the next
+            // character instead of in the gap before it; and it hurts 38400
+            // ~6.5x more than 19200 because that gap is half as wide.
+            //
+            // The erratum's workaround carries a caveat: SFDEN must not be
+            // re-enabled while a frame is incoming. modbus_idle is exactly that
+            // guarantee — it is false from the first byte of a frame until the
+            // frame is disposed of — so this gate is the safe place to arm it.
+            USART0.CTRLB |= USART_SFDEN_bm;
             sleep_cpu();
+            USART0.CTRLB &= ~USART_SFDEN_bm;
+        }
     }
 }

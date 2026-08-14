@@ -45,9 +45,12 @@ static const uint16_t s_baud_reg[] = {
 // leaves a marginal link marginal).
 //
 // Sign convention: a positive error means the oscillator runs fast, so the
-// divisor scales up to compensate.  VERIFY ON THE BENCH — scope the slave's TX
-// bit width, which should land on the nominal period (e.g. 52.08 µs at 19200)
-// once this is applied; if it moves the wrong way, negate `sigerr`.
+// divisor scales up to compensate.
+//
+// VERIFIED ON THE BENCH 2026-08-14 (Saleae, 4 MS/s, both directions): the
+// gateway's transmitted bit width lands at 52.00 us against a 52.08 us nominal
+// at 19200 (-0.16%) and 26.00 us against 26.04 us at 38400. The sign is
+// CORRECT — do not negate `sigerr`.
 static uint16_t baud_reg_for(uint8_t bidx) {
 #if BOARD_5V
     int8_t   sigerr = (int8_t)SIGROW.OSC20ERR5V;
@@ -67,13 +70,16 @@ static uint16_t baud_reg_for(uint8_t bidx) {
 //   3.5 char @ 9600  = 3.65 ms = 8.74 ticks -> N = 10 -> 9-10 ticks (3.75-4.17 ms)
 //   3.5 char @ 19200 = 1.82 ms = 4.37 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
 //   3.5 char @ 38400 = 0.91 ms = 2.19 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
-// EXPERIMENT (2026-08-09): 38400 was N = 4 (1.25-1.67 ms observed). MODBUS over
-// Serial Line V1.02 stops deriving the timers above 19200 and prescribes a FIXED
-// t3.5 of 1.750 ms, which 1.25 ms undershoots — a master-side inter-character
-// gap longer than our window is read as end-of-frame, splitting one frame into
-// two bad ones (which is why frame_error and crc_error accrue in near-equal
-// numbers). Testing whether that, rather than the RC oscillator, is what makes
-// 38400 dirty. Costs ~0.8 ms of extra silence per transaction.
+// N = 6 at 38400 (2026-08-09): MODBUS over Serial Line V1.02 stops deriving the
+// timers above 19200 and prescribes a FIXED t3.5 of 1.750 ms, which the previous
+// N = 4 (1.25-1.67 ms observed) undershot. Keep N = 6 — it is spec-conformant.
+//
+// RESOLVED 2026-08-14: that change was made to test whether frame SPLITTING was
+// what made 38400 dirty. It was not, and neither was the RC oscillator. The
+// cause was the SFDEN erratum (see the block above modbus_init) — with SFDEN
+// cleared in Active mode, 38400 measures 0.00% bad over 6609 frames with this
+// same N = 6. Both ends were also scoped and transmit within 0.8% of nominal at
+// both bauds, which is what ruled the oscillator out.
 static const uint8_t  s_silence_threshold[] = { 10, 6, 6 };
 // Per-baud reload value for the live silence_ticks countdown (set from
 // s_silence_threshold[] on init / baud change; copied into silence_ticks each
@@ -699,6 +705,62 @@ static void return_to_rx(void) {
     USART0.CTRLA  = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
 }
 
+// ---- SILICON ERRATUM: USART Start-of-Frame Detection ---------------------
+//
+// Microchip tinyAVR silicon errata, USART: "Start-of-Frame Detector Can Be
+// Unintentionally Triggered" (ATtiny1604 is tinyAVR 0-series; the same erratum
+// is published for the 0- and 1-series parts). Quoting the mechanism:
+//
+//   "If the Receive Data (RXDATA) registers are read while receiving new data,
+//    the Receive Complete Interrupt Flag (RXCIF) is cleared. This triggers the
+//    Start-of-Frame Detector and falsely detects the following falling edge as
+//    a start bit. When the Start-of-Frame Detector detects a start condition,
+//    the frame reception is restarted, resulting in corrupt received data."
+//
+//   "The USART Receive Start Interrupt Flag (RXSIF) always is '0' when in
+//    Active mode. No interrupt will be triggered."
+//
+//   Workaround: "Disable Start-of-Frame Detection by writing '0' to the SFDEN
+//   bit in USARTn.CTRLB when the device is in Active mode. Re-enable it by
+//   writing the bit to '1' before transitioning to Standby sleep mode. This
+//   workaround depends on a protocol preventing a new incoming frame when
+//   re-enabling Start-of-Frame Detection."
+//
+// TWO consequences for this driver, both previously wrong:
+//
+//   1. SFDEN must NOT be left set in Active mode. It is cleared here and armed
+//      only around sleep_cpu() in main.c, where modbus_idle already guarantees
+//      no frame is incoming — exactly the caveat the workaround requires.
+//
+//   2. RXSIE must STAY ENABLED, and the reason is worth recording because it
+//      looks removable and is not. There is no USART0_RXS_vect handler, so on
+//      the face of it enabling RXSIE risks vectoring to __bad_interrupt (which
+//      jumps to reset). It is nonetheless required: it is what arms the wake
+//      from Standby, and removing it was MEASURED to break reception — 0.11%
+//      bad even with the DALI bus idle, where the fix otherwise gives 0.00%,
+//      because the first byte after every sleep is then mangled.
+//
+//      It never actually vectors, and the erratum is why: RXSIF "always is '0'
+//      when in Active mode", so once the CPU is awake the flag cannot latch an
+//      interrupt. The enable arms the wake; the byte is delivered by RXC as
+//      usual. Do not "clean this up" without re-measuring the DALI-idle case.
+//
+// This was measured, not inferred. With SFDEN set in Active mode the gateway
+// reported framing errors on characters that were ELECTRICALLY PERFECT: a PB3
+// marker pulsed from the RXC ISR on FERR, captured alongside both RS-485 lines,
+// showed the failing frame decoding as valid Modbus with every stop bit high
+// and inter-character gaps of exactly 10.00 bits. Rates over 40-60 s of
+// saturated traffic, gateway counters zeroed after the baud had settled:
+//
+//                  SFDEN in Active     SFDEN only around sleep
+//     19200          0.13% bad               0.00%  (0 of 3025 frames)
+//     38400          0.85% bad               0.00%  (0 of 6609 frames)
+//
+// The failure needed concurrent DALI traffic because DALI ISR latency is what
+// delays our RXC ISR until the RXDATA read lands INSIDE the next character
+// rather than in the gap before it; and it hit 38400 ~6.5x harder because that
+// gap is half as wide. Errors therefore never appeared on a frame's first byte.
+
 // ---- Public API ---------------------------------------------------------
 
 void modbus_init(uint8_t addr) {
@@ -727,7 +789,11 @@ void modbus_init(uint8_t addr) {
     USART0.CTRLC = USART_CMODE_ASYNCHRONOUS_gc | USART_PMODE_DISABLED_gc |
                    USART_CHSIZE_8BIT_gc         | USART_SBMODE_1BIT_gc;
     USART0.CTRLA = USART_RS485_EXT_gc | USART_RXSIE_bm | USART_RXCIE_bm;
-    USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm | USART_SFDEN_bm;
+    // SFDEN is deliberately CLEAR here and is armed ONLY around sleep_cpu()
+    // in main.c. See the erratum note on modbus_init() below: with SFDEN set in
+    // Active mode, reading RXDATA while the next byte is arriving restarts
+    // frame reception and corrupts the byte.
+    USART0.CTRLB = USART_TXEN_bm | USART_RXEN_bm;
 }
 
 void modbus_tick(void) {

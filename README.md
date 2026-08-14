@@ -412,7 +412,7 @@ The firmware detects transmissions from other DALI masters on the bus: if a risi
 
 Modbus RTU, RS-485, 8N1.
 
-Slave address and baud rate live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud; `make configure` writes 19200 unless told otherwise. Writes to holding registers 0x1F02 / 0x1F03 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
+Slave address and baud rate live in USERROW so they survive a chip erase + reflash. The factory-fresh (post-erase) USERROW value of `0xFF` maps to address 1 / 9600 baud; `make configure` writes 38400 unless told otherwise. Writes to holding registers 0x1F02 / 0x1F03 trigger a USERROW page-erase-write; the runtime baud/slave switch is deferred until the FC06/FC10 response we are about to send has cleared the wire, so the master sees the response at the old config and the next request at the new one.
 
 ### Function codes
 
@@ -763,8 +763,8 @@ make         # build, erase device, and flash
 A standard `make` (build + erase + flash) does NOT touch USERROW — the slave address and baud rate persist across reflashes. To write the persisted-config bytes:
 
 ```sh
-make configure                                              # defaults: address 1, 19200 baud
-make configure SLAVE_ADDR=5 BAUD_INDEX=1                    # address 5, 19200 baud
+make configure                                              # defaults: address 1, 38400 baud
+make configure SLAVE_ADDR=5 BAUD_INDEX=1                    # address 5, 19200 baud (legacy)
 make configure SLAVE_ADDR=42 BAUD_INDEX=2
 ```
 
@@ -776,7 +776,7 @@ These are residual issues that the current firmware does not address. None are r
 
 ### Modbus
 
-- **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 4} TCA0 ticks at 9600/19200/38400), so bytes arriving 2–3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
+- **Inter-byte timeout conflated with inter-frame.**  Modbus §2.5.1.1 wants a 1.5-char inter-byte gap to declare a frame malformed and a separate 3.5-char inter-frame silence to mark frame end.  This firmware uses a single threshold sized for 3.5-char silence ({10, 6, 6} TCA0 ticks at 9600/19200/38400), so bytes arriving 2–3 char apart are silently accepted as part of one frame and rely on the CRC check to reject.  Any master that streams its bytes contiguously is unaffected.
 - **FC10 partial execution on register-map holes.**  The holding-register map is now just 0x1F02, 0x1F03 and 0x1F05, so everything between and around them is a hole — including 0x1F04, which sits between two live registers.  A multi-register write spanning a hole aborts on the first invalid address with `ILLEGAL_ADDRESS`, leaving earlier registers in the same FC10 already written and dispatched.  Workaround: write the config registers one at a time with FC06, which is what the controller does.
 - **FC04 0x0200 returns an ASCII version string, not a register address space.**  Reading exactly 16 input registers from address 0x0200 yields the 32-byte string `"DALI v<maj>.<min> <serial>"`.  Other lengths at this address fall through to the standard register-range check and return `ILLEGAL_ADDRESS`.
 - **`frame_is_valid` recognises the unsupported coil function codes (FC01 / FC05 / FC0F) for size-check purposes, and the broadcast filter still admits FC05 / FC0F.**  This is intentional: well-formed coil frames pass frame validation, reach the FC dispatcher, and receive a graceful `ILLEGAL_FUNCTION` exception reply (or — for a broadcast-addressed FC05 / FC0F — are silently absorbed) rather than being dropped at the size check.  Candidate for future tightening: removing the FC01 / FC05 / FC0F cases from `frame_is_valid` and from the broadcast filter would drop those frames at validation time instead.  Nothing breaks if it stays as-is; the current shape gives masters that probe for coil support a clearer "function not supported" answer.

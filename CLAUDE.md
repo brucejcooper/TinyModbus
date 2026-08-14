@@ -46,11 +46,14 @@ its own CLAUDE.md mirror it, and all of them must move together.
 | queue counters | `0x0320` | 8 | accepts, a_full, executes, results, acks, stalls, q_discard, spare |
 
 Queue counters (task 08, `QUEUE-PROTOCOL.md` §6) are 16-bit wrapping. Two of
-them read in **opposite directions** and it matters:
+them look alarming and are not — both are the system working:
 
-- **`a_full` non-zero is a canary**, not traffic. A_FULL is unreachable while the
-  master honours its in-flight cap, so any non-zero value means the master's
-  accounting is wrong. Investigate it.
+- **`a_full` non-zero is NORMAL and is the saturation signal.** It means both
+  command slots are busy, i.e. the DALI engine is fully fed — the goal state.
+  The master re-offers immediately; ~72 % of transactions are refusals under one
+  saturated gateway, and that share is the headroom gauge rather than a fault.
+  (It was a canary when the master paced against an estimate; A_FULL is the flow
+  control now.)
 - **`stalls` non-zero is normal.** It counts backpressure *episodes* (rising
   edge, not polls — the arbiter is polled thousands of times a second) and is
   simply the rule working whenever the master stops acking.

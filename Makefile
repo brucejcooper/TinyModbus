@@ -107,7 +107,7 @@ get_config:
 # Bytes 4-31 are written 0xFF so the page is in a known state regardless of
 # what was there before.
 SLAVE_ADDR      ?= 2
-BAUD_INDEX      ?= 1
+BAUD_INDEX      ?= 2
 # Rescan interval retired in task 05 (the gateway does no polling of its own —
 # the controller owns the background sweep via dali_sweep_interval_ms). The
 # USERROW bytes are left written as 0xFFFF so the layout is unchanged.

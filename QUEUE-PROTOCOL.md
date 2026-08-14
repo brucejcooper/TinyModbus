@@ -3,12 +3,13 @@
 Authoritative specification of how the controller (RP2040 master) drives the
 TinyModbus gateway's DALI command queue.
 
-> **Lineage.** v4 is the synthesis of Bruce's queue language
-> (`ALTERNATE-QUEUE-APPROACH.md`: single FC, ack-by-seq, response retention)
-> with the failure-handling rules of the v3 draft (see git history of this
-> file). Decisions taken 2026-08-09: timeout-based reboot detection (no boot
+> **Lineage.** v4 is the synthesis of Bruce's queue language — single FC,
+> ack-by-seq, response retention — with the failure-handling rules of the v3
+> draft (see git history of this file). Those proposals lived in
+> `ALTERNATE-QUEUE-APPROACH.md`, deleted once this document became their
+> answer. Decisions taken 2026-08-09: timeout-based reboot detection (no boot
 > byte on the hot path), a two-sequence response, queue depth 2 as a tweakable
-> constant, round-robin fairness at the controller, diagnostics in cold-path
+> constant, round-robin fairness (since moved into the transport), diagnostics in cold-path
 > registers rather than the reply.
 >
 > **Status: IMPLEMENTED AND VALIDATED** on the bench, 2026-08-09/10, on
@@ -17,11 +18,10 @@ TinyModbus gateway's DALI command queue.
 > results and the regression checklist are in [§10](#10-validation); the
 > blow-by-blow of the build lives in `tasks/08-queue-v4.md`.
 >
-> **Two things to read before touching the client:** the pacing rule in
-> [§5](#5-client-policy), which was got wrong first time and quietly cost the
-> whole benefit of the design; and the `A_FULL` note in
-> [§4](#4-recovery), whose original safety claim was **false** and is now
-> retracted in place.
+> **Read [§5](#5-client-policy) before touching the client.** Its pacing rule
+> was got wrong once, then removed entirely: `A_FULL` is the flow control now,
+> not an anomaly, and the estimator that policed admission is gone. The section
+> records both the rule and why it no longer applies.
 >
 > Where this document and the code disagree, this document is the intent and
 > the code is the bug — except where §10's measurements say otherwise.
@@ -35,12 +35,13 @@ One user-defined function code carries all queue traffic. A request optionally
 gateway's **response queue**; the reply reports the fate of the enqueue (an
 **accept byte** with a gateway-assigned sequence) and the current **head** of
 the response queue. Results are retained until explicitly acked, so no reply
-loss can destroy one. In steady state each transaction enqueues one command,
-acks the previous result, and collects the next — **one ~14-byte transaction
-per DALI frame**. That last property is not free: it requires the client to
-**wait** for the oldest command to be due rather than polling to find out
-(§5), and the first bench build got 2.04 transactions per command by polling
-eagerly. Reboots are detected by result deadlines plus two structural
+loss can destroy one. Each transaction enqueues one command, acks the previous result, and collects
+the next, in **one ~14-byte transaction**. A DALI frame therefore costs a
+*minimum* of one transaction — but the client does not try to hit that minimum:
+it re-offers on `A_FULL` rather than pacing against an estimate, so a saturated
+gateway costs ~3.6 transactions per command, most of them refusals that mean
+"the DALI engine is full". See §5 for why that trade was taken and §10 for the
+capacity it leaves. Reboots are detected by result deadlines plus two structural
 rules (seq collision, impossible-empty-head), with the existing sysinfo
 `boot_count` register as the cold-path arbiter for the one genuinely ambiguous
 corner. The gateway holds nothing the master cannot reconstruct.
@@ -69,7 +70,8 @@ refill the pipeline.
 > bound to 4 and consumes the entire margin, so `RESPQ_DEPTH` must go to 6 in
 > the same commit. Note also that **nothing on the wire carries the depth** —
 > §1 is deliberately depth-agnostic — so a depth bump applied to one side only
-> ships silently and presents as the `a_full` canary firing. Recommended before
+> ships silently and presents as an unexplained rise in `a_full` against a
+> gateway that is not actually saturated. Recommended before
 > anyone touches it: publish `CMDQ_DEPTH` in the queue-counter block's spare
 > register (`0x0327`, currently documented as "reads 0") and have the
 > controller latch incompatible on a mismatch at discovery, exactly as §8 does
@@ -452,21 +454,33 @@ Transport (`mbq_client`) and scheduler (`dali_queue`) split as today.
 - **Single outstanding per slave.** Every transaction is resolved — by reply,
   or by the §4 procedure — before the next is issued to that slave. The
   prediction rule and R1 depend on it.
-- **Round-robin across slaves with work pending** (fairness is the
-  scheduler's, not the protocol's). With per-slave single-outstanding this
-  bounds any slave's wait to one transaction time per competing slave.
-- **Pace, don't spin — and the case that matters is the in-flight cap.**
-  Whenever the client has **no enqueue it is allowed to send**, the next
-  transaction for that slave is scheduled at the estimated completion of its
-  oldest in-flight command (~25 ms SET / ~40 ms query / ~50 ms DTR0-pair), not
-  immediately. "Not allowed to send" covers **all three** reasons, and the
-  first is the one that dominates:
+- **Round-robin across participants, at the TRANSPORT.** Fairness is no longer
+  the scheduler's job. The bus asks each participant — relay boards and DALI
+  gateways alike — in rotation whenever it falls idle with nothing committed,
+  and the first with work gets the wire (`modbus_register_offer`). With
+  per-slave single-outstanding this bounds any participant's wait to one
+  transaction time per competing participant.
 
-  1. **the in-flight cap is reached and the backlog is NOT empty** — the
-     ordinary saturated steady state, and the case an earlier draft of this
-     section omitted;
-  2. the backlog *is* empty but results are outstanding;
-  3. `A_FULL` (which should never happen — see §4).
+- **~~Pace, don't spin.~~ SUPERSEDED 2026-08-12.** This section used to require
+  the client to schedule its next transaction at the *estimated* completion of
+  its oldest in-flight command, and to treat `A_FULL` as unreachable. Both are
+  now wrong, by deliberate decision:
+
+  - **`A_FULL` IS the flow control.** It is not an anomaly and not a canary. A
+    refusal means the gateway's queue is full, i.e. the DALI engine is fully
+    fed — the goal state. The client re-offers immediately. Under one saturated
+    gateway ~72 % of transactions are refusals, and that share is the HEADROOM
+    gauge: those probes convert into useful enqueues as gateways are added.
+  - **The estimator is gone.** It was admission control based on a guess, and a
+    command whose estimate had expired but whose result had not arrived still
+    held a local slot — so the client ran out of slots and polled instead,
+    which is how it reached 1.79 txns/command. Offer-based admission has no
+    guess to get wrong.
+
+  What is bought back: no guesswork, lower command latency (a retry lands
+  within a transaction of a slot opening, where a deliberately-late estimate
+  does not), and a much smaller client. What is paid: more Modbus transactions.
+  That trade was taken knowingly — the bus has the capacity (see §10).
 
   > **This is not a micro-optimisation; it is the design.** At depth 2 the
   > client is at its cap essentially always, and a DALI frame (~35 ms) is about
@@ -648,20 +662,33 @@ expectation, so verification does not depend on delivery order.
 
 ### Measured, against the FC23 design v4 replaces
 
-| | FC23 | **v4** |
-|---|---|---|
-| RS-485 occupancy, saturated | **99 %** | **37 %** |
-| Modbus transactions per DALI command | 1.73 | **1.03** |
-| charged per transaction | 19.46 ms | 13.1 ms |
-| throughput (write/read pairs) | 14.71/s | 13.9–14.1/s |
+| | FC23 | v4 (2026-08-10) | **v4 today** |
+|---|---|---|---|
+| RS-485 occupancy, saturated | **99 %** | 37 % | **~95 %** (see note) |
+| Modbus transactions per DALI command | 1.73 | 1.03 | **~3.6** |
+| charged per transaction | 19.46 ms | 13.1 ms | **8.96 ms** (38400) |
+| throughput (write/read pairs) | 14.71/s | 13.9–14.1/s | **14.5–14.8/s** |
 | endurance | — | 5000 pairs / 10 000 frames, **0 bad**, 0 failures of 20 748 transactions |
 | gateway flash / RAM | 11 028 B / 137 B | 10 462 B / 153 B |
 
-**The headline is the first two rows**: the bus went from saturated to roughly
-a third occupied, at essentially unchanged throughput, because a DALI frame now
-costs one Modbus transaction instead of 1.73. That is the whole purpose of the
-protocol, and it is what makes a second DALI gateway on the same RS-485
-possible.
+**Read the last column with §5 in hand.** Occupancy went back up because the
+client now re-offers on `A_FULL` instead of pacing against an estimate — and
+that is not capacity lost. Only the *accepted* enqueues are obligatory work,
+and each produces exactly one DALI frame: **29.3 accepts/s = 26 % of the bus per
+saturated gateway.** The other ~72 % of transactions are refusals spending idle
+bus time, and they convert into useful enqueues as gateways are added:
+
+| gateways | accepts needed | bus used by useful work | revisit interval |
+|---|---|---|---|
+| 1 | 29.3/s | 26 % | 9 ms |
+| **2** | 58.6/s | **53 %** | 18 ms |
+| 3 | 87.9/s | 79 % | 27 ms |
+| 4 | 117/s | 105 % — over | 36 ms |
+
+A gateway slot frees every 34.1 ms, so the rotation must revisit each gateway
+inside that window; at four the interval (36 ms) exceeds it, exactly where the
+bus-time budget also runs out. **Three saturated gateways is the ceiling**, and
+a second is comfortable — which is what this protocol existed to make possible.
 
 ### Regression checklist
 
@@ -670,12 +697,16 @@ not suggestions — three defects in this protocol's own bring-up had a *clean
 verdict and full throughput* while being badly wrong, so **correctness alone
 does not pass**.
 
-1. **Rate.** Soak at depth 2: `txns per command` ≈ 1.0 and `bus busy` ≈ 37 %.
-   A clean run at ~2 txns/command means the client is polling instead of
-   pacing (§5) and has silently given back the entire benefit.
-2. **Throughput.** ≥ ~13.9 pairs/s. Materially below that means the pacing
-   estimate is running long and the DALI bus is idling; materially above it
-   with `a_full` climbing means it is running early.
+1. **Accept rate, not transaction rate.** The gate is the gateway's `accepts`
+   counter ≈ the DALI frame rate (~29/s saturated), and `executes` equal to it.
+   `txns per command` is EXPECTED to be ~3.6 and `bus busy` ~95 % — high
+   `a_full` is the DALI engine being fed, not waste (§5). What would be a real
+   regression is `accepts` falling while `a_full` stays high, which means the
+   client is being refused and not converting refusals into enqueues.
+2. **Throughput.** ≥ ~14.5 pairs/s at 38400. Materially below that with the
+   gateway queue NOT full means the client is failing to keep it fed; check the
+   `pacing` breakdown in `soak` for whether it reports "queue full" (DALI-bound,
+   correct) or "tx busy" (Modbus-bound).
 3. **Endurance.** ≥ 5000 pairs, zero bad, zero transport failures.
 4. **Gateway reboot** (`gw_reboot <slave>` mid-soak, several runs, varying
    where the reboot lands): zero mis-attributed values, zero stale reads, zero

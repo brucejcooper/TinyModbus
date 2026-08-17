@@ -126,22 +126,35 @@
 void     regs_init(void);
 
 // USERROW-backed config.  USERROW survives chip erase + reflash, so units
-// keep their identity through firmware updates.  Reads are zero-overhead;
-// writes go through NVMCTRL page-erase-write (~3.4 ms, CPU halted during
-// the operation) and are skipped if the value already matches.
+// keep their identity through firmware updates.  Reads are zero-overhead
+// (they see a staged-but-uncommitted write immediately, so a read-back right
+// after a set() is never stale).  Writes are skipped if the value already
+// matches, and otherwise only STAGE the new byte in SRAM — the setter itself
+// never touches flash and never halts.  The actual NVMCTRL page-erase-write
+// (~3.4 ms, CPU halted for the duration) happens later, from userrow_service(),
+// which the main loop calls only when the DALI engine is confirmed idle. See
+// registers.c for why deferring it this way matters (a synchronous commit
+// could halt the CPU mid-DALI-frame) and why the timing is race-free.
 //
 // Layout: byte 0 = slave addr (encoded as addr - 2; 0xFF = address 1),
 //         byte 1 = baud index (0/1/2; 0xFF = 9600),
 //         bytes 2-3 = unused (written, but carry nothing).
 // Reserved Modbus addresses (0, 248-255) are clamped to 1 on read.
 // Setters return TM_ERR_BAD_VALUE for an out-of-range argument and
-// TM_ERR_HW_FAULT if the NVM write itself did not take — two outcomes a bool
+// TM_ERR_HW_FAULT if the byte could not even be staged — two outcomes a bool
 // could not tell apart, and the master needs to: one is "your request was wrong",
 // the other is "this gateway's flash is failing".
 uint8_t  userrow_get_slave_addr(void);
 tm_err_t userrow_set_slave_addr(uint8_t addr);
 uint8_t  userrow_get_baud_index(void);
 tm_err_t userrow_set_baud_index(uint8_t idx);
+
+// Commit any staged USERROW writes (see the setters above) to flash. Call
+// from the main loop only when start_next_dali_work() (dali_sync.h) reports
+// nothing outstanding — no command executing, none queued, bus not settling.
+// No-op when nothing is staged. See registers.c's userrow_service() for the
+// full race analysis against the DALI completion ISR.
+void     userrow_service(void);
 
 
 // Read one FC03 holding register at addr into *val.

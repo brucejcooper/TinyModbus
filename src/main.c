@@ -103,6 +103,11 @@ int main(void) {
         // and the line rather than a summary kept in step with them, and hands
         // back whether any DALI work is still outstanding.
         bool dali_work = start_next_dali_work();
+        // Deferred USERROW commit (registers.c): the DALI engine just
+        // reported nothing outstanding, which is the one moment a ~3.4 ms
+        // CPU-halting flash write cannot land mid-frame. No-op when no
+        // config register write is staged.
+        if (!dali_work) userrow_service();
         wdt_reset();
 
         // Sleep left ENABLED — confirmed (again) NOT the cause of the deafness:

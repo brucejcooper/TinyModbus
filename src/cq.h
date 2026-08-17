@@ -156,11 +156,14 @@ enum {
 // it can tear across the increment and misreport one sample. That is accepted
 // deliberately: fencing it would put the cli in this file that the header
 // forbids, for a cold-path diagnostic whose next read is correct anyway.
-// The two interesting ones read in OPPOSITE directions, and registers.h spells
-// this out for whoever finds them non-zero on a bench: `full` is a canary —
-// A_FULL is unreachable while the master honours its in-flight cap, so any
-// non-zero value means the master's accounting is wrong — whereas `stalls` is
-// the backpressure rule working as designed and is not alarming by itself.
+// `full` and `stalls` are both NORMAL, expected counters, not health flags —
+// registers.h spells this out for whoever finds them non-zero on a bench:
+// `full` is the flow-control refusal share, the headroom gauge (~72% of
+// transactions under one saturated gateway, by design — see
+// QUEUE-PROTOCOL.md §5); `stalls` is the backpressure rule doing its job
+// whenever the master stops acking. Neither means the gateway is broken; the
+// one thing that IS still a fault is the invariant-break branch in
+// cq_accept() (cq.c), which deliberately does NOT touch `full`.
 typedef struct {
     uint16_t accepts;   // commands enqueued (A_ACCEPTED replies sent)
     uint16_t full;      // enqueue attempts refused, queue full (A_FULL replies)
@@ -183,11 +186,14 @@ void cq_init(void);
 // report in the same breath, and the head is exactly what the master needs to
 // learn that a slot freed.
 //
-// A full queue is NOT this protocol's back-pressure mechanism (that is the
-// response queue, via cq_next). It should never happen at all: the master caps
-// its own in-flight count at CMDQ_DEPTH and its count over-estimates ours, so
-// A_FULL means the master is miscounting. Handle it gracefully, count it, and
-// treat a non-zero counter as a fault to investigate.
+// A full command queue IS this protocol's flow control (the response queue's
+// own backpressure rule, via cq_next, is a separate mechanism — see this
+// file's top-of-file notes). The client re-offers on A_FULL rather than
+// pacing against an estimate, so this is EXPECTED to happen often: under one
+// saturated gateway ~72% of transactions are refusals, and that share is the
+// headroom gauge (QUEUE-PROTOCOL.md §5). Count it — `full` is a rate/ratio
+// diagnostic, not a health flag — but a non-zero counter here is not itself a
+// fault to investigate.
 uint8_t cq_accept(const uint8_t cmd[CQ_CMD_BYTES]);
 
 // Ack: delete the head of the response queue IFF the head's seq equals `seq`.

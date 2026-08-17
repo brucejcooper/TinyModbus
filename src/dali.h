@@ -33,10 +33,11 @@ typedef enum {
 // dumb pipe: the controller composes complete 16-bit forward frames and submits
 // them as opaque queue commands, and this firmware shifts the bytes onto the
 // wire without interpreting them. Keeping an opcode table here implied a
-// vocabulary the gateway does not have, and the commissioning block documented
-// itself as "driven by the OP_COMMISSION state machine in dali_sync.c" — a state
-// wire without interpreting them. Anything needed belongs on the controller
-// side, which is where the frames are built.
+// vocabulary the gateway does not have, and the commissioning block used to
+// document itself as "driven by the OP_COMMISSION state machine in
+// dali_sync.c" — a state machine that no longer exists. Anything needing
+// interpretation belongs on the controller side, which is where the frames
+// are built.
 //
 // DTR0 is the single exception, and only because the QF_DTR0 flag makes the
 // preload a GATEWAY-side two-step sequence (0xA3<value>, then the frame) inside

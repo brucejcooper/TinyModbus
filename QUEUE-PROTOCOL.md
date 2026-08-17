@@ -500,9 +500,10 @@ Transport (`mbq_client`) and scheduler (`dali_queue`) split as today.
   a little latency, early costs a whole wasted transaction and lands you back
   at 2 txns/frame. On a poll that finds nothing, back off further rather than
   re-polling at the same cadence.
-- **In-flight cap = `CMDQ_DEPTH`.** The client tracks accepts minus results
-  and stops submitting at the cap — `A_FULL` is the backstop, not the flow
-  control (task-07 lesson).
+- **No in-flight cap on the client.** The estimator-based admission cap this
+  bullet used to describe is GONE with the pacing it enforced (see the
+  retraction above) — the client submits until `A_FULL` refuses it. `A_FULL`
+  IS the flow control now; there is no cap left for it to backstop.
 - **Ack discipline: always piggyback.** Every request carries the ack for the
   most recent result the master has consumed. This keeps response-queue
   occupancy at ~2, keeps R1 available (the recovery shortcut needs a

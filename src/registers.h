@@ -79,17 +79,20 @@
 //
 //   reg0  0x0320  accepts        commands enqueued (A_ACCEPTED replies)
 //   reg1  0x0321  a_full         enqueues refused, queue full (A_FULL replies).
-//                                *** NON-ZERO IS A CANARY, NOT TRAFFIC. ***
-//                                A_FULL is UNREACHABLE in correct operation: the
-//                                master decrements its in-flight count only when
-//                                it SEES a result, while this gateway frees a
-//                                command slot the moment the command completes,
-//                                so the master's count always over-estimates our
-//                                occupancy — if it believes there is room, there
-//                                is.  A non-zero reading therefore means the
-//                                master's accounting has gone wrong, not that
-//                                the queue got busy.  Investigate it; do not
-//                                read it as back-pressure working
+//                                NON-ZERO IS NORMAL — it is the protocol's flow
+//                                control, not a canary.  A_FULL means both
+//                                command slots are busy, i.e. the DALI engine
+//                                is fully fed (the goal state); the master
+//                                re-offers immediately rather than pacing
+//                                against an estimate, so under one saturated
+//                                gateway ~72% of transactions are refusals, and
+//                                that refusal share is the HEADROOM gauge
+//                                (QUEUE-PROTOCOL.md §5) — it converts into
+//                                useful enqueues as gateways are added.  The
+//                                one thing that IS still a fault is the
+//                                invariant-break branch in cq_accept() (cq.c),
+//                                which deliberately does NOT increment this
+//                                counter — see cq.c for why
 //   reg2  0x0322  executes       commands handed to the DALI adapter
 //   reg3  0x0323  results        results pushed onto the response queue
 //   reg4  0x0324  acks           response entries popped by a matching ack

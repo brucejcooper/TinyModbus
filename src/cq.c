@@ -123,24 +123,24 @@ uint8_t cq_accept(const uint8_t cmd[CQ_CMD_BYTES]) {
     uint8_t idx = s_head;
     for (uint8_t i = 0; i < s_live; i++) idx = ring_next(idx, CMDQ_DEPTH);
     // The ring cursor says this slot is free; the state byte is the truth. If
-    // they disagree, an internal invariant has broken.
+    // they disagree, an internal invariant has broken — this is NOT the normal
+    // A_FULL path above (that one is the protocol's flow control, see cq.h /
+    // registers.h) and it must not be counted as one.
     //
-    // Still report A_FULL: the master paces and retries, which is survivable,
-    // where arming a slot that still holds a live command is not. But RECORD it
-    // and do NOT touch the a_full counter, for two distinct reasons:
+    // Still report A_FULL: the master paces and retries on a refusal, which is
+    // survivable, where arming a slot that still holds a live command is not.
+    // But RECORD it and do NOT touch the a_full counter, for two distinct
+    // reasons:
     //
     //   errors.h RULE 2 — this failure has no caller to return to, so it must
     //   land in the fault registers rather than vanish into a reply that looks
     //   like ordinary queue pressure.
     //
-    //   Spec §4 lets the controller's R1 assume a lost enqueue was ACCEPTED
-    //   rather than A_FULL, and the justification is that "A_FULL is unreachable
-    //   while the client honours its in-flight cap". That argument covers the
-    //   s_live check above; it does NOT cover this branch, which the client
-    //   cannot see or prevent. If this reply were lost, R1 would bind the
-    //   command to a seq we never assigned. Recording it puts the evidence on
-    //   the correct side of the bus — a_full means "the master is miscounting",
-    //   and a gateway fault must not be able to raise it.
+    //   `a_full` is read as the headroom gauge (QUEUE-PROTOCOL.md §5): its
+    //   whole value is meaningful as "the DALI engine is fully fed". Folding a
+    //   broken invariant into it would hide a real gateway bug inside a counter
+    //   everyone is trained to read as "just busy, not broken" — the evidence
+    //   belongs on the fault side, not the traffic side.
     if (s_cmdq[idx].state != CQ_FREE) {
         tm_fault(TM_SITE_CQ_ACCEPT, TM_ERR_BAD_SLOT);
         return CQ_SEQ_NONE;

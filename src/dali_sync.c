@@ -167,10 +167,16 @@ bool start_next_dali_work(void) {
                 // committed launch with no command would put the previous frame
                 // back on the bus. Record it — nothing above can act on it — and
                 // leave the line parked for the next selection.
-                if (cq_begin(idx, &s_raw_cmd, &s_cq_seq) != TM_OK) {
+                // cq_begin takes a plain uint8_t* — passing &s_cq_seq
+                // directly would discard the volatile qualifier (and the
+                // store inside cq.c would not be a volatile access). Land
+                // the seq in a local, then store it through the volatile.
+                uint8_t seq;
+                if (cq_begin(idx, &s_raw_cmd, &seq) != TM_OK) {
                     tm_fault(TM_SITE_CQ_BEGIN, TM_ERR_BAD_SLOT);
                     goto no_launch;
                 }
+                s_cq_seq = seq;
                 s_cq_idx = idx;             // we now own the channel
                 // A command without QF_DTR0 has no preload step to run.
                 s_step = (dali_frame_of(&s_raw_cmd).flags & QF_DTR0)

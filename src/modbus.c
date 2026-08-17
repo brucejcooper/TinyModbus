@@ -467,13 +467,10 @@ static void note_runtime_config_write(uint16_t mb_reg) {
     if (mb_reg == MBREG_BAUD_INDEX) pending_apply_mask |= APPLY_BAUD;
 }
 
-// Handle FC06 (Write Single Register): validate, update register map, dispatch DALI action.
-//
-// Group register writes go through regs_write_holding which transparently
-// handles three cases: (1) no-change write -> ACK without DALI work; (2)
-// actual change with group channel idle -> arm + ACK; (3) actual change
-// with group channel busy -> rollback + return false.  The downstream
-// busy check distinguishes case (3) from a genuine ILLEGAL_ADDRESS.
+// Handle FC06 (Write Single Register): validate via regs_write_holding, then
+// dispatch_action_reg for the one register that still triggers a side effect
+// (MBREG_SYSTEM_RESET).  There is no group membership or queue state left to
+// touch here — see registers.c — so this is a straight validate/apply/echo.
 static void process_fc06(void) {
     uint16_t addr = ((uint16_t)buf[2] << 8) | buf[3];
     uint16_t val  = ((uint16_t)buf[4] << 8) | buf[5];
@@ -505,24 +502,16 @@ static void process_fc10(void) {
     // command queue, so an FC10 write to the retired 0x1000 range falls through
     // to the per-register loop and comes back ILLEGAL_ADDRESS like any other
     // unmapped address.
-
-    // Group register write rules: only one DALI-actionable group write
-    // per FC10 (matches the spec's "restrict FC10 group writes to a
-    // single register at a time" option).  Multi-group bunches get
-    // DEVICE_BUSY pre-flight; the in-flight busy check happens inside
-    // regs_write_holding (so a no-op write doesn't get rejected when
-    // another group write is in flight).
-    {
-        uint8_t group_targets = 0;
-        for (uint16_t i = 0; i < count; i++) {
-            uint16_t r = addr + i;
-            if (r >= 0x0110u && r <= 0x014Fu) group_targets++;
-        }
-        if (group_targets > 1u) {
-            send_error(MB_ERR_DEVICE_BUSY);
-            return;
-        }
-    }
+    //
+    // There used to be a pre-flight loop here refusing more than one register
+    // in 0x0110-0x014F (group membership masks) with MB_ERR_DEVICE_BUSY. That
+    // range was retired in the task-05 stateless-pipe strip along with the
+    // group state it guarded, and regs_write_holding already answers any
+    // write in it with ILLEGAL_ADDRESS like every other unmapped register —
+    // the pre-flight loop was answering DEVICE_BUSY for addresses that no
+    // longer exist. A client whose "busy = retry" policy took that literally
+    // would retry forever, since ILLEGAL_ADDRESS from the per-register loop
+    // below is the only answer this range can ever give now.
 
     uint8_t *payload_ptr = buf + 7;
     for (uint16_t i = 0; i < count; i++) {

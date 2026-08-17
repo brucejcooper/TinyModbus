@@ -440,22 +440,22 @@ static void process_fc03(void) {
 
 // ---- FC06 / FC10 - write register(s) -----------------------------------
 
-// Returns 0 on success, or a Modbus error code if the command cannot be dispatched.
+// Its only remaining job is latching pending_reset; validation already
+// happened in regs_write_holding, so there is nothing left here that can
+// fail.
 //
 // DALI commands go through the command queue (submit window 0x1000), not through
 // here. After the task-05 strip the ONLY action register left is
 // MBREG_SYSTEM_RESET — scan-trigger, rescan-interval and commissioning all went
 // with the gateway's state.
-static mb_err_t dispatch_action_reg(uint16_t mb_reg) {
+static void dispatch_action_reg(uint16_t mb_reg) {
     if (mb_reg == MBREG_SYSTEM_RESET) {
         // regs_write_holding validated the magic and returned TM_ERR_BAD_VALUE if
         // it was wrong, so reaching here means the value was correct — which is
         // why this takes no value parameter.  Latch the
         // reset; fire_pending_reset() reboots once the ACK has left the wire.
         pending_reset = true;
-        return 0;
     }
-    return 0;
 }
 
 // Mark slave-addr / baud-index writes for deferred runtime apply.  The
@@ -481,8 +481,7 @@ static void process_fc06(void) {
     tm_err_t we = regs_write_holding(addr, val);
     if (we != TM_OK) { send_error(tm_err_to_modbus(we)); return; }
     note_runtime_config_write(addr);
-    mb_err_t err = dispatch_action_reg(addr);
-    if (err) { send_error(err); return; }
+    dispatch_action_reg(addr);
     // Echo the request back (standard FC06 response)
     start_tx(6);
 }
@@ -521,8 +520,7 @@ static void process_fc10(void) {
         tm_err_t we = regs_write_holding(r, reg_value);
         if (we != TM_OK) { send_error(tm_err_to_modbus(we)); return; }
         note_runtime_config_write(r);
-        mb_err_t err = dispatch_action_reg(r);
-        if (err) { send_error(err); return; }
+        dispatch_action_reg(r);
     }
     // Standard FC10 response: slave addr, FC, start addr (2), count (2)
     start_tx(6);

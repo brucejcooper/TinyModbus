@@ -37,8 +37,17 @@
 // The SEQ, not the index, is what completion is reported against: a seq names
 // one command for its whole life, where an index names a reusable slot, so a
 // completion can never be attributed to whatever was enqueued after it.
-static uint8_t s_cq_idx = CQ_NONE;
-static uint8_t s_cq_seq = CQ_SEQ_NONE;
+//
+// VOLATILE: both are written from main (start_next_dali_work, inside the
+// ATOMIC re-check) and from ISR context (dali_sync_completion at LVL1,
+// dali_sync_abort_busfault at LVL0), then read back from main
+// (dali_sync_owns_channel, and again inside that same ATOMIC re-check). The
+// two sides never fight over a value — main only ever moves the handle
+// CQ_NONE -> owned, an ISR only ever moves it owned -> CQ_NONE — but without
+// volatile the compiler is free to cache a stale read across that boundary;
+// only -O3 happening to reload it made this safe before.
+static volatile uint8_t s_cq_idx = CQ_NONE;
+static volatile uint8_t s_cq_seq = CQ_SEQ_NONE;
 static cq_cmd_t s_raw_cmd;
 
 // Where we are in the executing command. Meaningless unless we own the channel.

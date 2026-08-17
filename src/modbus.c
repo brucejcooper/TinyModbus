@@ -824,9 +824,16 @@ void modbus_process(void) {
         // counter.  Snapshot the bytes for forensics.
         if (rx_sz >= 4u && rx_crc != 0u) {
             diag_crc_error++;
-            diag_last_fail_len = rx_sz;
             uint8_t n = (rx_sz < sizeof diag_last_fail) ? rx_sz
                                                         : (uint8_t)sizeof diag_last_fail;
+            // Store the CLAMPED length, not raw rx_sz: diag_last_fail is only
+            // sizeof(diag_last_fail) (16) bytes, and reg4 is documented (and
+            // read by FC04 0x0300) as that capture's length. rx_sz can run up
+            // to MAX_PKT_SZ (40) for an oversized frame; reporting it
+            // uncapped told a reader to decode up to 40 "frame bytes" out of
+            // a 16-byte field, swallowing reg13-14 (fault counters) as if
+            // they were frame data.
+            diag_last_fail_len = n;
             for (uint8_t i = 0; i < n; i++) diag_last_fail[i] = buf[i];
         }
         // A queue frame addressed to US whose CRC was fine but whose length or

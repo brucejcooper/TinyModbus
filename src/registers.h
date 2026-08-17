@@ -47,6 +47,10 @@
 // reg14 [tm_err_t | tm_fault_site_t] of the FIRST internal fault, reg15 spare.
 // Zeroed on reset.
 //
+// reg4 is CAPPED at the reg5..12 capture size (16 bytes): a CRC-failed frame
+// longer than that (up to MAX_PKT_SZ) still only fills 16 bytes of buf, so
+// reg4 never claims more frame bytes than reg5..12 actually holds.
+//
 // reg13/reg14 are the errors that could not be returned to a caller — a bad slot
 // index in the DALI completion ISR, a refused command launch (see errors.h).
 // reg13 != 0 means an internal invariant broke; reg14 says which one.  A healthy

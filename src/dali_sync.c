@@ -69,10 +69,23 @@ static void dispatch_step(void) {
         return;
     }
     // A frame step holds the window open to receive a backward frame
-    // (QF_ANSWER) or to provide the 22 TE inter-send gap (QF_TWICE — both of
-    // its sends use it).
-    dali_transmitting_state_enter(f.addr, f.data,
-                                  (f.flags & (QF_ANSWER | QF_TWICE)) != 0u);
+    // (QF_ANSWER) or to provide the 22 TE inter-send gap (QF_TWICE). Only the
+    // FIRST send needs QF_TWICE for that gap — it's what re-fires the second
+    // send with no dead time (dali_sync_repeat_send, called from within that
+    // same wait). The SECOND send has nothing left to wait for: a send-twice
+    // command can never carry QF_ANSWER (it's SET-class, no answer defined),
+    // so gating on QF_TWICE too for FRAME_2 was holding the window open for a
+    // response nothing could ever fill, burning a full NORESPONSE_TIMEOUT_
+    // TICKS (~9.2 ms, dali_state_wait_for_response.c) before the settle that
+    // was actually needed (dali_wait_for_idle_state_enter, unconditional at
+    // the end of dali_sync_completion) even started. Same idea as CMD_SEND
+    // skipping this window entirely (README.md's DALI state-machine section,
+    // "TRANSMITTING") — just scoped to one step of a two-send command instead
+    // of the whole command.
+    bool want_window = (s_step == DALI_STEP_FRAME_2)
+                            ? (f.flags & QF_ANSWER) != 0u
+                            : (f.flags & (QF_ANSWER | QF_TWICE)) != 0u;
+    dali_transmitting_state_enter(f.addr, f.data, want_window);
 }
 
 void dali_sync_dispatch_current(void) {

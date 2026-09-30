@@ -41,6 +41,7 @@ its own CLAUDE.md mirror it, and all of them must move together.
 | block | address | count | contents |
 |---|---|---|---|
 | version | `0x0200` | 16 | `"DALI v<maj>.<min> <20-hex-serial>"` |
+| build | `0x0210` | 16 | `git describe` of the image, NUL-padded (`-dirty` = uncommitted tree) |
 | RX diagnostics | `0x0300` | 16 | overflow, frame err, CRC err, frames ok, last failed frame, internal faults |
 | sysinfo | `0x0310` | 4 | uptime (32-bit), boot count, reset reason |
 | queue counters | `0x0320` | 8 | accepts, a_full, executes, results, acks, stalls, q_discard, spare |

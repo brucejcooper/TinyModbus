@@ -447,6 +447,7 @@ accepted, and any other count is ILLEGAL DATA ADDRESS rather than a short read.
 | Address | FC | Width | Content |
 |---|---|---|---|
 | `0x0200–0x020F` | 04 | 16 regs | Version string `DALI v<maj>.<min> <20-hex-serial>`. Read exactly 16. |
+| `0x0210–0x021F` | 04 | 16 regs | Build string: the `git describe --long --dirty --tags` the image was built from (e.g. `v0.5-81-gabc1234`), ASCII, NUL-padded to 32 bytes. `-dirty` = built from an uncommitted tree. Read exactly 16. |
 | `0x0300–0x030F` | 04 | 16 regs | RX diagnostics: `reg0` rx_overflow, `reg1` frame_error, `reg2` crc_error (a CRC-good frame addressed to another device is ignored, framing errors included; any CRC-bad frame counts, since its address can't be trusted), `reg3` frames_ok, `reg4` last_fail_len, `reg5–12` the last CRC-failed frame, `reg13` internal fault count, `reg14` `[tm_err_t \| tm_fault_site_t]` of the first internal fault. Zeroed on reset. Read exactly 16. |
 | `0x0310–0x0313` | 04 | 4 regs | Sysinfo: `reg0–1` uptime_s (32-bit BE), `reg2` boot_count (since cold power-on), `reg3` reset_reason (`RSTCTRL.RSTFR`: bit0 PORF, 1 BORF, 2 EXTRF, 3 WDRF, 4 SWRF, 5 UPDIRF). No EEPROM — uptime is RAM, boot_count is magic-guarded `.noinit`, reset_reason is hardware-latched. Read exactly 4. |
 | `0x0320–0x0327` | 04 | 8 regs | **Queue counters** (new in v4). Read exactly 8 — see "Queue diagnostics" below. |

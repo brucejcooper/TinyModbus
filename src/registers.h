@@ -23,6 +23,7 @@
 //  ADDRESS        FC              W  ACCESS  CONTENT
 //  ─────────────  ──────────────  ─  ──────  ──────────────────────────────────
 //  0x0200-0x020F  04             16  R       Version string. Read exactly 16.
+//  0x0210-0x021F  04             16  R       Build string (git describe). Read exactly 16.
 //  0x0300-0x030F  04             16  R       RX diagnostics. Read exactly 16.
 //  0x0310-0x0313  04              4  R       Sysinfo. Read exactly 4.
 //  0x0320-0x0327  04              8  R       Queue counters. Read exactly 8.
@@ -40,6 +41,13 @@
 // ---- Read-only blocks ------------------------------------------------------
 
 #define FC04_VERSION_BLOCK  0x0200u  // version string, 16 registers
+// Build string: the `git describe --long --dirty --tags` the image was built
+// from (Makefile FW_VERSION), ASCII, NUL-padded to 32 bytes (truncated if
+// longer). The queue generation in FC04_VERSION_BLOCK says which PROTOCOL a
+// gateway speaks; this says which BUILD it runs, so a fielded gateway can be
+// identified without reading its flash back over UPDI. "-dirty" means it was
+// built from an uncommitted tree.
+#define FC04_BUILD_BLOCK    0x0210u  // build string, 16 registers
 
 // RX diagnostics.  reg0 rx_overflow, reg1 frame_error, reg2 crc_error,
 // reg3 frames_ok, reg4 last_fail_len, reg5..12 the last CRC-failed frame

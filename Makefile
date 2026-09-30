@@ -29,7 +29,12 @@ export FW_VERSION=$(shell git describe --long --dirty --tags)
 # monotone boundary, and MAJOR >= 1 is it. Do not bump MAJOR again for anything
 # short of another wire-breaking queue generation — the controller's
 # MBQ_GW_MIN_VER_MAJOR is keyed to it.
-COMPILE    	= avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION="$(FW_VERSION)" -mmcu=$(DEVICE) -DFW_VER_MAJOR=1 -DFW_VER_MINOR=0 -fstack-usage -ffunction-sections -fdata-sections
+# avr-gcc by FULL PATH: with the quoted FW_VERSION string literal below, GNU
+# make 3.81 (the macOS default) looks avr-gcc up in its own PATH rather than the
+# exported one, finds Homebrew's avr-gcc first, and that compiler has no
+# ATtiny1604 device spec. FW_VERSION must be a real C string literal for the
+# FC04 0x0210 build block.
+COMPILE    	= $(CURDIR)/$(AVR_GCC_DIR)/bin/avr-gcc -Wall -O3 -DF_CPU=$(CLOCK) -DBOARD_5V=$(BOARD_5V) -DFW_VERSION='"$(FW_VERSION)"' -mmcu=$(DEVICE) -DFW_VER_MAJOR=1 -DFW_VER_MINOR=0 -fstack-usage -ffunction-sections -fdata-sections
 LDFLAGS    	= -Wl,--gc-sections
 AVR_GCC_DIR = avr
 CSOURCES    = $(wildcard src/*.c )

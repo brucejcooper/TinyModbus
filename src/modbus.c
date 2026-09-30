@@ -364,6 +364,13 @@ static void send_error(mb_err_t err) {
 // for a different count is ILLEGAL_ADDRESS, not a short read, so a client built
 // against a different register map fails loudly instead of parsing a prefix.
 //
+// The build this image came from (see FC04_BUILD_BLOCK). FW_VERSION is passed as
+// a string literal by the Makefile; the fallback marks a build made without it.
+#ifndef FW_VERSION
+#define FW_VERSION "unknown"
+#endif
+static const char s_build[] PROGMEM = FW_VERSION;
+
 // Handle FC04 (Read Input Registers).  Supports the FC04_VERSION_BLOCK special case
 // at 0x0200 and atomically clears dirty flags for any dirty registers in the read range.
 static void process_fc04(void) {
@@ -381,6 +388,15 @@ static void process_fc04(void) {
                  SIGROW_SERNUM0, SIGROW_SERNUM1, SIGROW_SERNUM2, SIGROW_SERNUM3,
                  SIGROW_SERNUM4, SIGROW_SERNUM5, SIGROW_SERNUM6, SIGROW_SERNUM7,
                  SIGROW_SERNUM8, SIGROW_SERNUM9);
+        start_tx(35u);
+        return;
+    }
+
+    // Build string block at FC04_BUILD_BLOCK (16-register read, 32 bytes payload).
+    if (addr == FC04_BUILD_BLOCK && count == 0x10u) {
+        buf[2] = 32u;
+        memset(buf + 3, 0, 32u);
+        strncpy_P((char *)(buf + 3), s_build, 32u);
         start_tx(35u);
         return;
     }

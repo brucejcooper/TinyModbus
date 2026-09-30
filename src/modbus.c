@@ -169,6 +169,9 @@ static volatile uint8_t  rx_sz    = 0;
 static volatile uint16_t rx_crc   = 0xFFFF;
 static volatile uint8_t  silence_ticks = 0;
 static volatile bool     frame_ready   = false;
+// Framing/parity errors seen in the frame being captured (saturating). Written
+// by the RX ISR; read in modbus_process only while RX is disabled (frame_ready).
+static volatile uint8_t  rx_ferr  = 0;
 // tx_sz is written on the main path (append_crc) and decremented in the DRE
 // ISR, so it must be volatile.  no_response is main-only today (set in
 // modbus_process, read in start_tx), marked volatile for consistency with the
@@ -179,12 +182,21 @@ static volatile bool     no_response   = false;
 // ---- RX diagnostics (read via FC04 0x0300, 16-register read) --------------
 // Counters to pin down why some Modbus requests go unanswered under load:
 //   rx_overflow : USART RX FIFO overflowed — a byte was lost (RXC starvation).
-//   frame_error : USART framing/parity error on a received byte.
+//   frame_error : USART framing/parity errors in a frame we could not ignore.
 //   crc_error   : a frame's worth of bytes arrived, then 3.5-char silence, but
-//                 the CRC was non-zero (corruption — distinct from a foreign
-//                 slave's valid-CRC frame, which is NOT counted).
+//                 the CRC was non-zero.
 //   frames_ok   : valid frames addressed to us that we processed (denominator).
 // last_fail[]   : the bytes of the most recent CRC-failed frame, for forensics.
+//
+// A CRC-good frame addressed to another device is ignored entirely: on a
+// multi-drop bus we hear every other slave's traffic, and it is not our link.
+// A CRC-bad frame is always counted — its address byte cannot be trusted, so
+// there is no telling whose it was. Framing errors are tallied per frame in
+// rx_ferr by the RX ISR and charged at the frame boundary, once we know which
+// of the two it was; before 2026-09-30 they were charged per byte in the ISR,
+// so the idle gateway on a two-gateway bench logged framing errors on the
+// other gateway's clean traffic. rx_overflow is still counted on every byte: a
+// lost byte is our own ISR starving, whoever the frame was for.
 //
 // diag_q_discard is the queue protocol's own discard counter (FC04 0x0326, not
 // this block): FC 0x41 frames addressed to us with a GOOD CRC that were dropped
@@ -686,6 +698,7 @@ static void return_to_rx(void) {
     rx_ptr      = buf;
     rx_crc      = 0xFFFF;
     rx_sz       = 0;
+    rx_ferr     = 0;
     frame_ready = false;
     modbus_idle = true;
     USART0.STATUS = USART_RXSIF_bm | USART_TXCIF_bm;
@@ -755,6 +768,7 @@ void modbus_init(uint8_t addr) {
     rx_ptr      = buf;
     rx_crc      = 0xFFFF;
     rx_sz       = 0;
+    rx_ferr     = 0;
     frame_ready = false;
     modbus_idle = true;
     initial_silence_observed = false;
@@ -817,9 +831,15 @@ void modbus_process(void) {
     // without a response.  The inter-frame silence (§2.5.1.1) has already elapsed,
     // so once a valid frame is confirmed the response can go straight out.
     if (!frame_is_valid()) {
-        // Count a real CRC failure only — a foreign slave's frame has a valid
-        // (zero) CRC and just isn't our address, so it must not inflate the
-        // counter.  Snapshot the bytes for forensics.
+        // A CRC-good frame for another device: none of our business, including
+        // any framing errors it carried.
+        if (rx_crc == 0u && buf[0] != slave_addr) {
+            return_to_rx();
+            return;
+        }
+        diag_frame_error += rx_ferr;
+        // A real CRC failure, whoever it was meant for.  Snapshot the bytes for
+        // forensics.
         if (rx_sz >= 4u && rx_crc != 0u) {
             diag_crc_error++;
             uint8_t n = (rx_sz < sizeof diag_last_fail) ? rx_sz
@@ -848,6 +868,7 @@ void modbus_process(void) {
         return;
     }
     diag_frames_ok++;   // a valid, CRC-good frame addressed to us
+    diag_frame_error += rx_ferr;   // CRC-good despite a framing error: rare, still ours
 
     no_response = (buf[0] == 0);
 
@@ -929,7 +950,7 @@ ISR(USART0_RXC_vect) {
         uint8_t sh  = USART0.RXDATAH;
         uint8_t val = USART0.RXDATAL;
         if (sh & USART_BUFOVF_bm)                    diag_rx_overflow++;
-        if (sh & (USART_FERR_bm | USART_PERR_bm))    diag_frame_error++;
+        if ((sh & (USART_FERR_bm | USART_PERR_bm)) && rx_ferr != 0xFFu) rx_ferr++;
         if (rx_sz < MAX_PKT_SZ) {
             *rx_ptr++ = val;
             rx_sz++;

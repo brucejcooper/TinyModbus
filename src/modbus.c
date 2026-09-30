@@ -62,29 +62,62 @@ static uint16_t baud_reg_for(uint8_t bidx) {
     return (uint16_t)v;
 }
 
-// 3.5-character silence threshold in TCA0 ticks (~417 µs each), per baud rate.
-// USART is configured for 1 start + 8 data + 1 stop = 10 bits/char.  The first decrement
-// after a byte arrival can land anywhere from 0 to 1 tick later, so silence_ticks = N
-// gives an observed silence window of (N-1) to N ticks.  N is sized so the lower bound
-// (N-1 ticks) meets Modbus §2.5.1.1's 3.5-char minimum.
-//   3.5 char @ 9600  = 3.65 ms = 8.74 ticks -> N = 10 -> 9-10 ticks (3.75-4.17 ms)
-//   3.5 char @ 19200 = 1.82 ms = 4.37 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
-//   3.5 char @ 38400 = 0.91 ms = 2.19 ticks -> N = 6  -> 5-6  ticks (2.08-2.50 ms)
-// N = 6 at 38400 (2026-08-09): MODBUS over Serial Line V1.02 stops deriving the
-// timers above 19200 and prescribes a FIXED t3.5 of 1.750 ms, which the previous
-// N = 4 (1.25-1.67 ms observed) undershot. Keep N = 6 — it is spec-conformant.
+// Frame timing, in TCA0 ticks (~417 µs each), per baud index {9600, 19200, 38400}.
+// Characters are 11 bits in the spec's model (MODBUS over Serial Line V1.02
+// §2.5.1.1); above 19200 the spec fixes t1.5 = 750 µs and t3.5 = 1.750 ms.
 //
-// RESOLVED 2026-08-14: that change was made to test whether frame SPLITTING was
-// what made 38400 dirty. It was not, and neither was the RC oscillator. The
-// cause was the SFDEN erratum (see the block above modbus_init) — with SFDEN
-// cleared in Active mode, 38400 measures 0.00% bad over 6609 frames with this
-// same N = 6. Both ends were also scoped and transmit within 0.8% of nominal at
-// both bauds, which is what ruled the oscillator out.
-static const uint8_t  s_silence_threshold[] = { 10, 6, 6 };
+//              t1.5 (max gap INSIDE a frame)   t3.5 (min gap BETWEEN frames)
+//   9600       1.72 ms                         4.01 ms
+//   19200      0.86 ms                         2.01 ms
+//   38400      0.75 ms (fixed)                 1.75 ms (fixed)
+//
+// A byte arrival reloads a countdown and each tick decrements it, so a reload of
+// N ticks declares end-of-frame after (N-1, N] ticks of real silence.
+//
+// DETECTION (s_silence_threshold) must sit strictly between the two: above t1.5
+// so a frame is never split, and at or below t3.5 so a legal inter-frame gap is
+// never missed. Missing one glues two frames together, and on a multi-drop bus
+// that is exactly what happened: a gap as short as t3.5 separates the master's
+// request from the other slave's reply, and the old thresholds (N = 10/6/6,
+// windows 3.75-4.17 / 2.08-2.50 / 2.08-2.50 ms) all sat ABOVE t3.5. They were
+// sized so the LOWER bound met t3.5 (2026-08-09), which is the wrong bound. The
+// first two-gateway bench (2026-09-30) caught it: the idle gateway merged
+// request+reply pairs of its neighbour and logged them as CRC errors.
+//   9600   N = 8 -> 2.92-3.33 ms    (1.72 < w <= 4.01)
+//   19200  N = 4 -> 1.25-1.67 ms    (0.86 < w <= 2.01)
+//   38400  N = 4 -> 1.25-1.67 ms    (0.75 < w <= 1.75)
+//
+// REPLY (s_reply_guard) is the mirror image. A reply may only start once the
+// line has been quiet for t3.5 (spec) AND for longer than any listener's
+// detection window — else a listener that has not yet declared end-of-request
+// swallows our reply into it. Replies are therefore held until G ticks have
+// elapsed since the request's last byte, i.e. more than G-1 ticks of silence:
+//   9600   G = 11 -> > 4.17 ms      (>= t3.5 4.01, > window max 3.33)
+//   19200  G = 6  -> > 2.08 ms      (>= t3.5 2.01, > window max 1.67)
+//   38400  G = 6  -> > 2.08 ms      (>= t3.5 1.75, > window max 1.67)
+// A listener also only sees our first byte once it is fully received (~0.26 ms
+// at 38400), which is extra margin on top of these. At 19200/38400 the reply
+// goes out when it did before (the old detection point), so throughput is
+// unchanged; the master's next request (controller: its t3.5 + 1.5 char
+// deadtime, >= ~2.5 ms at 38400) clears the new detection window with margin.
+//
+// History: 38400 was N = 4 until 2026-08-09, raised to 6 while chasing 38400
+// bad frames. That cause turned out to be the SFDEN erratum (see the block
+// above modbus_init), not frame splitting — 0.00% bad over 6609 frames once
+// fixed — and the scope showed both ends within 0.8% of nominal baud.
+static const uint8_t  s_silence_threshold[] = { 8, 4, 4 };
+static const uint8_t  s_reply_guard[]       = { 11, 6, 6 };
+_Static_assert(sizeof s_silence_threshold == sizeof s_reply_guard, "one entry per baud");
 // Per-baud reload value for the live silence_ticks countdown (set from
 // s_silence_threshold[] on init / baud change; copied into silence_ticks each
 // time a byte arrives).  Named _reload to disambiguate from the countdown.
 static volatile uint8_t  s_silence_reload;
+static volatile uint8_t  s_reply_guard_ticks;   // s_reply_guard[] for the live baud
+// Ticks since the last received byte (saturating): reset by the RX ISR, advanced
+// by modbus_tick. The reply guard is measured against it.
+static volatile uint8_t  ticks_since_rx = 0xFF;
+// A reply is built and waiting for the guard to expire (start_tx -> modbus_tick).
+static volatile bool     tx_held        = false;
 
 // Modbus §2.5.1.1 initial-silence gate.  After reset (power-on or WDT) the slave must
 // observe 3.5 char of bus silence before treating bytes as the start of a new frame -
@@ -287,12 +320,23 @@ static void append_crc(uint8_t len) {
 
 // Finalise a response frame in buf (appends CRC) and begin DRE-driven transmission.
 // No-op for broadcast frames (no_response set by modbus_process).
+static void release_tx(void) {
+    tx_held       = false;
+    USART0.STATUS = USART_TXCIF_bm;
+    USART0.CTRLA  = USART_RS485_EXT_gc | USART_DREIE_bm | USART_TXCIE_bm;
+}
+
 static void start_tx(uint8_t payload_len) {
     if (no_response) return;
     append_crc(payload_len);
     rx_ptr = buf;    // reuse buf pointer for TX
-    USART0.STATUS = USART_TXCIF_bm;
-    USART0.CTRLA  = USART_RS485_EXT_gc | USART_DREIE_bm | USART_TXCIE_bm;
+    // Hold the reply until the line has been quiet for the reply guard (see
+    // s_reply_guard); modbus_tick releases it. Checked and set atomically
+    // against that ISR so the release can be neither missed nor doubled.
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if (ticks_since_rx >= s_reply_guard_ticks) release_tx();
+        else                                        tx_held = true;
+    }
 }
 
 // Set the exception flag in buf[1], write the error code, and transmit.
@@ -683,6 +727,7 @@ static void apply_pending_config(void) {
         uint8_t bidx = userrow_get_baud_index();
         USART0.BAUD     = baud_reg_for(bidx);
         s_silence_reload = s_silence_threshold[bidx];
+        s_reply_guard_ticks = s_reply_guard[bidx];
     }
     if (mask & APPLY_SLAVE) {
         slave_addr = userrow_get_slave_addr();
@@ -775,6 +820,8 @@ void modbus_init(uint8_t addr) {
 
     uint8_t bidx = userrow_get_baud_index();
     s_silence_reload = s_silence_threshold[bidx];
+    s_reply_guard_ticks = s_reply_guard[bidx];
+    tx_held = false;
     // Arm the initial 3.5-char silence countdown.  modbus_tick will set
     // initial_silence_observed when it expires without an intervening byte.
     silence_ticks = s_silence_reload;
@@ -798,6 +845,10 @@ void modbus_init(uint8_t addr) {
 }
 
 void modbus_tick(void) {
+    if (ticks_since_rx != 0xFFu) ticks_since_rx++;
+    // Release a held reply once the reply guard has elapsed (see s_reply_guard).
+    if (tx_held && ticks_since_rx >= s_reply_guard_ticks) release_tx();
+
     // Silence counter: decremented here, frame_ready set when it hits 0.
     // The silence threshold is set (reset to non-zero) by the RXC ISR and at boot
     // (to arm the initial-silence gate).
@@ -929,6 +980,7 @@ ISR(USART0_TXC_vect) {
 ISR(USART0_RXC_vect) {
     modbus_idle    = false;
     silence_ticks  = s_silence_reload;
+    ticks_since_rx = 0;
     USART0.STATUS  = USART_RXSIF_bm;
 
     if (!initial_silence_observed) {

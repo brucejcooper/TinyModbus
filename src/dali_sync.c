@@ -221,8 +221,8 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
             //   OK             -> H_OK,     resp8 = backward-frame answer
             //   NAK + QF_ANSWER-> H_NAK,    resp8 = 0
             //   NAK, no ANSWER -> H_OK,     resp8 = 0
-            //   MALFORMED      -> H_FAILED, DALI_RESP_COLLISION
-            //   other          -> H_FAILED, DALI_RESP_BUSFAULT
+            //   MALFORMED / PULSE_* -> H_FAILED, DALI_RESP_COLLISION
+            //   (BUSFAULT comes only from dali_sync_abort_busfault: a stuck bus)
             //
             // The NAK split is the whole point. finished_transmission() reports
             // DALI_RESPONSE_NAK for a command that never opened a response
@@ -248,8 +248,18 @@ void dali_sync_completion(dali_response_type_t type, uint8_t value) {
                 st = expected ? H_NAK : H_OK;
                 r8 = 0;
             }
-            else if (type == DALI_RESPONSE_MALFORMED) { st = H_FAILED; r8 = DALI_RESP_COLLISION; }
-            else                                      { st = H_FAILED; r8 = DALI_RESP_BUSFAULT; }
+            // Anything that went wrong while DECODING a backward frame is a
+            // collision: something answered, and what arrived was not one clean
+            // frame. That includes pulse-width errors, not just out-of-sequence
+            // bits — several gear answering together (a group query, a COMPARE,
+            // two gear sharing an address) start up to 5 ms apart, and the
+            // overlap is full of pulses of in-between widths. Those used to be
+            // reported as BUSFAULT, which made the master read "nothing learned"
+            // (house, 2026-09-30: group 3.6 could not be switched off from the
+            // wall; 3.1/3.3 showed unavailable). IEC 62386 likewise treats a
+            // garbled backward frame as "an answer was received". A genuinely
+            // stuck bus is still BUSFAULT, via dali_sync_abort_busfault.
+            else                                      { st = H_FAILED; r8 = DALI_RESP_COLLISION; }
             // ISR context: no caller to return to, and a dropped completion
             // strands the command EXECUTING until reboot. Record it so a stuck
             // queue is diagnosable over Modbus instead of a mystery. The two

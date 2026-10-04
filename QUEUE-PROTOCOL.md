@@ -190,7 +190,7 @@ the request.
 |---|---|---|
 | *(`0x01` reserved)* | `0x01` | was `DALI_RESP_NAK`; retired 2026-08-13, see below |
 | `DALI_RESP_COLLISION` | `0x02` | garbled backward frame — two or more gear answered |
-| `DALI_RESP_BUSFAULT` | `0x03` | transport fault: short pulse, stuck bus |
+| `DALI_RESP_BUSFAULT` | `0x03` | stuck/shorted bus (the bus-stuck escape). A reply that fails to decode — bad bit sequence OR bad pulse width — is `COLLISION`, not this |
 
 **`H_NAK` is a fact, not a verdict, and that is the whole point.** Silence on the
 DALI bus means different things depending on what was asked, and the gateway

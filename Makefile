@@ -84,6 +84,8 @@ HOSTCC ?= cc
 test: prepare
 	$(HOSTCC) -Wall -Wextra -I src -o build/cq_test test/cq_test.c src/cq.c src/errors.c
 	./build/cq_test
+	$(HOSTCC) -Wall -Wextra -I src -o build/frame_pair_test test/frame_pair_test.c src/frame_pair.c
+	./build/frame_pair_test
 
 build: prepare $(OBJECTS)
 	$(COMPILE) $(LDFLAGS) -o build/$(FILENAME).elf $(OBJECTS)

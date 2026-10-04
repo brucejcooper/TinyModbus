@@ -70,7 +70,7 @@ static inline dali_frame_t dali_frame_of(const cq_cmd_t *c) {
 // status or the payload. The value stays reserved rather than reused so a
 // mismatched old master decodes an unknown code instead of a wrong one.
 #define DALI_RESP_COLLISION  0x02u  // garbled backward frame (>=1 gear answered)
-#define DALI_RESP_BUSFAULT   0x03u  // transport-level fault (short pulse, stuck bus)
+#define DALI_RESP_BUSFAULT   0x03u  // stuck/shorted bus (dali_sync_abort_busfault); a garbled reply of any kind is COLLISION
 
 // True while this gateway is running a queued command — i.e. one entry is
 // CQ_EXECUTING and we hold the wire for it, across the whole multi-frame

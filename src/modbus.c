@@ -9,6 +9,7 @@
 
 #include "modbus.h"
 #include "registers.h"
+#include "frame_pair.h"
 #include "errors.h"
 #include "sysinfo.h"
 #include "cq.h"
@@ -903,6 +904,18 @@ void modbus_process(void) {
         if (rx_crc == 0u && buf[0] != slave_addr) {
             return_to_rx();
             return;
+        }
+        // Two CRC-good frames glued together — a slave that answered faster
+        // than our silence window, so its reply joined the master's request
+        // (the house relay board, frame_pair.h). Not corruption; if neither
+        // half is for us it is just someone else's traffic.
+        {
+            uint8_t k;
+            if (rx_crc != 0u && frame_is_pair(buf, rx_sz, crc16, &k)
+                && buf[0] != slave_addr && buf[k] != slave_addr) {
+                return_to_rx();
+                return;
+            }
         }
         diag_frame_error += rx_ferr;
         // A real CRC failure, whoever it was meant for.  Snapshot the bytes for

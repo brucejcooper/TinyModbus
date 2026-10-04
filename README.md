@@ -548,7 +548,7 @@ the request.
   backward-frame answer (or 0 for a command that expected none); with `hstatus`
   = `H_FAILED` (1), `resp8` is a failure code: `0x01` NAK (no or too-short
   backward frame where one was expected), `0x02` COLLISION (garbled backward
-  frame — two or more gear answered), `0x03` BUSFAULT (short pulse, stuck bus).
+  frame — two or more gear answered), `0x03` BUSFAULT (stuck/shorted bus only — any reply that fails to decode, pulse-width errors included, is COLLISION).
   COLLISION is distinct from NAK so the controller's any-on probe can read a
   collision as "≥1 on" and silence as "none on".
 
@@ -785,7 +785,7 @@ These are residual issues that the current firmware does not address. None are r
 ### DALI
 
 - **No multi-master collision detection during our own TX.**  If another master begins driving the bus while we are already transmitting, the resulting collision is not detected; the receiving ballast simply sees a malformed frame and ignores it.
-- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a ±83 µs tolerance window (`DALI_HALF_BIT_USECS / 5`); pulses falling between the half-bit and full-bit ranges (~500–750 µs) are reported as `PULSE_IN_MIDDLE` and discarded.  At spec-compliant DALI bit timing this never fires.
+- **Receiver dead-band.**  Half-bit and full-bit pulse classification has a ±83 µs tolerance window (`DALI_HALF_BIT_USECS / 5`); pulses falling between the half-bit and full-bit ranges (~500–750 µs) are reported as `PULSE_IN_MIDDLE`.  A single gear at spec-compliant bit timing never produces one; several gear answering at once (a group query, COMPARE, two gear sharing an address) produce them routinely, so any receive error is reported to the master as COLLISION — something answered.
 - **A queued DTR0-first command holds the bus for its pair.**  A command with the `QW_DTR0` flag issues two frames (`0xA3<dtr0>` then the frame, e.g. a config DTR0+SET pair) as one atomic unit, so DTR0 can't be clobbered between them.  Other DALI work waits behind the pair (~2 frame times).  Single-frame commands (DAPC level, group-bit changes, most raw commands) are unaffected — ≤ ~50 ms each.  (The old 6-send `SYNC_WRITE_MINMAX/POWER/FADE` sequences were retired with the config banks.)
 
 ### Hardware / runtime
